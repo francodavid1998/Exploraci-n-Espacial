@@ -12,10 +12,14 @@ export interface ShipModel {
 
 export function buildShip(env: THREE.Texture | null, plasmaMat: THREE.Material): ShipModel {
   const root = new THREE.Group();
-  const hull = new THREE.MeshStandardMaterial({ color: 0xdfe3e8, metalness: 0.55, roughness: 0.32, envMap: env, envMapIntensity: 0.6 });
-  const dark = new THREE.MeshStandardMaterial({ color: 0x23272d, metalness: 0.7, roughness: 0.45, envMap: env, envMapIntensity: 0.5 });
-  const accent = new THREE.MeshStandardMaterial({ color: 0xff6a1a, metalness: 0.3, roughness: 0.4, envMap: env, envMapIntensity: 0.4 });
-  const glass = new THREE.MeshPhysicalMaterial({ color: 0x0a1622, metalness: 0.1, roughness: 0.04, clearcoat: 1, clearcoatRoughness: 0.02, envMap: env, envMapIntensity: 1.6 });
+  // The RoomEnvironment map contains light panels with radiance ~50-100: keep
+  // envMapIntensity modest or the hull blooms into a white haze near the player.
+  // Roughness floors: a mirror-like canopy (0.04 / clearcoat 0.02) reflecting the
+  // Sun produced specular peaks > 65504 (half-float overflow -> Inf -> black screen).
+  const hull = new THREE.MeshStandardMaterial({ color: 0xdfe3e8, metalness: 0.55, roughness: 0.32, envMap: env, envMapIntensity: 0.3 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x23272d, metalness: 0.7, roughness: 0.45, envMap: env, envMapIntensity: 0.25 });
+  const accent = new THREE.MeshStandardMaterial({ color: 0xff6a1a, metalness: 0.3, roughness: 0.4, envMap: env, envMapIntensity: 0.2 });
+  const glass = new THREE.MeshPhysicalMaterial({ color: 0x0a1622, metalness: 0.1, roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.1, envMap: env, envMapIntensity: 0.6 });
 
   const add = (g: THREE.BufferGeometry, m: THREE.Material, p?: [number, number, number]) => {
     const mesh = new THREE.Mesh(g, m);
@@ -151,9 +155,9 @@ export interface AstroModel {
 export function buildAstronaut(env: THREE.Texture | null): AstroModel {
   const root = new THREE.Group();
   const suit = new THREE.MeshStandardMaterial({ color: 0xeeeeea, roughness: 0.78, metalness: 0.02 });
-  const grey = new THREE.MeshStandardMaterial({ color: 0x7d838a, roughness: 0.55, metalness: 0.4, envMap: env, envMapIntensity: 0.5 });
+  const grey = new THREE.MeshStandardMaterial({ color: 0x7d838a, roughness: 0.55, metalness: 0.4, envMap: env, envMapIntensity: 0.25 });
   const orange = new THREE.MeshStandardMaterial({ color: 0xff6a1a, roughness: 0.6 });
-  const visor = new THREE.MeshStandardMaterial({ color: 0xd9a441, roughness: 0.08, metalness: 1, envMap: env, envMapIntensity: 1.5 });
+  const visor = new THREE.MeshStandardMaterial({ color: 0xd9a441, roughness: 0.18, metalness: 1, envMap: env, envMapIntensity: 0.6 });
   const m = (g: THREE.BufferGeometry, mat: THREE.Material, parent: THREE.Object3D, p: [number, number, number]) => {
     const mesh = new THREE.Mesh(g, mat);
     mesh.position.set(...p);

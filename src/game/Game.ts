@@ -9,6 +9,7 @@ import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
   makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture,
+  hardenBloomPass, hardenOutputPass,
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
@@ -68,6 +69,8 @@ export interface HudState {
 
 const V = () => new THREE.Vector3();
 const ZERO = new THREE.Vector3();
+/** Scene render resolution relative to CSS pixels (1 = same as before; raise for sharper, slower rendering). */
+const SCENE_SCALE = 1;
 const posMod = (x: number, m: number) => ((x % m) + m) % m;
 
 export function formatDist(m: number): string {
@@ -190,12 +193,24 @@ export class Game {
     this.scene.add(this.camera);
     this.scene.background = new THREE.Color(0x000000);
 
-    const rt = new THREE.WebGLRenderTarget(container.clientWidth, container.clientHeight, { type: THREE.HalfFloatType, samples: 4 });
+    // Scene buffer at CSS resolution x SCENE_SCALE (integer sizes). The canvas
+    // itself uses min(devicePixelRatio, 1.5) but only the cheap final pass runs
+    // at that size; rendering the scene at device resolution was 1.5-2.25x
+    // slower on laptops with Windows display scaling.
+    const bw = Math.max(1, Math.round(container.clientWidth * SCENE_SCALE)), bh = Math.max(1, Math.round(container.clientHeight * SCENE_SCALE));
+    const rt = new THREE.WebGLRenderTarget(bw, bh, { type: THREE.HalfFloatType, samples: 4 });
     this.composer = new EffectComposer(r, rt);
+    this.composer.setPixelRatio(1);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(container.clientWidth, container.clientHeight), 0.55, 0.55, 0.9);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(bw, bh), 0.55, 0.55, 0.9);
+    // Black-screen fix: NaN/Inf or absurdly bright pixels (e.g. the Sun mirrored
+    // in the canopy) must never reach the bloom blur, which would smear them
+    // over the whole frame and tone-map to black.
+    hardenBloomPass(this.bloom, 16);
     this.composer.addPass(this.bloom);
-    this.composer.addPass(new OutputPass());
+    const output = new OutputPass();
+    hardenOutputPass(output);
+    this.composer.addPass(output);
 
     const pmrem = new THREE.PMREMGenerator(r);
     const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -415,7 +430,7 @@ export class Game {
   private onResize = () => {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.renderer.setSize(w, h);
-    this.composer.setSize(w, h);
+    this.composer.setSize(Math.max(1, Math.round(w * SCENE_SCALE)), Math.max(1, Math.round(h * SCENE_SCALE)));
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   };

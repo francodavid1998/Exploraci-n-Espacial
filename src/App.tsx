@@ -17,6 +17,7 @@ export default function App() {
       try {
         g = new Game(containerRef.current!, markerRef.current!);
         g.onMenuToggle = (o) => setMenu(o);
+        if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) (window as unknown as { __game?: Game }).__game = g; // debug hook (dev only)
         setGame(g);
       } catch (e) {
         console.error(e);

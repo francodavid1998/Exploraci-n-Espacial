@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import type { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import type { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 
 export const NOISE_GLSL = /* glsl */ `
 vec3 mod289(vec3 x){return x - floor(x*(1.0/289.0))*289.0;}
@@ -516,7 +518,8 @@ void main(){
   float ndl = dot(N, uSunDir);
   float sunUp = smoothstep(-0.05, 0.15, ndl);
   vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 30.0, vDepth)) * (0.06 + max(ndl, 0.0)) * uSunColor * 0.32;
-  vec3 H = normalize(uSunDir + V);
+  vec3 Hs = uSunDir + V;
+  vec3 H = dot(Hs, Hs) > 1e-8 ? normalize(Hs) : N;
   float nh = max(dot(n, H), 0.0);
   float spec = pow(nh, 900.0) * 60.0 + pow(nh, 80.0) * 0.5;
   vec3 col = mix(body, uSky, fres) + uSunColor * spec * sunUp * 0.4;
@@ -593,7 +596,9 @@ float tDetail(vec3 p){
     vec3 r1 = cross(dpdy, normal), r2 = cross(normal, dpdx);
     float det = dot(dpdx, r1);
     vec3 grad = sign(det) * (dhx * r1 + dhy * r2);
-    vec3 pn = normalize(abs(det) * normal - grad);
+    vec3 pn0 = abs(det) * normal - grad;
+    float pl = dot(pn0, pn0);
+    vec3 pn = pl > 1e-12 ? pn0 * inversesqrt(pl) : normal;
     normal = normalize(mix(normal, pn, bf));
   }
 }`,
@@ -758,6 +763,52 @@ void main(){
     blending: THREE.AdditiveBlending,
     side: THREE.DoubleSide,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Post-processing hardening.
+// The scene is rendered into a half-float buffer (max 65504). Extremely sharp
+// speculars (ship canopy / visor reflecting the Sun) can exceed that and become
+// +Inf; any NaN/Inf that reaches UnrealBloomPass is smeared by its blur mip
+// chain over hundreds of pixels and tone-maps to black -> the whole screen (or
+// big rectangles with straight edges) goes black. We clamp the bloom input and
+// sanitize NaN/Inf before tone mapping so one bad pixel can never do that.
+const SANE_GLSL = /* glsl */ `
+// Comparisons are false for NaN, so NaN -> 0, +Inf -> lim. (No isnan(): the
+// OutputPass is a RawShaderMaterial compiled as GLSL ES 1.00.)
+float heliosSane1(float x, float lim){ return (x > 0.0) ? ((x < lim) ? x : lim) : 0.0; }
+vec3 heliosSane(vec3 c, float lim){ return vec3(heliosSane1(c.r, lim), heliosSane1(c.g, lim), heliosSane1(c.b, lim)); }
+`;
+
+/** Clamp + sanitize the bloom pass input. `maxValue` is the brightest value allowed to bloom. */
+export function hardenBloomPass(bloom: UnrealBloomPass, maxValue: number) {
+  const mat = bloom.materialHighPassFilter;
+  (bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax = { value: maxValue };
+  mat.fragmentShader = /* glsl */ `
+uniform sampler2D tDiffuse; uniform vec3 defaultColor; uniform float defaultOpacity;
+uniform float luminosityThreshold; uniform float smoothWidth; uniform float heliosMax;
+varying vec2 vUv;
+${SANE_GLSL}
+void main(){
+  vec4 texel = texture2D(tDiffuse, vUv);
+  texel.rgb = heliosSane(texel.rgb, heliosMax);
+  float v = luminance(texel.xyz);
+  vec4 outputColor = vec4(defaultColor.rgb, defaultOpacity);
+  float alpha = smoothstep(luminosityThreshold, luminosityThreshold + smoothWidth, v);
+  gl_FragColor = mix(outputColor, texel, alpha);
+}`;
+  mat.needsUpdate = true;
+}
+
+/** Sanitize NaN/Inf right before tone mapping (a NaN tone-maps to black). */
+export function hardenOutputPass(pass: OutputPass) {
+  const mat = pass.material;
+  const anchor = 'gl_FragColor = texture2D( tDiffuse, vUv );';
+  if (!mat.fragmentShader.includes(anchor)) return;
+  mat.fragmentShader = mat.fragmentShader
+    .replace('void main() {', `${SANE_GLSL}\nvoid main() {`)
+    .replace(anchor, `${anchor}\n\t\t\tgl_FragColor.rgb = heliosSane(gl_FragColor.rgb, 1.0e4);`);
+  mat.needsUpdate = true;
 }
 
 export function radialTexture(stops: [number, string][], size = 256) {
