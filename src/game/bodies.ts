@@ -2,6 +2,33 @@ import { Noise3, craterField, smoothstep, clamp, lerp } from './noise';
 
 export const AU = 1.495978707e11;
 export const C_LIGHT = 299792458;
+export const LY = 9.4607304725808e15; // light-year in metres
+const DEG = Math.PI / 180;
+
+/** Star appearance and physics (one per `kind: 'star'` body). */
+export interface StarDef {
+  luminosity: number; // in solar luminosities (sets how bright planets are lit)
+  teff: number; // effective temperature, K
+  colorLimb: [number, number, number]; // disc shader colour at the limb
+  colorCenter: [number, number, number]; // disc shader colour at the centre
+  glowStops: [number, number, number][]; // four RGB stops (0-255) for the halo texture
+  glowTint: [number, number, number]; // halo sprite tint
+  lightTint: [number, number, number]; // colour of the light cast on planets
+  intensity: number; // disc brightness
+}
+export const SUN_STAR: StarDef = {
+  luminosity: 1, teff: 5778,
+  colorLimb: [1.0, 0.62, 0.25], colorCenter: [1.0, 0.9, 0.7],
+  glowStops: [[255, 240, 215], [255, 220, 170], [255, 180, 110], [255, 150, 80]],
+  glowTint: [1, 0.91, 0.77], lightTint: [1, 1, 1], intensity: 40,
+};
+/** Proxima Centauri: M5.5Ve red dwarf (Teff ≈ 3 040 K, L ≈ 0.15 % L☉, Ribas et al. 2017). */
+export const PROXIMA_STAR: StarDef = {
+  luminosity: 0.00151, teff: 3042,
+  colorLimb: [0.72, 0.12, 0.03], colorCenter: [1.0, 0.45, 0.2],
+  glowStops: [[255, 160, 110], [255, 95, 50], [225, 55, 22], [170, 30, 10]],
+  glowTint: [1, 0.45, 0.25], lightTint: [1, 0.72, 0.55], intensity: 26,
+};
 
 export type BodyKind = 'star' | 'rocky' | 'gas';
 
@@ -35,9 +62,15 @@ export interface BodyDef {
   kind: BodyKind;
   radius: number;
   parent?: string;
+  /** distance to the parent (m); for a top-level body, distance to the Sun */
   orbit: number;
+  /** orbital angle (rad); for a top-level body, ecliptic longitude measured from +X towards +Z */
   angle: number;
   incl?: number;
+  /** ecliptic latitude (rad) of a top-level body (+Y = ecliptic north); used to place other stars */
+  lat?: number;
+  /** star appearance/physics (kind 'star' only; defaults to the Sun) */
+  star?: StarDef;
   gravity: number;
   tempC: number;
   tempText: string;
@@ -62,7 +95,7 @@ export const BODIES: BodyDef[] = [
     tempText: '5 500 °C (fotosfera) · 15 millones °C (núcleo)', pressure: 0, composition: 'Hidrógeno 73% · Helio 25%',
     description: 'Estrella enana amarilla de tipo G2V. Contiene el 99,86% de la masa del sistema solar.',
     facts: ['Edad: ~4 600 millones de años', 'La luz tarda 8 min 20 s en llegar a la Tierra', 'Diámetro: 109 veces el de la Tierra'],
-    tilt: 0.126, scaleHeight: 1, markerColor: '#ffd36b', seed: 1,
+    tilt: 0.126, scaleHeight: 1, markerColor: '#ffd36b', seed: 1, star: SUN_STAR,
   },
   {
     id: 'mercury', name: 'Mercurio', kind: 'rocky', radius: 2439.7e3, orbit: 0.387 * AU, angle: 0.55, gravity: 3.7, tempC: 167,
@@ -200,6 +233,42 @@ export const BODIES: BodyDef[] = [
     facts: ['Una de las superficies más frías conocidas', 'Terreno "piel de melón" único', 'Géiseres de nitrógeno de 8 km de altura'],
     tilt: 0, scaleHeight: 1, markerColor: '#e8c9c0', seed: 188,
     hazard: { suitDrain: 0.2, text: 'Frío extremo: −235 °C' },
+  },
+  // -------------------------------------------------------------------------
+  // Proxima Centauri system. Position from RA 14h29m43s, Dec −62°40′46″ (J2000)
+  // converted to ecliptic coordinates: longitude 239.1°, latitude −44.8°.
+  // -------------------------------------------------------------------------
+  {
+    id: 'proxima', name: 'Próxima Centauri', kind: 'star', radius: 0.1542 * 696340e3, orbit: 4.2465 * LY, angle: 239.12 * DEG, lat: -44.76 * DEG,
+    gravity: 1407, tempC: 2769, tempText: '≈ 2 800 °C (fotosfera) · enana roja M5.5V', pressure: 0, composition: 'Hidrógeno ~70% · Helio ~28% · elementos pesados',
+    description: 'La estrella más cercana al Sol: una enana roja tenue con el 12% de la masa solar y el 15% de su radio, que emite solo el 0,15% de su luz. Es una estrella fulgurante: sus erupciones multiplican su brillo en minutos y bañan a sus planetas en rayos X.',
+    facts: ['Distancia: 4,2465 años luz (1,30 pc)', 'Descubierta en 1915 por Robert Innes', 'Forma parte del sistema triple Alfa Centauri: orbita a las estrellas A y B a ~13 000 UA', 'Temperatura superficial ≈ 3 040 K · rotación ≈ 83 días', 'Vivirá billones de años: las enanas rojas queman su hidrógeno muy despacio'],
+    tilt: 0, scaleHeight: 1, markerColor: '#ff7a55', seed: 300, star: PROXIMA_STAR,
+  },
+  {
+    id: 'proxima-d', name: 'Próxima Centauri d', kind: 'rocky', radius: 0.7 * 6371e3, parent: 'proxima', orbit: 0.02885 * AU, angle: 0.8, gravity: 5.3, tempC: 87,
+    tempText: '≈ 87 °C de equilibrio · lado diurno mucho más caliente', pressure: 0, composition: 'Sin atmósfera conocida (probablemente arrasada por las fulguraciones)',
+    description: 'Subtierra confirmada en 2022 con el espectrógrafo ESPRESSO del VLT: al menos un cuarto de la masa terrestre, orbitando a solo 0,029 UA cada 5,1 días. Su radio y composición se desconocen; se representa como un mundo rocoso árido y abrasado.',
+    facts: ['Masa mínima: 0,26 masas terrestres', 'Período orbital: 5,12 días', 'Recibe casi el doble de luz que la Tierra', 'Uno de los planetas más ligeros detectados por velocidad radial', 'Probablemente en rotación síncrona'],
+    tilt: 0, scaleHeight: 1, markerColor: '#d9a07a', seed: 301,
+    hazard: { suitDrain: 1.0, text: 'Calor y radiación de las fulguraciones de Próxima' },
+  },
+  {
+    id: 'proxima-b', name: 'Próxima Centauri b', kind: 'rocky', radius: 1.02 * 6371e3, parent: 'proxima', orbit: 0.04856 * AU, angle: 2.9, gravity: 10.1, tempC: -39,
+    tempText: '≈ −39 °C de equilibrio (sin efecto invernadero)', pressure: 0.3, composition: 'Desconocida · aquí: N₂ y CO₂ tenues (hipotética)',
+    description: 'El exoplaneta confirmado más cercano a la Tierra (2016, HARPS/ESO): masa mínima de 1,07 Tierras en la zona habitable de Próxima. Casi con seguridad en rotación síncrona, con un hemisferio en día perpetuo y otro en noche eterna. Si conserva atmósfera y agua sería un "mundo ojo": océano templado frente a la estrella y hielo en la cara oculta. Así se representa aquí.',
+    facts: ['Masa mínima: 1,07 masas terrestres', 'Período orbital: 11,19 días a 0,0486 UA', 'Recibe el 65% de la luz que la Tierra recibe del Sol', 'Las fulguraciones de Próxima bañan su superficie en rayos X y ultravioleta', 'Objetivo del proyecto Breakthrough Starshot'],
+    tilt: 0, scaleHeight: 9000, markerColor: '#7fb8a8', seed: 302,
+    atmo: { height: 60e3, betaR: [7e-6, 9e-6, 14e-6], betaM: 8e-6, HR: 9000, HM: 1500, g: 0.76, sun: 20, mieTint: [1, 0.9, 0.8], fogColor: [0.6, 0.55, 0.5], fogDensity: 8e-6, surfaceDensity: 0.3, skyBrightness: 0.6 },
+    hazard: { suitDrain: 0.3, text: 'Radiación de las fulguraciones de Próxima' },
+  },
+  {
+    id: 'proxima-c', name: 'Próxima Centauri c', kind: 'gas', radius: 2.4 * 6371e3, parent: 'proxima', orbit: 1.489 * AU, angle: 4.4, gravity: 11.9, tempC: -234,
+    tempText: '≈ −234 °C en las nubes', pressure: 1, composition: 'Hipotética: H₂, He y metano (minineptuno)',
+    description: 'Candidato sin confirmar (2020, Damasso et al.): una supertierra o minineptuno de al menos 7 masas terrestres a 1,5 UA, con un año de 5,3 años terrestres. Análisis posteriores lo ponen en duda. Se representa como un minineptuno helado con un posible anillo de polvo.',
+    facts: ['Masa mínima: ≈ 7 masas terrestres (sin confirmar)', 'Período orbital: 1 928 días', 'Recibe menos del 0,1% de la luz que recibe la Tierra', 'El Hubble detectó un posible exceso de luz: ¿anillos o polvo?'],
+    tilt: 0.3, scaleHeight: 18000, markerColor: '#8fa8ff', seed: 303, gasType: 3, rings: 2,
+    atmo: { height: 150e3, betaR: [1.2e-6, 3.6e-6, 9.0e-6], betaM: 1e-6, HR: 18000, HM: 14000, g: 0.7, sun: 14, mieTint: [0.8, 0.9, 1], fogColor: [0.3, 0.45, 0.9], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
 ];
 
@@ -594,9 +663,69 @@ function tritonGen(R: number, seed: number): TerrainGen {
   };
 }
 
+/**
+ * Tidally locked temperate world ("eyeball planet"): ocean and bare rock on the
+ * day side, a permanent ice sheet on the night side. `sub` is the unit vector
+ * towards the star in planet-local coordinates (the substellar point).
+ */
+function eyeballGen(R: number, seed: number, sub: [number, number, number]): TerrainGen {
+  const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2), n4 = new Noise3(seed + 3);
+  const day = (x: number, y: number, z: number) => x * sub[0] + y * sub[1] + z * sub[2];
+  const iceMask = (x: number, y: number, z: number, px: number, py: number, pz: number) =>
+    smoothstep(0.15, -0.15, day(x, y, z) + n4.fbm(px, py, pz, R * 0.2, 3, 20e3) * 0.12);
+  return {
+    seaLevel: 0,
+    rockScale: 1,
+    waterDeep: [0.02, 0.07, 0.14],
+    waterShallow: [0.05, 0.3, 0.36],
+    height(x, y, z, minWl) {
+      const px = x * R, py = y * R, pz = z * R;
+      const c = n1.fbm(px, py, pz, R * 0.5, 8, Math.max(minWl, 1500)) - 0.05;
+      let h: number;
+      if (c > 0) {
+        h = c * 2200 + n2.fbm(px, py, pz, 25e3, 10, minWl) * 350 * smoothstep(0, 0.05, c);
+        const r = n3.ridged(px, py, pz, R * 0.04, 9, minWl);
+        h += r * r * 2500 * smoothstep(0.05, 0.3, c);
+      } else {
+        h = -200 * smoothstep(0, 0.03, -c) - Math.max(0, -c - 0.03) * 6000;
+      }
+      h += craterField(px, py, pz, seed, R * 0.3, 6, 0.25, 0.5, minWl) * 0.5;
+      h += n1.fbm(px, py, pz, 50, 5, minWl) * 1.5 + n2.fbm(px, py, pz, 3, 3, minWl) * 0.2;
+      // night side: the ocean freezes into a shelf and land carries an ice sheet
+      const ice = iceMask(x, y, z, px, py, pz);
+      if (ice > 0) h = Math.max(h, 0) + ice * (150 + n2.fbm(px, py, pz, 8e3, 6, minWl) * 80);
+      return h;
+    },
+    color(x, y, z, h, slope, out, i) {
+      const px = x * R, py = y * R, pz = z * R;
+      const d = day(x, y, z);
+      const ice = iceMask(x, y, z, px, py, pz);
+      const v = 1 + n1.noise(px / 700, py / 700, pz / 700) * 0.06;
+      let c: C3;
+      if (h < 0) c = mix3([0.5, 0.45, 0.35], [0.2, 0.22, 0.2], smoothstep(0, 60, -h));
+      else if (h < 3) c = [0.6, 0.55, 0.45];
+      else {
+        c = mix3([0.45, 0.33, 0.24], [0.3, 0.25, 0.22], smoothstep(-0.3, 0.3, n3.fbm(px, py, pz, R * 0.1, 4, R * 0.003)));
+        c = mix3(c, [0.28, 0.22, 0.18], smoothstep(0.5, 0.9, d) * 0.5); // scorched basalt near the substellar point
+        c = mix3(c, [0.5, 0.47, 0.44], smoothstep(0.3, 0.6, slope));
+      }
+      c = mix3(c, [0.88, 0.92, 0.97], ice * (1 - smoothstep(0.55, 0.85, slope)));
+      put(out, i, c[0] * v, c[1] * v, c[2] * v);
+    },
+    rocks: (h, slope) => (h > 3 ? 0.004 + smoothstep(0.25, 0.6, slope) * 0.03 : 0),
+  };
+}
+
 export function makeGenerator(def: BodyDef): TerrainGen | null {
   const R = def.radius, s = def.seed;
   switch (def.id) {
+    case 'proxima-d':
+      return cratered(R, s, { maria: 0.08, craterDensity: 0.55, craterDepth: 0.9, hill: 1200, high: [0.42, 0.36, 0.3], mare: [0.3, 0.25, 0.2], rough: 2 });
+    case 'proxima-b': {
+      // substellar direction in planet-local coordinates (the star sits at -orbit direction)
+      const a = def.angle, inc = def.incl ?? 0;
+      return eyeballGen(R, s, [-Math.cos(a), -Math.sin(a) * Math.sin(inc), -Math.sin(a) * Math.cos(inc)]);
+    }
     case 'mercury':
       return cratered(R, s, { maria: 0.12, craterDensity: 0.62, craterDepth: 1, hill: 1500, high: [0.5, 0.47, 0.44], mare: [0.58, 0.55, 0.5], rough: 2 });
     case 'venus': return venusGen(R, s);

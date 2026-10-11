@@ -29,7 +29,10 @@ function Row({ k, v, accent }: { k: string; v: string; accent?: boolean }) {
 function fmtTime(s: number) {
   if (!isFinite(s) || s <= 0) return '—';
   if (s < 60) return `${s.toFixed(0)} s`;
-  return `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
+  if (s < 86400 * 365.25 * 2) return `${(s / 86400).toFixed(1)} días`;
+  return `${(s / (86400 * 365.25)).toFixed(2)} años`;
 }
 
 function fmtPressure(p: number) {
@@ -68,7 +71,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
         <Row k={altLabel} v={altVal} accent={isGas && s.altitude < 0} />
         <Row k="Gravedad" v={`${s.gravity} m/s² · ${(s.gravity / 9.81).toFixed(2)} g`} />
         <Row k="Presión" v={fmtPressure(s.pressure)} accent={s.pressure > 20} />
-        <Row k="Temperatura" v={(isGas && s.altitude < 0) || s.bodyId === 'sun' ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
+        <Row k="Temperatura" v={(isGas && s.altitude < 0) || s.bodyKind === 'Estrella' ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
         <Row k="Luz solar" v={`${(s.sunlight * 100).toFixed(s.sunlight < 0.1 ? 2 : 0)}% de la Tierra`} />
         <div className="mt-2 border-t border-white/10 pt-2 text-[11px] leading-relaxed text-white/60">{s.composition}</div>
       </div>
@@ -210,7 +213,10 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
 export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }) {
   const [sel, setSel] = useState<string>(game.target?.def.id ?? 'earth');
   const def = BODIES.find((b) => b.id === sel)!;
-  const planets = BODIES.filter((b) => !b.parent);
+  const stars = BODIES.filter((b) => b.kind === 'star');
+  const planetsOf = (star: typeof stars[number]) => BODIES.filter((b) => b.kind !== 'star' && (b.parent === star.id || (star.id === 'sun' && !b.parent)));
+  const parentDef = def.parent ? BODIES.find((b) => b.id === def.parent) : undefined;
+  const kindLabel = def.kind === 'gas' ? 'GIGANTE GASEOSO' : def.kind === 'star' ? 'ESTRELLA' : parentDef && parentDef.kind !== 'star' ? `LUNA DE ${parentDef.name.toUpperCase()}` : parentDef ? `EXOPLANETA DE ${parentDef.name.toUpperCase()}` : 'PLANETA ROCOSO';
   const R_EARTH = 6371e3;
   return (
     <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/75 font-mono text-white backdrop-blur-md">
@@ -218,13 +224,21 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
         <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
           <div>
             <div className="text-[10px] tracking-[0.5em] text-cyan-300/70">NAVEGACIÓN</div>
-            <div className="text-2xl font-extralight tracking-[0.2em]">SISTEMA SOLAR</div>
+            <div className="text-2xl font-extralight tracking-[0.2em]">SISTEMAS ESTELARES</div>
           </div>
           <button onClick={onClose} className="rounded-md border border-white/20 px-4 py-1.5 text-xs tracking-[0.3em] text-white/80 hover:bg-white/10">CERRAR (M)</button>
         </div>
         <div className="flex min-h-0 flex-1">
           <div className="w-72 overflow-y-auto border-r border-white/10 p-3">
-            {planets.map((p) => (
+            {stars.map((st) => (
+              <div key={st.id} className="mb-3">
+                <button onClick={() => setSel(st.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-white/5 ${sel === st.id ? 'bg-white/10' : ''}`}>
+                  <span className="inline-block h-5 w-5 rounded-full" style={{ background: st.markerColor, boxShadow: `0 0 14px ${st.markerColor}` }} />
+                  <span className="text-sm tracking-[0.2em]">{st.name.toUpperCase()}</span>
+                  {game.target?.def.id === st.id && <span className="ml-auto text-[10px] text-amber-300">◆</span>}
+                </button>
+                {st.orbit > 0 && <div className="mb-1 ml-11 text-[10px] text-white/40">a {formatDist(st.orbit)} del Sol</div>}
+                {planetsOf(st).map((p) => (
               <div key={p.id}>
                 <button onClick={() => setSel(p.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-white/5 ${sel === p.id ? 'bg-white/10' : ''}`}>
                   <span className="inline-block rounded-full" style={{ width: Math.max(8, Math.min(22, Math.log10(p.radius / 1e5) * 9)), height: Math.max(8, Math.min(22, Math.log10(p.radius / 1e5) * 9)), background: p.markerColor, boxShadow: `0 0 10px ${p.markerColor}` }} />
@@ -239,13 +253,15 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
                   </button>
                 ))}
               </div>
+                ))}
+              </div>
             ))}
           </div>
           <div className="flex-1 overflow-y-auto p-8">
             <div className="flex items-start gap-6">
               <div className="h-28 w-28 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 35% 35%, ${def.markerColor}, #000 75%)`, boxShadow: `0 0 40px ${def.markerColor}55` }} />
               <div>
-                <div className="text-[10px] tracking-[0.4em] text-white/50">{def.kind === 'gas' ? 'GIGANTE GASEOSO' : def.kind === 'star' ? 'ESTRELLA' : def.parent ? `LUNA DE ${BODIES.find((b) => b.id === def.parent)!.name.toUpperCase()}` : 'PLANETA ROCOSO'}</div>
+                <div className="text-[10px] tracking-[0.4em] text-white/50">{kindLabel}</div>
                 <div className="text-4xl font-extralight tracking-[0.15em]">{def.name}</div>
                 <p className="mt-3 max-w-2xl text-sm leading-relaxed text-white/75">{def.description}</p>
               </div>
@@ -256,7 +272,7 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               <Row k="Gravedad" v={`${def.gravity} m/s²`} />
               <Row k="Temperatura" v={def.tempText} />
               <Row k="Presión" v={def.kind === 'gas' ? 'Sin superficie' : fmtPressure(def.pressure)} />
-              <Row k={def.parent ? 'Órbita' : 'Distancia al Sol'} v={def.kind === 'star' ? '—' : formatDist(def.orbit)} />
+              <Row k={def.parent ? 'Órbita' : 'Distancia al Sol'} v={def.kind === 'star' && def.orbit <= 0 ? '—' : formatDist(def.orbit)} />
             </div>
             <div className="mt-4 text-[11px] uppercase tracking-[0.2em] text-white/45">Atmósfera</div>
             <div className="text-sm text-white/80">{def.composition}</div>

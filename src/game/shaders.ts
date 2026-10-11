@@ -375,14 +375,17 @@ void main(){
 }
 
 // ---------------------------------------------------------------------------
-export function makeSunMaterial() {
+export function makeSunMaterial(limb: [number, number, number], center: [number, number, number]) {
   return new THREE.ShaderMaterial({
-    uniforms: { uTime: { value: 0 }, uI: { value: 40 } },
+    uniforms: {
+      uTime: { value: 0 }, uI: { value: 40 },
+      uColA: { value: new THREE.Vector3(...limb) }, uColB: { value: new THREE.Vector3(...center) },
+    },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform float uTime; uniform float uI;
+uniform float uTime; uniform float uI; uniform vec3 uColA; uniform vec3 uColB;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 void main(){
@@ -393,7 +396,7 @@ void main(){
   vec3 V = normalize(-vWorld);
   float mu = max(dot(normalize(vNormalW), V), 0.0);
   float limb = 0.3 + 0.7*pow(mu, 0.5);
-  vec3 col = mix(vec3(1.0,0.62,0.25), vec3(1.0,0.9,0.7), limb) * (1.0 + 0.22*g + 0.08*big);
+  vec3 col = mix(uColA, uColB, limb) * (1.0 + 0.22*g + 0.08*big);
   float spots = smoothstep(0.72, 0.8, snoise(n*14.0 + 2.0)) * smoothstep(0.5, 0.1, abs(n.y - 0.3*sign(n.y)));
   col *= 1.0 - 0.6*spots;
   gl_FragColor = vec4(col * limb * uI, 1.0);

@@ -4,7 +4,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { BODIES, AU, C_LIGHT, makeGenerator, type BodyDef } from './bodies';
+import { BODIES, AU, LY, C_LIGHT, SUN_STAR, makeGenerator, type BodyDef } from './bodies';
 import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
@@ -32,6 +32,10 @@ interface Body {
   marker: HTMLDivElement;
   label: HTMLDivElement;
   collapsed: boolean;
+  // stars only
+  starMat?: THREE.ShaderMaterial;
+  glow?: THREE.Sprite;
+  glow2?: THREE.Sprite;
 }
 
 export interface HudState {
@@ -112,6 +116,7 @@ export function formatDist(m: number): string {
   if (a < 1000) return `${s}${a.toFixed(0)} m`;
   if (a < 1e6) return `${s}${(a / 1000).toFixed(2)} km`;
   if (a < 0.02 * AU) return `${s}${Math.round(a / 1000).toLocaleString('es-ES')} km`;
+  if (a >= 0.02 * LY) return `${s}${(a / LY).toFixed(2)} al`;
   return `${s}${(a / AU).toFixed(3)} UA`;
 }
 export function formatSpeed(v: number): string {
@@ -128,10 +133,9 @@ export class Game {
   bloom: UnrealBloomPass;
   bodies: Body[] = [];
   byId = new Map<string, Body>();
+  /** the star lighting the scene: always the nearest star to the player */
   sunBody!: Body;
-  sunMat: THREE.ShaderMaterial;
-  sunGlow: THREE.Sprite;
-  sunGlow2: THREE.Sprite;
+  starBodies: Body[] = [];
   light: THREE.DirectionalLight;
   hemi: THREE.HemisphereLight;
   stars: THREE.Points;
@@ -230,7 +234,7 @@ export class Game {
     r.domElement.style.display = 'block';
     this.renderer = r;
 
-    this.camera = new THREE.PerspectiveCamera(65, container.clientWidth / container.clientHeight, 0.25, 1e15);
+    this.camera = new THREE.PerspectiveCamera(65, container.clientWidth / container.clientHeight, 0.25, 1e17);
     this.scene.add(this.camera);
     this.scene.background = new THREE.Color(0x000000);
 
@@ -274,14 +278,6 @@ export class Game {
     this.scene.add(this.light, this.light.target);
     this.hemi = new THREE.HemisphereLight(0x88aaff, 0x332211, 0.0);
     this.scene.add(this.hemi);
-
-    // sun
-    this.sunMat = makeSunMaterial();
-    const glowTex = radialTexture([[0, 'rgba(255,240,215,1)'], [0.12, 'rgba(255,220,170,0.55)'], [0.35, 'rgba(255,180,110,0.12)'], [1, 'rgba(255,150,80,0)']]);
-    this.sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(2.2, 2.0, 1.7) }));
-    this.sunGlow2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(0.35, 0.3, 0.25) }));
-    this.sunGlow.renderOrder = 5;
-    this.sunGlow2.renderOrder = 5;
 
     this.plasmaMat = makePlasmaMaterial();
     this.createBodies();
@@ -329,7 +325,7 @@ export class Game {
         this.glowMats.push({ mat: mc, base: mc.color.clone() });
       }
     };
-    reg(this.sunGlow.material); reg(this.sunGlow2.material);
+    for (const st of this.starBodies) { reg(st.glow!.material); reg(st.glow2!.material); }
     for (const o of [...this.ship.flames, ...this.ship.glows, ...this.ship.navLights, ...this.astro.jet]) reg(o.material);
     try {
       const v = localStorage.getItem(LIGHTS_KEY);
@@ -353,7 +349,9 @@ export class Game {
         const inc = def.incl ?? 0;
         pos.set(Math.cos(def.angle) * def.orbit, Math.sin(def.angle) * def.orbit * Math.sin(inc), Math.sin(def.angle) * def.orbit * Math.cos(inc)).add(p.pos);
       } else {
-        pos.set(Math.cos(def.angle) * def.orbit, 0, Math.sin(def.angle) * def.orbit);
+        // top-level body: angle = ecliptic longitude from +X, lat = ecliptic latitude (+Y = north)
+        const lat = def.lat ?? 0;
+        pos.set(Math.cos(lat) * Math.cos(def.angle) * def.orbit, Math.sin(lat) * def.orbit, Math.cos(lat) * Math.sin(def.angle) * def.orbit);
       }
       const root = new THREE.Group();
       this.scene.add(root);
@@ -370,10 +368,21 @@ export class Game {
       const b: Body = { def, pos, root, tiltQ, invRot, marker, label, collapsed: false };
 
       if (def.kind === 'star') {
-        const m = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), this.sunMat);
+        const st = def.star ?? SUN_STAR;
+        b.starMat = makeSunMaterial(st.colorLimb, st.colorCenter);
+        const m = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), b.starMat);
         m.scale.setScalar(def.radius);
-        root.add(m, this.sunGlow, this.sunGlow2);
-        this.sunBody = b;
+        const g = st.glowStops;
+        const stop = (k: number, a: number) => `rgba(${g[k][0]},${g[k][1]},${g[k][2]},${a})`;
+        const glowTex = radialTexture([[0, stop(0, 1)], [0.12, stop(1, 0.55)], [0.35, stop(2, 0.12)], [1, stop(3, 0)]]);
+        const tint = new THREE.Color(...st.glowTint);
+        b.glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: tint.clone().multiplyScalar(2.2) }));
+        b.glow2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: tint.clone().multiplyScalar(0.35) }));
+        b.glow.renderOrder = 5;
+        b.glow2.renderOrder = 5;
+        root.add(m, b.glow, b.glow2);
+        this.starBodies.push(b);
+        if (!this.sunBody) this.sunBody = b;
       } else if (def.kind === 'gas') {
         b.gasMat = makeGasMaterial(def.gasType ?? 0);
         const m = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.gasMat);
@@ -555,7 +564,7 @@ export class Game {
     this.bloom.threshold = comfort ? 1.2 : 0.9;
     (this.bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax.value = comfort ? 6 : 16;
     this.renderer.toneMappingExposure = comfort ? 0.82 : 1.0;
-    this.sunMat.uniforms.uI.value = comfort ? 18 : 40;
+    for (const st of this.starBodies) st.starMat!.uniforms.uI.value = (st.def.star ?? SUN_STAR).intensity * (comfort ? 0.45 : 1);
     const f = comfort ? 0.45 : 1;
     for (const { mat, base } of this.glowMats) mat.color.copy(base).multiplyScalar(f);
   }
@@ -629,6 +638,20 @@ export class Game {
   // -------------------------------------------------------------------------
   private terrainH(b: Body, dir: THREE.Vector3) {
     return b.terrain ? b.terrain.heightAt(dir.x, dir.y, dir.z) : 0;
+  }
+
+  private nearestStar(p: THREE.Vector3) {
+    let best = this.starBodies[0], bd = Infinity;
+    for (const s of this.starBodies) {
+      const d = p.distanceToSquared(s.pos);
+      if (d < bd) { bd = d; best = s; }
+    }
+    return best;
+  }
+
+  /** Distance from the current star expressed in "Sun-equivalent AU": the distance from the Sun that would give the same irradiance. */
+  private starAU(d: number) {
+    return d / (AU * Math.sqrt((this.sunBody.def.star ?? SUN_STAR).luminosity));
   }
 
   private findNearest(p: THREE.Vector3) {
@@ -993,20 +1016,23 @@ export class Game {
     }
     const ds = p.distanceTo(this.sunBody.pos);
     const Rs = this.sunBody.def.radius;
+    const star = this.sunBody.def.star ?? SUN_STAR;
     if (def.kind === 'star') {
       this.pressureNow = 0;
-      // radiative equilibrium temperature of a body at this distance from the Sun
-      this.tempNow = 5778 * Math.sqrt(Rs / (2 * Math.max(ds, Rs))) - 273;
+      // radiative equilibrium temperature of a body at this distance from the star
+      this.tempNow = star.teff * Math.sqrt(Rs / (2 * Math.max(ds, Rs))) - 273;
     }
     // Sun heat. You may fly as close as you like; inside 3 solar radii (from the
     // centre) the hull starts to burn, faster the closer you get, and touching the
     // photosphere destroys the ship outright.
     if (ds < Rs * 3 && this.mode === 'ship') {
       const f = (Rs * 3) / ds;
-      this.warnings.push(ds < Rs * 1.8 ? 'CASCO FUNDIÉNDOSE · ALÉJATE DEL SOL' : 'TEMPERATURA DEL CASCO CRÍTICA');
+      this.warnings.push(ds < Rs * 1.8 ? 'CASCO FUNDIÉNDOSE · ALÉJATE DE LA ESTRELLA' : 'TEMPERATURA DEL CASCO CRÍTICA');
       this.hull -= dt * (f * f - 1) * 10;
-      if (ds < Rs * 1.05) this.die('La nave se desintegró al rozar la fotosfera del Sol: 5 500 °C y un flujo de energía decenas de miles de veces mayor que en la Tierra.');
-      else if (this.hull <= 0) this.die('La nave se vaporizó por el calor del Sol. A esta distancia la radiación funde cualquier material conocido.');
+      const sn = this.sunBody.def.name;
+      const tC = Math.round((star.teff - 273) / 100) * 100;
+      if (ds < Rs * 1.05) this.die(`La nave se desintegró al rozar la fotosfera de ${sn}: ${tC.toLocaleString('es-ES')} °C y un flujo de energía miles de veces mayor que en la Tierra.`);
+      else if (this.hull <= 0) this.die(`La nave se vaporizó por el calor de ${sn}. A esta distancia la radiación funde cualquier material conocido.`);
     }
     if (this.hull < 30 && !this.dead && this.mode === 'ship') this.warnings.push(`INTEGRIDAD DEL CASCO ${this.hull.toFixed(0)}%`);
     if (this.mode === 'foot' && this.suit < 40) this.warnings.push(`INTEGRIDAD DEL TRAJE ${Math.max(0, this.suit).toFixed(0)}%`);
@@ -1076,7 +1102,8 @@ export class Game {
     const up = camToB.clone().divideScalar(camR);
     const camAlt = camR - def.radius;
     const sunEl = up.dot(sunDir);
-    const dAU = sunDist / AU;
+    const starDef = this.sunBody.def.star ?? SUN_STAR;
+    const dAU = this.starAU(sunDist);
     const sunI = 3.3 * Math.pow(1 / Math.max(dAU * dAU, 0.05), 0.3);
 
     // body placement & uniforms
@@ -1084,7 +1111,7 @@ export class Game {
       body.root.position.copy(body.pos).sub(cw);
       const bR = body.def.radius;
       const bSun = sunPos.clone().sub(body.pos).normalize();
-      const bAU = sunPos.distanceTo(body.pos) / AU;
+      const bAU = this.starAU(sunPos.distanceTo(body.pos));
       const bSunI = 3.3 * Math.pow(1 / Math.max(bAU * bAU, 0.05), 0.3);
       const rel = body.pos.clone().sub(cw);
       if (body.atmoMat) {
@@ -1138,19 +1165,23 @@ export class Game {
         u.uFogDensity.value = 0;
       }
     }
-    // sun
-    this.sunMat.uniforms.uTime.value = this.time;
-    // halo: a fixed angular size from afar, a modest multiple of the disc up close
-    const Rs = this.sunBody.def.radius;
-    const gs = Math.max(Rs * 2.4, sunDist * 0.035);
-    this.sunGlow.scale.setScalar(gs);
-    this.sunGlow2.scale.setScalar(Math.max(Rs * 4.5, sunDist * 0.14));
+    // stars: surface animation + halo. The halo keeps a fixed angular size out to
+    // ~60 AU, shrinks to a point at interstellar range, and never grows beyond a
+    // modest multiple of the disc up close.
+    for (const st of this.starBodies) {
+      st.starMat!.uniforms.uTime.value = this.time;
+      const d = st.pos.distanceTo(cw);
+      const Rs = st.def.radius;
+      const far = clamp((60 * AU) / d, 0.03, 1);
+      st.glow!.scale.setScalar(Math.max(Rs * 2.4, d * 0.035 * far));
+      st.glow2!.scale.setScalar(Math.max(Rs * 4.5, d * 0.14 * far));
+    }
 
     // lighting at the camera / focus
     const hor = camAlt > 0 ? Math.acos(clamp(def.radius / camR, -1, 1)) : 0;
     let shadowF = def.kind === 'star' ? 1 : smoothstep(-Math.sin(hor) - 0.03, -Math.sin(hor) + 0.02, sunEl);
     if (camAlt < 3000) shadowF = 1; // near ground the shadow map handles it
-    const lc = new THREE.Color(1, 1, 1);
+    const lc = new THREE.Color(...starDef.lightTint);
     let li = sunI;
     let fogDensity = 0;
     const fogC = new THREE.Color(0, 0, 0);
@@ -1418,6 +1449,7 @@ export class Game {
     }
 
     const focus = this.mode === 'ship' ? this.shipPos : this.playerPos;
+    this.sunBody = this.nearestStar(focus);
     this.nearest = this.findNearest(focus).body;
     if (!this.dead && !this.menuOpen) {
       if (this.mode === 'ship') this.updateShip(dt);
@@ -1452,12 +1484,12 @@ export class Game {
       else if (def.kind === 'rocky' && this.altitude < 60) hint = 'E: aterrizar y bajar';
       else if (def.kind === 'gas' && this.altitude < 200000) hint = 'Sin superficie: descender más aumentará la presión';
     } else if (this.playerPos.distanceTo(this.shipPos) < 14) hint = 'E: subir a la nave';
-    const sunD = p.distanceTo(this.sunBody.pos) / AU;
+    const sunD = this.starAU(p.distanceTo(this.sunBody.pos));
     return {
       mode: this.mode,
       bodyId: def.id,
       bodyName: def.name,
-      bodyKind: def.kind === 'gas' ? 'Gigante gaseoso' : def.kind === 'star' ? 'Estrella' : def.parent ? 'Luna' : 'Planeta rocoso',
+      bodyKind: def.kind === 'gas' ? 'Gigante gaseoso' : def.kind === 'star' ? 'Estrella' : def.parent && this.byId.get(def.parent)?.def.kind !== 'star' ? 'Luna' : def.parent ? 'Exoplaneta rocoso' : 'Planeta rocoso',
       altitude: this.altitude,
       speed: this.mode === 'ship' ? this.shipVel.length() : this.playerVel.length(),
       warp: this.warp,
