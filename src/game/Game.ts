@@ -66,6 +66,7 @@ export interface HudState {
   lights: boolean;
   inCloud: boolean;
   quality: string;
+  autopilot: boolean;
 }
 
 const V = () => new THREE.Vector3();
@@ -145,6 +146,8 @@ export class Game {
   warp = false;
   warpSpeed = 0;
   warpT = 0;
+  /** steer towards the selected destination while warping (K); off = free flight */
+  autopilot = false;
   landed = false;
   autoLand = false;
   pendingExit = false;
@@ -525,7 +528,7 @@ export class Game {
 
   setTarget(id: string | null) {
     this.target = id ? this.byId.get(id) ?? null : null;
-    if (this.target) this.note(`Destino fijado: ${this.target.def.name}. Pulsa J para el salto a velocidad luz`);
+    if (this.target) this.note(`Destino fijado: ${this.target.def.name}. J: salto libre · K: piloto automático hacia el destino`);
   }
 
   note(text: string) {
@@ -644,6 +647,14 @@ export class Game {
       }
     }
 
+    // autopilot toggle: only with it on does the warp steer towards the destination
+    if (this.pressed.has('KeyK')) {
+      this.autopilot = !this.autopilot;
+      if (!this.autopilot) this.note('Piloto automático desactivado: salto libre, dirige con el ratón');
+      else if (this.target) this.note(`Piloto automático: rumbo a ${this.target.def.name} durante el salto`);
+      else this.note('Piloto automático activado: fija un destino con T o en el mapa');
+    }
+
     // warp toggling
     if (this.pressed.has('KeyJ')) {
       if (this.warp) {
@@ -660,14 +671,17 @@ export class Game {
         this.warp = true;
         this.warpT = 0;
         this.warpSpeed = Math.max(this.shipVel.length(), 8000);
-        this.note(this.target ? `Salto hacia ${this.target.def.name}` : 'Motor de pulso activado');
+        this.note(this.autopilot && this.target ? `Salto hacia ${this.target.def.name} (piloto automático)` : 'Salto libre: dirige la nave con el ratón');
       }
     }
 
     if (this.warp) {
       this.warpT += dt;
-      if (this.target && this.time - this.lastMouseMove > 0.6) {
-        const want = this.target.pos.clone().sub(this.shipPos).normalize();
+      // Free flight by default: the ship goes wherever you point it, whatever the
+      // selected destination. Only with the autopilot on (K) does it steer there.
+      const tgt = this.autopilot ? this.target : null;
+      if (tgt && this.time - this.lastMouseMove > 0.6) {
+        const want = tgt.pos.clone().sub(this.shipPos).normalize();
         const m = new THREE.Matrix4().lookAt(ZERO, want, sUp);
         const tq = new THREE.Quaternion().setFromRotationMatrix(m);
         this.shipQ.slerp(tq, 1 - Math.exp(-dt * 2.2));
@@ -678,17 +692,29 @@ export class Game {
       this.shipVel.copy(f2).multiplyScalar(this.warpSpeed);
       this.shipPos.addScaledVector(this.shipVel, dt);
       this.throttle = 1;
-      // drop out
+      // drop out of warp
       const nn = this.findNearest(this.shipPos);
-      const approaching = this.shipVel.dot(nn.body.pos.clone().sub(this.shipPos)) > 0;
-      const isTarget = !this.target || nn.body === this.target;
-      const da = this.dropAlt(nn.body) * (isTarget ? 1 : 0.3);
-      if (this.warpT > 1.2 && approaching && nn.alt < da) {
+      const toB = nn.body.pos.clone().sub(this.shipPos);
+      const along = toB.dot(f2);
+      let stop: string | null = null;
+      if (this.warpT > 1.2 && along > 0) {
+        const da = this.dropAlt(nn.body);
+        if (tgt) {
+          const isTarget = nn.body === tgt;
+          if (nn.alt < da * (isTarget ? 1 : 0.3)) stop = isTarget ? `Llegada: ${nn.body.def.name}` : `Trayectoria obstruida por ${nn.body.def.name}. Rodéalo y vuelve a saltar`;
+        } else {
+          // free flight: stop only when the current heading really leads into the body,
+          // so passing near a planet does not kill the jump
+          const miss = Math.sqrt(Math.max(0, toB.lengthSq() - along * along));
+          if (nn.alt < da && miss < nn.body.def.radius + da * 0.6) stop = `Llegada: ${nn.body.def.name}`;
+        }
+      }
+      if (!stop && nn.alt < 15000 && nn.body.def.kind !== 'star') stop = `Demasiado cerca de ${nn.body.def.name}: motor de pulso desactivado`;
+      if (stop) {
         this.warp = false;
-        this.shipVel.copy(f2).multiplyScalar(Math.min(this.warpSpeed, nn.alt * 0.3));
+        this.shipVel.copy(f2).multiplyScalar(Math.min(this.warpSpeed, Math.max(nn.alt, 1000) * 0.3));
         this.throttle = 0.6;
-        if (isTarget) this.note(`Llegada: ${nn.body.def.name}`);
-        else this.note(`Trayectoria obstruida por ${nn.body.def.name}. Rodéalo y vuelve a saltar`);
+        this.note(stop);
       }
       return;
     }
@@ -1399,6 +1425,7 @@ export class Game {
       lights: this.lightsOn,
       inCloud: this.inCloud,
       quality: QUALITY_LEVELS[this.quality].name + (this.qualityManual ? '' : ' (auto)'),
+      autopilot: this.autopilot,
     };
   }
 

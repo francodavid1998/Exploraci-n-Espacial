@@ -90,6 +90,10 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
           <span className="rounded border border-white/20 px-1.5">T</span> siguiente
           <span className="ml-2 rounded border border-white/20 px-1.5">M</span> mapa
         </div>
+        <div className="mt-2 text-[10px] text-white/50">
+          <span className="rounded border border-white/20 px-1.5">K</span> piloto automático:{' '}
+          <span className={s.autopilot ? 'text-amber-200' : 'text-white/40'}>{s.autopilot ? 'ON' : 'OFF · salto libre'}</span>
+        </div>
         <button onClick={onOpenMap} className="pointer-events-auto mt-3 w-full rounded-md border border-amber-300/30 bg-amber-300/10 py-1.5 text-[11px] tracking-[0.2em] text-amber-200 hover:bg-amber-300/20">
           MAPA DEL SISTEMA
         </button>
@@ -160,7 +164,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
             <div><b className="text-white">W / S</b> empuje · <b className="text-white">X</b> parar</div>
             <div><b className="text-white">A / D</b> alabeo · <b className="text-white">Shift</b> turbo</div>
             <div><b className="text-white">Espacio / C</b> subir / bajar (vertical)</div>
-            <div><b className="text-white">J</b> salto a velocidad luz</div>
+            <div><b className="text-white">J</b> salto luz (libre) · <b className="text-white">K</b> piloto automático</div>
             <div><b className="text-white">T / M</b> destino · mapa</div>
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
             <div><b className="text-white">Rueda</b> distancia cámara</div>
