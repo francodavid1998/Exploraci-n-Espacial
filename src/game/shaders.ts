@@ -98,6 +98,8 @@ export function makeAtmosphereMaterial() {
       uMieTint: { value: new THREE.Vector3(1, 1, 1) },
       uFade: { value: 1 },
     },
+    // Ray-march sample counts; raised by the graphics quality level (Game.applyQuality).
+    defines: { ATMO_NS: 16, ATMO_NL: 6 },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
@@ -116,8 +118,8 @@ void main(){
   float t0 = max(a.x, 0.0);
   float t1 = a.y;
   if (p.x < p.y && p.x > 0.0) t1 = min(t1, p.x);
-  const int NS = 16;
-  const int NL = 6;
+  const int NS = ATMO_NS;
+  const int NL = ATMO_NL;
   float ds = (t1 - t0) / float(NS);
   vec3 sumR = vec3(0.0), sumM = vec3(0.0);
   float odR = 0.0, odM = 0.0;

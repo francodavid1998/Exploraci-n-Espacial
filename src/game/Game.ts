@@ -65,12 +65,35 @@ export interface HudState {
   landed: boolean;
   lights: boolean;
   inCloud: boolean;
+  quality: string;
 }
 
 const V = () => new THREE.Vector3();
 const ZERO = new THREE.Vector3();
-/** Scene render resolution relative to CSS pixels (1 = same as before; raise for sharper, slower rendering). */
-const SCENE_SCALE = 1;
+/**
+ * Graphics quality ladder (index 0 = best). The game starts at the top level and
+ * steps down automatically while the frame rate stays under MIN_FPS; G cycles
+ * the levels by hand (that choice is remembered and disables the automatic
+ * fallback). The last level is the baseline that is known to run well.
+ */
+export interface QualityLevel {
+  name: string;
+  /** scene buffer size relative to CSS pixels (1.5 = 2.25x the pixels: supersampling) */
+  sceneScale: number;
+  /** directional shadow map resolution */
+  shadowMap: number;
+  /** atmosphere ray-march samples along the view ray / towards the Sun */
+  atmoSteps: number;
+  atmoLight: number;
+}
+export const QUALITY_LEVELS: QualityLevel[] = [
+  { name: 'Alta', sceneScale: 1.5, shadowMap: 4096, atmoSteps: 24, atmoLight: 8 },
+  { name: 'Media', sceneScale: 1.25, shadowMap: 4096, atmoSteps: 20, atmoLight: 7 },
+  { name: 'Básica', sceneScale: 1, shadowMap: 2048, atmoSteps: 16, atmoLight: 6 },
+];
+const QUALITY_KEY = 'helios-quality';
+/** A level must sustain (nearly) 60 fps on a 60 Hz display to be kept; otherwise step down. */
+const MIN_FPS = 55;
 const posMod = (x: number, m: number) => ((x % m) + m) % m;
 
 export function formatDist(m: number): string {
@@ -141,6 +164,10 @@ export class Game {
   camDistShip = 30;
   camDistFoot = 5;
   lightsOn = false;
+  quality = 0;
+  qualityManual = false;
+  private qualityWin = { t0: 0, frames: 0, bad: 0 };
+  private qualityGrace = 0;
   target: Body | null = null;
   nearest!: Body;
   altitude = 0;
@@ -193,11 +220,15 @@ export class Game {
     this.scene.add(this.camera);
     this.scene.background = new THREE.Color(0x000000);
 
-    // Scene buffer at CSS resolution x SCENE_SCALE (integer sizes). The canvas
+    // Scene buffer at CSS resolution x sceneScale (integer sizes). The canvas
     // itself uses min(devicePixelRatio, 1.5) but only the cheap final pass runs
-    // at that size; rendering the scene at device resolution was 1.5-2.25x
-    // slower on laptops with Windows display scaling.
-    const bw = Math.max(1, Math.round(container.clientWidth * SCENE_SCALE)), bh = Math.max(1, Math.round(container.clientHeight * SCENE_SCALE));
+    // at that size. A remembered manual quality choice wins over the default.
+    try {
+      const saved = localStorage.getItem(QUALITY_KEY);
+      if (saved !== null && QUALITY_LEVELS[+saved]) { this.quality = +saved; this.qualityManual = true; }
+    } catch { /* storage unavailable */ }
+    const q0 = QUALITY_LEVELS[this.quality];
+    const bw = Math.max(1, Math.round(container.clientWidth * q0.sceneScale)), bh = Math.max(1, Math.round(container.clientHeight * q0.sceneScale));
     const rt = new THREE.WebGLRenderTarget(bw, bh, { type: THREE.HalfFloatType, samples: 4 });
     this.composer = new EffectComposer(r, rt);
     this.composer.setPixelRatio(1);
@@ -223,7 +254,7 @@ export class Game {
     // lights
     this.light = new THREE.DirectionalLight(0xffffff, 3);
     this.light.castShadow = true;
-    this.light.shadow.mapSize.set(2048, 2048);
+    this.light.shadow.mapSize.set(q0.shadowMap, q0.shadowMap);
     this.light.shadow.bias = -0.0004;
     this.light.shadow.normalBias = 0.08;
     this.scene.add(this.light, this.light.target);
@@ -240,6 +271,7 @@ export class Game {
 
     this.plasmaMat = makePlasmaMaterial();
     this.createBodies();
+    this.applyQuality(q0);
 
     // ship & astronaut
     this.ship = buildShip(env, this.plasmaMat);
@@ -262,12 +294,13 @@ export class Game {
     this.cloudPts.renderOrder = 1001;
     this.cloudPts.visible = false;
     this.scene.add(this.cloudPts);
-    const S = 260;
+    // Warp streaks: kept sparse, dim and slow on purpose (photosensitivity).
+    const S = 90;
     this.streakData = new Float32Array(S * 6);
     for (let i = 0; i < S; i++) this.respawnStreak(i, true);
     const sg = new THREE.BufferGeometry();
     sg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(S * 6), 3));
-    this.streaks = new THREE.LineSegments(sg, new THREE.LineBasicMaterial({ color: new THREE.Color(1.2, 1.6, 2.6), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+    this.streaks = new THREE.LineSegments(sg, new THREE.LineBasicMaterial({ color: new THREE.Color(0.45, 0.6, 0.95), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
     this.streaks.frustumCulled = false;
     this.streaks.renderOrder = 1002;
     this.scene.add(this.streaks);
@@ -430,10 +463,59 @@ export class Game {
   private onResize = () => {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.renderer.setSize(w, h);
-    this.composer.setSize(Math.max(1, Math.round(w * SCENE_SCALE)), Math.max(1, Math.round(h * SCENE_SCALE)));
+    const s = QUALITY_LEVELS[this.quality].sceneScale;
+    this.composer.setSize(Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s)));
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   };
+
+  /** Apply a quality level: scene buffer scale, shadow map size, atmosphere ray-march steps. */
+  private applyQuality(q: QualityLevel) {
+    const w = this.container.clientWidth, h = this.container.clientHeight;
+    this.composer.setSize(Math.max(1, Math.round(w * q.sceneScale)), Math.max(1, Math.round(h * q.sceneScale)));
+    const sh = this.light.shadow;
+    if (sh.mapSize.x !== q.shadowMap) {
+      sh.mapSize.set(q.shadowMap, q.shadowMap);
+      if (sh.map) { sh.map.dispose(); sh.map = null; }
+    }
+    for (const b of this.bodies) {
+      const m = b.atmoMat;
+      if (!m) continue;
+      if (m.defines.ATMO_NS !== q.atmoSteps || m.defines.ATMO_NL !== q.atmoLight) {
+        m.defines.ATMO_NS = q.atmoSteps;
+        m.defines.ATMO_NL = q.atmoLight;
+        m.needsUpdate = true;
+      }
+    }
+    // shader recompiles and buffer reallocation cause hitches: ignore them for a while (wall clock, ms)
+    this.qualityGrace = performance.now() + 6000;
+    this.qualityWin.t0 = 0; this.qualityWin.frames = 0; this.qualityWin.bad = 0;
+  }
+
+  setQuality(level: number, manual: boolean) {
+    level = clamp(level, 0, QUALITY_LEVELS.length - 1);
+    this.quality = level;
+    this.qualityManual = manual;
+    this.applyQuality(QUALITY_LEVELS[level]);
+    if (manual) { try { localStorage.setItem(QUALITY_KEY, String(level)); } catch { /* ignore */ } }
+  }
+
+  /** Steps the quality down one level when the frame rate stays under MIN_FPS for 4 s (auto mode only). */
+  private qualityWatchdog(t: number) {
+    if (this.qualityManual || this.quality >= QUALITY_LEVELS.length - 1 || t < this.qualityGrace) return;
+    const w = this.qualityWin;
+    if (w.t0 === 0) { w.t0 = t; w.frames = 0; return; }
+    w.frames++;
+    const span = t - w.t0;
+    if (span < 1000) return;
+    const fps = (w.frames * 1000) / span;
+    w.bad = fps < MIN_FPS ? w.bad + 1 : 0;
+    w.frames = 0; w.t0 = t;
+    if (w.bad >= 4) {
+      this.setQuality(this.quality + 1, false);
+      this.note(`Calidad gráfica reducida a ${QUALITY_LEVELS[this.quality].name} para mantener la fluidez (G para cambiar)`);
+    }
+  }
 
   toggleMenu(force?: boolean) {
     this.menuOpen = force ?? !this.menuOpen;
@@ -867,10 +949,6 @@ export class Game {
       const off = new THREE.Vector3(0, this.camDistShip * 0.2, this.camDistShip).applyQuaternion(q);
       eye = this.shipPos.clone().add(off);
       lookQ = q.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.1, 0, 0)));
-      if (this.warp) {
-        const w = Math.min(1, this.warpSpeed / (C_LIGHT * 5));
-        lookQ.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((Math.random() - 0.5) * 0.004 * w, (Math.random() - 0.5) * 0.004 * w, 0)));
-      }
     } else {
       const up = this.playerPos.clone().sub(b.pos).normalize();
       const right = new THREE.Vector3().crossVectors(this.camFwd, up).normalize();
@@ -892,7 +970,7 @@ export class Game {
     this.camWorld.copy(eye);
     this.camera.position.set(0, 0, 0);
     this.camera.quaternion.copy(lookQ);
-    const fov = this.warp ? 65 + 18 * Math.min(1, this.warpSpeed / (C_LIGHT * 20)) : 65;
+    const fov = this.warp ? 65 + 8 * Math.min(1, this.warpSpeed / (C_LIGHT * 20)) : 65;
     if (Math.abs(this.camera.fov - fov) > 0.05) {
       this.camera.fov += (fov - this.camera.fov) * Math.min(1, dt * 3);
       this.camera.updateProjectionMatrix();
@@ -902,7 +980,7 @@ export class Game {
 
   private respawnStreak(i: number, initial: boolean) {
     const a = Math.random() * Math.PI * 2;
-    const rad = 6 + Math.random() * 60;
+    const rad = 16 + Math.random() * 54;
     const z = initial ? -Math.random() * 600 : -600 - Math.random() * 100;
     const d = this.streakData;
     d[i * 6] = Math.cos(a) * rad; d[i * 6 + 1] = Math.sin(a) * rad; d[i * 6 + 2] = z;
@@ -1149,13 +1227,13 @@ export class Game {
     // warp streaks
     const wf = this.warp ? Math.min(1, this.warpSpeed / (C_LIGHT * 0.5)) : 0;
     const sMat = this.streaks.material as THREE.LineBasicMaterial;
-    sMat.opacity += ((this.warp ? 0.85 * Math.max(0.15, wf) : 0) - sMat.opacity) * Math.min(1, dt * 4);
+    sMat.opacity += ((this.warp ? 0.35 * Math.max(0.2, wf) : 0) - sMat.opacity) * Math.min(1, dt * 2);
     this.streaks.visible = sMat.opacity > 0.01;
     if (this.streaks.visible) {
       const d = this.streakData;
       const out = (this.streaks.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
-      const vis = 900 + 3000 * wf;
-      const len = 6 + 120 * wf;
+      const vis = 500 + 1200 * wf;
+      const len = 4 + 40 * wf;
       const q = this.camQ;
       const tmp = new THREE.Vector3();
       for (let i = 0; i < d.length / 6; i++) {
@@ -1242,6 +1320,11 @@ export class Game {
     if (!this.locked) { this.mdx = 0; this.mdy = 0; }
 
     if (this.pressed.has('KeyF')) { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
+    if (this.pressed.has('KeyG')) {
+      this.setQuality((this.quality + 1) % QUALITY_LEVELS.length, true);
+      this.note(`Calidad gráfica: ${QUALITY_LEVELS[this.quality].name}`);
+    }
+    this.qualityWatchdog(t);
     if (this.pressed.has('KeyT')) {
       const list = this.bodies;
       const i = this.target ? list.indexOf(this.target) : -1;
@@ -1315,6 +1398,7 @@ export class Game {
       landed: this.landed,
       lights: this.lightsOn,
       inCloud: this.inCloud,
+      quality: QUALITY_LEVELS[this.quality].name + (this.qualityManual ? '' : ' (auto)'),
     };
   }
 
