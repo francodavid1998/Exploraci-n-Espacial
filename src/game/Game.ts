@@ -67,7 +67,16 @@ export interface HudState {
   inCloud: boolean;
   quality: string;
   autopilot: boolean;
+  lightsMode: LightsMode;
 }
+
+/**
+ * Bright-light comfort setting. 'bright' is the original look; 'comfort' tones
+ * down (never removes) the glow: weaker/higher-threshold bloom, lower exposure,
+ * dimmer Sun disc and halo, dimmer engine flames and navigation lights.
+ */
+export type LightsMode = 'bright' | 'comfort';
+const LIGHTS_KEY = 'helios-lights';
 
 const V = () => new THREE.Vector3();
 const ZERO = new THREE.Vector3();
@@ -167,6 +176,8 @@ export class Game {
   camDistShip = 30;
   camDistFoot = 5;
   lightsOn = false;
+  lightsMode: LightsMode = 'comfort';
+  private glowMats: { mat: THREE.Material & { color: THREE.Color }; base: THREE.Color }[] = [];
   quality = 0;
   qualityManual = false;
   private qualityWin = { t0: 0, frames: 0, bad: 0 };
@@ -307,6 +318,24 @@ export class Game {
     this.streaks.frustumCulled = false;
     this.streaks.renderOrder = 1002;
     this.scene.add(this.streaks);
+
+    // bright-light comfort mode: remember base colours of every glowing material
+    const seen = new Set<THREE.Material>();
+    const reg = (m: THREE.Material | THREE.Material[]) => {
+      for (const x of Array.isArray(m) ? m : [m]) {
+        if (seen.has(x) || !('color' in x)) continue;
+        seen.add(x);
+        const mc = x as THREE.Material & { color: THREE.Color };
+        this.glowMats.push({ mat: mc, base: mc.color.clone() });
+      }
+    };
+    reg(this.sunGlow.material); reg(this.sunGlow2.material);
+    for (const o of [...this.ship.flames, ...this.ship.glows, ...this.ship.navLights, ...this.astro.jet]) reg(o.material);
+    try {
+      const v = localStorage.getItem(LIGHTS_KEY);
+      if (v === 'bright' || v === 'comfort') this.lightsMode = v;
+    } catch { /* storage unavailable */ }
+    this.applyLightsMode();
 
     this.spawnStart();
     this.bindInput();
@@ -518,6 +547,23 @@ export class Game {
       this.setQuality(this.quality + 1, false);
       this.note(`Calidad gráfica reducida a ${QUALITY_LEVELS[this.quality].name} para mantener la fluidez (G para cambiar)`);
     }
+  }
+
+  private applyLightsMode() {
+    const comfort = this.lightsMode === 'comfort';
+    this.bloom.strength = comfort ? 0.25 : 0.55;
+    this.bloom.threshold = comfort ? 1.2 : 0.9;
+    (this.bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax.value = comfort ? 6 : 16;
+    this.renderer.toneMappingExposure = comfort ? 0.82 : 1.0;
+    this.sunMat.uniforms.uI.value = comfort ? 18 : 40;
+    const f = comfort ? 0.45 : 1;
+    for (const { mat, base } of this.glowMats) mat.color.copy(base).multiplyScalar(f);
+  }
+
+  setLightsMode(mode: LightsMode) {
+    this.lightsMode = mode;
+    this.applyLightsMode();
+    try { localStorage.setItem(LIGHTS_KEY, mode); } catch { /* ignore */ }
   }
 
   toggleMenu(force?: boolean) {
@@ -1346,6 +1392,10 @@ export class Game {
     if (!this.locked) { this.mdx = 0; this.mdy = 0; }
 
     if (this.pressed.has('KeyF')) { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
+    if (this.pressed.has('KeyL')) {
+      this.setLightsMode(this.lightsMode === 'comfort' ? 'bright' : 'comfort');
+      this.note(this.lightsMode === 'comfort' ? 'Luces cómodas: brillos y resplandores atenuados' : 'Luces brillantes: aspecto original');
+    }
     if (this.pressed.has('KeyG')) {
       this.setQuality((this.quality + 1) % QUALITY_LEVELS.length, true);
       this.note(`Calidad gráfica: ${QUALITY_LEVELS[this.quality].name}`);
@@ -1426,6 +1476,7 @@ export class Game {
       inCloud: this.inCloud,
       quality: QUALITY_LEVELS[this.quality].name + (this.qualityManual ? '' : ' (auto)'),
       autopilot: this.autopilot,
+      lightsMode: this.lightsMode,
     };
   }
 

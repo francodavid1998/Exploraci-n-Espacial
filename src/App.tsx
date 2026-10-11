@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Game } from './game/Game';
+import { Game, type LightsMode } from './game/Game';
 import Hud, { SystemMap } from './components/Hud';
 
 export default function App() {
@@ -9,6 +9,7 @@ export default function App() {
   const [started, setStarted] = useState(false);
   const [menu, setMenu] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lights, setLights] = useState<LightsMode>('comfort');
 
   useEffect(() => {
     if (!containerRef.current || !markerRef.current) return;
@@ -18,6 +19,7 @@ export default function App() {
         g = new Game(containerRef.current!, markerRef.current!);
         g.onMenuToggle = (o) => setMenu(o);
         if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) (window as unknown as { __game?: Game }).__game = g; // debug hook (dev only)
+        setLights(g.lightsMode);
         setGame(g);
       } catch (e) {
         console.error(e);
@@ -68,6 +70,17 @@ export default function App() {
             >
               {game ? 'INICIAR' : 'GENERANDO MUNDOS…'}
             </button>
+            <div className="mt-4 text-[11px] text-white/60">
+              Luces:{' '}
+              <button
+                disabled={!game}
+                onClick={() => { const next: LightsMode = lights === 'comfort' ? 'bright' : 'comfort'; game?.setLightsMode(next); setLights(next); }}
+                className="pointer-events-auto rounded border border-white/20 px-2 py-0.5 text-white/80 hover:bg-white/10 disabled:opacity-40"
+              >
+                {lights === 'comfort' ? 'cómodas' : 'brillantes'}
+              </button>
+              <span className="ml-2 text-white/40">(cambiar con L durante el juego)</span>
+            </div>
             <div className="mt-8 grid grid-cols-3 gap-4 text-[11px] text-white/50">
               <div><b className="block text-white/80">Ratón + WASD</b>pilotar / caminar</div>
               <div><b className="block text-white/80">J</b>salto a velocidad luz</div>

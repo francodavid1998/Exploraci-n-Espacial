@@ -169,6 +169,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
             <div><b className="text-white">Rueda</b> distancia cámara</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
+            <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
           </div>
         ) : (
           <div className="space-y-0.5">
@@ -177,6 +178,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
+            <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
           </div>
         ))}
       </div>
