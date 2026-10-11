@@ -68,7 +68,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
         <Row k={altLabel} v={altVal} accent={isGas && s.altitude < 0} />
         <Row k="Gravedad" v={`${s.gravity} m/s² · ${(s.gravity / 9.81).toFixed(2)} g`} />
         <Row k="Presión" v={fmtPressure(s.pressure)} accent={s.pressure > 20} />
-        <Row k="Temperatura" v={isGas && s.altitude < 0 ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
+        <Row k="Temperatura" v={(isGas && s.altitude < 0) || s.bodyId === 'sun' ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
         <Row k="Luz solar" v={`${(s.sunlight * 100).toFixed(s.sunlight < 0.1 ? 2 : 0)}% de la Tierra`} />
         <div className="mt-2 border-t border-white/10 pt-2 text-[11px] leading-relaxed text-white/60">{s.composition}</div>
       </div>

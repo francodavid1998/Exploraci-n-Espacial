@@ -585,7 +585,7 @@ export class Game {
   respawn() {
     const b = this.nearest;
     const R = b.def.radius;
-    const off = Math.max(R * 0.35, (b.def.atmo?.height ?? 0) * 2.5, 60000);
+    const off = b.def.kind === 'star' ? R * 6 : Math.max(R * 0.35, (b.def.atmo?.height ?? 0) * 2.5, 60000);
     const dir = this.shipPos.clone().sub(b.pos).normalize();
     this.shipPos.copy(b.pos).addScaledVector(dir, R + off);
     const perp = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0.1)).normalize();
@@ -642,7 +642,7 @@ export class Game {
 
   private dropAlt(b: Body) {
     const R = b.def.radius;
-    if (b.def.kind === 'star') return R * 18;
+    if (b.def.kind === 'star') return R * 2.5;
     if (b.def.kind === 'gas') return Math.max(R * 0.8, (b.def.atmo?.height ?? 0) * 4);
     return Math.max(R * 0.9, (b.def.atmo?.height ?? 0) * 4, 4000);
   }
@@ -772,8 +772,8 @@ export class Game {
     const boost = k.has('ShiftLeft') || k.has('ShiftRight');
     const altEff = isGas ? Math.abs(alt) : Math.max(alt, 0);
     let maxS = clamp(altEff * 0.5, isGas ? 4000 : 30, 2.5e6);
-    if (def.kind === 'star') maxS = clamp(altEff * 0.5, 1e5, 2.5e7);
-    if (boost) maxS = Math.min(maxS * 3.5, 1e7);
+    if (def.kind === 'star') maxS = clamp(altEff * 0.5, 1e5, 1e8); // fast enough to dive at the Sun
+    if (boost) maxS = Math.min(maxS * 3.5, Math.max(1e7, maxS));
     const vert = (k.has('Space') ? 1 : 0) - (k.has('KeyC') || k.has('KeyQ') ? 1 : 0);
 
     if (this.landed) {
@@ -990,18 +990,23 @@ export class Game {
     } else if (def.kind === 'rocky') {
       this.pressureNow = def.pressure * Math.exp(-Math.max(0, alt) / def.scaleHeight);
       this.tempNow = def.tempC;
-    } else {
-      this.pressureNow = 0;
-      this.tempNow = 5500;
     }
-    // sun heat
     const ds = p.distanceTo(this.sunBody.pos);
     const Rs = this.sunBody.def.radius;
-    if (ds < Rs * 12 && this.mode === 'ship') {
-      const f = (Rs * 12) / ds;
-      this.warnings.push('TEMPERATURA DEL CASCO CRÍTICA');
-      this.hull -= dt * (f * f - 1) * 6;
-      if (this.hull <= 0) this.die('La nave se vaporizó por el calor del Sol. A esta distancia la radiación supera los miles de grados.');
+    if (def.kind === 'star') {
+      this.pressureNow = 0;
+      // radiative equilibrium temperature of a body at this distance from the Sun
+      this.tempNow = 5778 * Math.sqrt(Rs / (2 * Math.max(ds, Rs))) - 273;
+    }
+    // Sun heat. You may fly as close as you like; inside 3 solar radii (from the
+    // centre) the hull starts to burn, faster the closer you get, and touching the
+    // photosphere destroys the ship outright.
+    if (ds < Rs * 3 && this.mode === 'ship') {
+      const f = (Rs * 3) / ds;
+      this.warnings.push(ds < Rs * 1.8 ? 'CASCO FUNDIÉNDOSE · ALÉJATE DEL SOL' : 'TEMPERATURA DEL CASCO CRÍTICA');
+      this.hull -= dt * (f * f - 1) * 10;
+      if (ds < Rs * 1.05) this.die('La nave se desintegró al rozar la fotosfera del Sol: 5 500 °C y un flujo de energía decenas de miles de veces mayor que en la Tierra.');
+      else if (this.hull <= 0) this.die('La nave se vaporizó por el calor del Sol. A esta distancia la radiación funde cualquier material conocido.');
     }
     if (this.hull < 30 && !this.dead && this.mode === 'ship') this.warnings.push(`INTEGRIDAD DEL CASCO ${this.hull.toFixed(0)}%`);
     if (this.mode === 'foot' && this.suit < 40) this.warnings.push(`INTEGRIDAD DEL TRAJE ${Math.max(0, this.suit).toFixed(0)}%`);
@@ -1135,9 +1140,11 @@ export class Game {
     }
     // sun
     this.sunMat.uniforms.uTime.value = this.time;
-    const gs = Math.max(this.sunBody.def.radius * 9, sunDist * 0.035);
+    // halo: a fixed angular size from afar, a modest multiple of the disc up close
+    const Rs = this.sunBody.def.radius;
+    const gs = Math.max(Rs * 2.4, sunDist * 0.035);
     this.sunGlow.scale.setScalar(gs);
-    this.sunGlow2.scale.setScalar(gs * 4);
+    this.sunGlow2.scale.setScalar(Math.max(Rs * 4.5, sunDist * 0.14));
 
     // lighting at the camera / focus
     const hor = camAlt > 0 ? Math.acos(clamp(def.radius / camR, -1, 1)) : 0;
@@ -1201,7 +1208,10 @@ export class Game {
         this.setOverlay(fc, (1 - camAlt / 20000) * 0.45);
       }
     }
-    if (!this.inCloud && !(def.kind === 'gas' && camAlt < 20000)) this.setOverlay(fogC, 0);
+    // heat haze when flying close to the Sun (ramps in from 4 solar radii)
+    const starHeat = def.kind === 'star' ? clamp((3 - camR / def.radius) / 2, 0, 1) : 0;
+    if (starHeat > 0) this.setOverlay(new THREE.Color(1.0, 0.45, 0.15).multiplyScalar(1.2 * starHeat), starHeat * starHeat * 0.55);
+    if (starHeat <= 0 && !this.inCloud && !(def.kind === 'gas' && camAlt < 20000)) this.setOverlay(fogC, 0);
     li *= shadowF;
     this.light.color.copy(lc);
     this.light.intensity = li;
