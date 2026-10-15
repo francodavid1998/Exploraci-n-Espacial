@@ -62,6 +62,7 @@ export default function App() {
             <p className="mx-auto mt-8 max-w-xl text-sm leading-relaxed text-white/70">
               Del Sol a Neptuno a escala real. Pilota tu nave, salta entre mundos a velocidad luz, atraviesa atmósferas,
               aterriza y camina sobre la Luna, Marte, Titán o Europa. Desciende en Júpiter… si te atreves: no hay suelo, solo presión.
+              Y cruza 4,2 años luz hasta Próxima Centauri, la estrella más cercana, con sus tres mundos.
             </p>
             <button
               disabled={!game}
