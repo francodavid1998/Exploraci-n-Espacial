@@ -132,6 +132,9 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
           <div className="text-[10px] tracking-[0.3em] text-white/50">VELOCIDAD</div>
           <div className="min-w-[150px] text-3xl font-extralight tracking-wider">{formatSpeed(s.speed)}</div>
           {s.mode === 'ship' && c > 0.0005 && <div className="text-[10px] text-cyan-300/80">{(c * 100).toFixed(c < 0.01 ? 3 : 1)}% velocidad de la luz</div>}
+          {s.mode === 'ship' && c > 0.1 && c < 1 && (
+            <div className="text-[10px] text-cyan-200/60">dilatación temporal γ = {(1 / Math.sqrt(1 - c * c)).toFixed(2)} · 1 s a bordo = {(1 / Math.sqrt(1 - c * c)).toFixed(2)} s fuera</div>
+          )}
         </div>
         {s.mode === 'ship' ? (
           <div className="flex flex-col gap-2">
@@ -168,6 +171,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
             <div><b className="text-white">A / D</b> alabeo · <b className="text-white">Shift</b> turbo</div>
             <div><b className="text-white">Espacio / C</b> subir / bajar (vertical)</div>
             <div><b className="text-white">J</b> salto luz (libre) · <b className="text-white">K</b> piloto automático</div>
+            <div><b className="text-white">V</b> arranque rápido del pulso: {s.fastStart ? 'ON' : 'OFF'}</div>
             <div><b className="text-white">T / M</b> destino · mapa</div>
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
             <div><b className="text-white">Rueda</b> distancia cámara</div>

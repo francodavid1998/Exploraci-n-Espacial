@@ -14,20 +14,22 @@ export interface StarDef {
   glowStops: [number, number, number][]; // four RGB stops (0-255) for the halo texture
   glowTint: [number, number, number]; // halo sprite tint
   lightTint: [number, number, number]; // colour of the light cast on planets
-  intensity: number; // disc brightness
+  intensity: number; // disc brightness (keep low for red stars or tone mapping bleaches them white)
+  glowIntensity: number; // halo sprite brightness
 }
+/** The Sun seen from space is white (G2V, 5 778 K); it only looks yellow or red through an atmosphere. */
 export const SUN_STAR: StarDef = {
   luminosity: 1, teff: 5778,
-  colorLimb: [1.0, 0.62, 0.25], colorCenter: [1.0, 0.9, 0.7],
-  glowStops: [[255, 240, 215], [255, 220, 170], [255, 180, 110], [255, 150, 80]],
-  glowTint: [1, 0.91, 0.77], lightTint: [1, 1, 1], intensity: 40,
+  colorLimb: [1.0, 0.8, 0.55], colorCenter: [1.0, 0.97, 0.92],
+  glowStops: [[255, 250, 242], [255, 240, 222], [255, 226, 196], [255, 212, 172]],
+  glowTint: [1, 0.97, 0.92], lightTint: [1, 1, 1], intensity: 40, glowIntensity: 2.2,
 };
 /** Proxima Centauri: M5.5Ve red dwarf (Teff ≈ 3 040 K, L ≈ 0.15 % L☉, Ribas et al. 2017). */
 export const PROXIMA_STAR: StarDef = {
   luminosity: 0.00151, teff: 3042,
-  colorLimb: [0.72, 0.12, 0.03], colorCenter: [1.0, 0.45, 0.2],
-  glowStops: [[255, 160, 110], [255, 95, 50], [225, 55, 22], [170, 30, 10]],
-  glowTint: [1, 0.45, 0.25], lightTint: [1, 0.72, 0.55], intensity: 26,
+  colorLimb: [0.55, 0.08, 0.02], colorCenter: [1.0, 0.32, 0.1],
+  glowStops: [[255, 120, 70], [240, 70, 30], [200, 40, 12], [150, 25, 8]],
+  glowTint: [1, 0.3, 0.12], lightTint: [1, 0.72, 0.55], intensity: 4, glowIntensity: 1.1,
 };
 
 export type BodyKind = 'star' | 'rocky' | 'gas';

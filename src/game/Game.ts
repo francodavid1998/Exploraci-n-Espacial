@@ -43,6 +43,8 @@ interface Body {
   starMat?: THREE.ShaderMaterial;
   glow?: THREE.Sprite;
   glow2?: THREE.Sprite;
+  glowBase?: THREE.Color;
+  glow2Base?: THREE.Color;
 }
 
 export interface HudState {
@@ -79,6 +81,7 @@ export interface HudState {
   quality: string;
   autopilot: boolean;
   lightsMode: LightsMode;
+  fastStart: boolean;
 }
 
 /**
@@ -159,6 +162,10 @@ export class Game {
   lastCamWorld = V();
   /** camera position minus the followed anchor (ship or player), computed with small exact numbers */
   camOff = V();
+  /** pulse-engine look: Doppler tint strength (0..1) and direction of travel */
+  dop = 0;
+  dopDir = new THREE.Vector3(0, 0, -1);
+  private outputPass: OutputPass;
   mode: 'ship' | 'foot' = 'ship';
   shipPos = V();
   shipVel = V();
@@ -170,6 +177,8 @@ export class Game {
   warpT = 0;
   /** steer towards the selected destination while warping (K); off = free flight */
   autopilot = false;
+  /** V: start a pulse jump at high speed when far from every body and the heading is clear */
+  fastStart = true;
   landed = false;
   autoLand = false;
   pendingExit = false;
@@ -190,6 +199,8 @@ export class Game {
   camDistFoot = 5;
   lightsOn = false;
   lightsMode: LightsMode = 'comfort';
+  /** brightness factor of glowing things for the current lights mode */
+  private glowFactor = 1;
   private glowMats: { mat: THREE.Material & { color: THREE.Color }; base: THREE.Color }[] = [];
   quality = 0;
   qualityManual = false;
@@ -269,6 +280,7 @@ export class Game {
     const output = new OutputPass();
     hardenOutputPass(output);
     this.composer.addPass(output);
+    this.outputPass = output;
 
     const pmrem = new THREE.PMREMGenerator(r);
     const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -313,8 +325,9 @@ export class Game {
     this.cloudPts.renderOrder = 1001;
     this.cloudPts.visible = false;
     this.scene.add(this.cloudPts);
-    // Warp streaks: kept sparse, dim and slow on purpose (photosensitivity).
-    const S = 90;
+    // Warp streaks: a bare motion hint. The main light-speed effect is the
+    // Doppler tint of the (static) sky plus a global blue colour grade, see updateScene.
+    const S = 40;
     this.streakData = new Float32Array(S * 6);
     for (let i = 0; i < S; i++) this.respawnStreak(i, true);
     const sg = new THREE.BufferGeometry();
@@ -334,11 +347,12 @@ export class Game {
         this.glowMats.push({ mat: mc, base: mc.color.clone() });
       }
     };
-    for (const st of this.starBodies) { reg(st.glow!.material); reg(st.glow2!.material); }
     for (const o of [...this.ship.flames, ...this.ship.glows, ...this.ship.navLights, ...this.astro.jet]) reg(o.material);
     try {
       const v = localStorage.getItem(LIGHTS_KEY);
       if (v === 'bright' || v === 'comfort') this.lightsMode = v;
+      const fs = localStorage.getItem('helios-faststart');
+      if (fs === '0' || fs === '1') this.fastStart = fs === '1';
     } catch { /* storage unavailable */ }
     this.applyLightsMode();
 
@@ -398,8 +412,10 @@ export class Game {
         const stop = (k: number, a: number) => `rgba(${g[k][0]},${g[k][1]},${g[k][2]},${a})`;
         const glowTex = radialTexture([[0, stop(0, 1)], [0.12, stop(1, 0.55)], [0.35, stop(2, 0.12)], [1, stop(3, 0)]]);
         const tint = new THREE.Color(...st.glowTint);
-        b.glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: tint.clone().multiplyScalar(2.2) }));
-        b.glow2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: tint.clone().multiplyScalar(0.35) }));
+        b.glowBase = tint.clone().multiplyScalar(st.glowIntensity);
+        b.glow2Base = tint.clone().multiplyScalar(st.glowIntensity * 0.16);
+        b.glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: b.glowBase.clone() }));
+        b.glow2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: b.glow2Base.clone() }));
         b.glow.renderOrder = 5;
         b.glow2.renderOrder = 5;
         root.add(m, b.glow, b.glow2);
@@ -604,6 +620,7 @@ export class Game {
     this.renderer.toneMappingExposure = comfort ? 0.82 : 1.0;
     for (const st of this.starBodies) st.starMat!.uniforms.uI.value = (st.def.star ?? SUN_STAR).intensity * (comfort ? 0.45 : 1);
     const f = comfort ? 0.45 : 1;
+    this.glowFactor = f;
     for (const { mat, base } of this.glowMats) mat.color.copy(base).multiplyScalar(f);
   }
 
@@ -687,6 +704,34 @@ export class Game {
     return best;
   }
 
+  /**
+   * RGB transmittance of body `b`'s atmosphere along the view ray from the camera
+   * towards `dir` (1 = clear). Rayleigh scattering removes blue first, so a star
+   * seen through an atmosphere turns yellow, then orange and red near the horizon.
+   */
+  private atmoTransmittance(b: Body, dir: THREE.Vector3, out: THREE.Vector3) {
+    out.set(1, 1, 1);
+    const a = b.def.atmo;
+    if (!a || b.def.kind !== 'rocky') return out;
+    const R = b.def.radius, Ra = R + a.height;
+    const ro = this.camWorld.clone().sub(b.pos);
+    const r2 = ro.lengthSq();
+    if (r2 > Ra * Ra) return out;
+    const bq = ro.dot(dir);
+    const t1 = -bq + Math.sqrt(Math.max(bq * bq - (r2 - Ra * Ra), 0));
+    const NS = 16, ds = t1 / NS;
+    let odR = 0, odM = 0;
+    const p = new THREE.Vector3();
+    for (let i = 0; i < NS; i++) {
+      p.copy(ro).addScaledVector(dir, ds * (i + 0.5));
+      const h = Math.max(p.length() - R, 0);
+      odR += Math.exp(-h / a.HR) * ds;
+      odM += Math.exp(-h / a.HM) * ds;
+    }
+    const m = a.betaM * 1.1 * odM;
+    return out.set(Math.exp(-(a.betaR[0] * odR + m)), Math.exp(-(a.betaR[1] * odR + m)), Math.exp(-(a.betaR[2] * odR + m)));
+  }
+
   /** Distance from the current star expressed in "Sun-equivalent AU": the distance from the Sun that would give the same irradiance. */
   private starAU(d: number) {
     return d / (AU * Math.sqrt((this.sunBody.def.star ?? SUN_STAR).luminosity));
@@ -706,6 +751,19 @@ export class Game {
     if (b.def.kind === 'star') return R * 2.5;
     if (b.def.kind === 'gas') return Math.max(R * 0.8, (b.def.atmo?.height ?? 0) * 4);
     return Math.max(R * 0.9, (b.def.atmo?.height ?? 0) * 4, 4000);
+  }
+
+  /** Why a full-power jump start is not allowed right now (null = allowed). */
+  private fastStartBlocker(fwd: THREE.Vector3): string | null {
+    const cosCone = Math.cos((12 * Math.PI) / 180);
+    for (const b of this.bodies) {
+      const rel = b.pos.clone().sub(this.shipPos);
+      const len = rel.length();
+      const dist = len - b.def.radius;
+      if (dist < Math.max(b.def.radius * 20, 1e8)) return `demasiado cerca de ${b.def.name}`;
+      if (rel.dot(fwd) / len > cosCone && dist < Math.max(this.dropAlt(b) * 50, b.def.radius * 2000)) return `${b.def.name} en la trayectoria`;
+    }
+    return null;
   }
 
   private warpCap(p: THREE.Vector3) {
@@ -754,6 +812,13 @@ export class Game {
       }
     }
 
+    // fast-start toggle for the pulse engine
+    if (this.pressed.has('KeyV')) {
+      this.fastStart = !this.fastStart;
+      try { localStorage.setItem('helios-faststart', this.fastStart ? '1' : '0'); } catch { /* ignore */ }
+      this.note(this.fastStart ? 'Arranque rápido del pulso: activado (lejos de los astros y con la ruta despejada)' : 'Arranque rápido del pulso: desactivado');
+    }
+
     // autopilot toggle: only with it on does the warp steer towards the destination
     if (this.pressed.has('KeyK')) {
       this.autopilot = !this.autopilot;
@@ -778,7 +843,16 @@ export class Game {
         this.warp = true;
         this.warpT = 0;
         this.warpSpeed = Math.max(this.shipVel.length(), 8000);
-        this.note(this.autopilot && this.target ? `Salto hacia ${this.target.def.name} (piloto automático)` : 'Salto libre: dirige la nave con el ratón');
+        let how = '';
+        if (this.fastStart) {
+          const block = this.fastStartBlocker(fwd);
+          if (block) how = ` · arranque normal: ${block}`;
+          else {
+            this.warpSpeed = Math.max(this.warpSpeed, this.warpCap(this.shipPos) * 0.3);
+            how = ` · arranque rápido a ${formatSpeed(this.warpSpeed)}`;
+          }
+        }
+        this.note((this.autopilot && this.target ? `Salto hacia ${this.target.def.name} (piloto automático)` : 'Salto libre: dirige la nave con el ratón') + how);
       }
     }
 
@@ -1211,13 +1285,20 @@ export class Game {
     // stars: surface animation + halo. The halo keeps a fixed angular size out to
     // ~60 AU, shrinks to a point at interstellar range, and never grows beyond a
     // modest multiple of the disc up close.
+    const tint = new THREE.Vector3();
     for (const st of this.starBodies) {
       st.starMat!.uniforms.uTime.value = this.time;
-      const d = st.pos.distanceTo(cw);
+      const rel = st.pos.clone().sub(cw);
+      const d = rel.length();
       const Rs = st.def.radius;
       const far = clamp((60 * AU) / d, 0.03, 1);
       st.glow!.scale.setScalar(Math.max(Rs * 2.4, d * 0.035 * far));
       st.glow2!.scale.setScalar(Math.max(Rs * 4.5, d * 0.14 * far));
+      // seen from inside an atmosphere the star is reddened and dimmed
+      this.atmoTransmittance(b, rel.divideScalar(d), tint);
+      st.starMat!.uniforms.uTint.value.copy(tint);
+      (st.glow!.material as THREE.SpriteMaterial).color.copy(st.glowBase!).multiplyScalar(this.glowFactor).multiply(new THREE.Color(tint.x, tint.y, tint.z));
+      (st.glow2!.material as THREE.SpriteMaterial).color.copy(st.glow2Base!).multiplyScalar(this.glowFactor).multiply(new THREE.Color(tint.x, tint.y, tint.z));
     }
 
     // lighting at the camera / focus
@@ -1383,8 +1464,23 @@ export class Game {
     }
     // warp streaks
     const wf = this.warp ? Math.min(1, this.warpSpeed / (C_LIGHT * 0.5)) : 0;
+    // Light-speed look, pulse engine only (normal flight is untouched): every
+    // star stays exactly in place, but the sky tints blue/brighter ahead and
+    // red/dimmer behind, and the whole image takes a gentle blue colour grade
+    // (a multiplication before tone mapping: hue shifts, nothing is hidden or
+    // washed out). Everything eases in and out; nothing flashes.
+    const vShip = this.mode === 'ship' ? this.shipVel.length() : 0;
+    const dopTarget = this.warp && this.mode === 'ship' ? Math.min(0.85, 1 - Math.exp(-vShip / (0.5 * C_LIGHT))) : 0;
+    this.dop += (dopTarget - this.dop) * Math.min(1, dt * 2);
+    if (vShip > 1) this.dopDir.copy(this.shipVel).divideScalar(vShip);
+    for (const m of [this.stars.material, this.milky.material] as THREE.ShaderMaterial[]) {
+      m.uniforms.uDop.value = this.dop;
+      m.uniforms.uVel.value.copy(this.dopDir);
+    }
+    const k = this.dop * (0.6 + 0.4 * this.glowFactor);
+    (this.outputPass.material.uniforms as Record<string, THREE.IUniform>).heliosGrade.value.set(1 - 0.14 * k, 1 - 0.05 * k, 1 + 0.14 * k);
     const sMat = this.streaks.material as THREE.LineBasicMaterial;
-    sMat.opacity += ((this.warp ? 0.35 * Math.max(0.2, wf) : 0) - sMat.opacity) * Math.min(1, dt * 2);
+    sMat.opacity += ((this.warp ? 0.15 * Math.max(0.2, wf) : 0) - sMat.opacity) * Math.min(1, dt * 2);
     this.streaks.visible = sMat.opacity > 0.01;
     if (this.streaks.visible) {
       const d = this.streakData;
@@ -1446,6 +1542,10 @@ export class Game {
     // light-years away) would stack their labels: keep only the most relevant
     // one per spot: the destination, then stars, then the largest body.
     const placed: { x: number; y: number }[] = [];
+    // "Behind the camera" must be decided geometrically: with a 1e17 m far plane
+    // the projected depth of a body behind us rounds to exactly 1.0 in doubles,
+    // so testing NDC z would draw mirrored ghost markers inside the view.
+    const camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
     const rank = (b: Body) => (b === this.target ? 2 : 0) + (b.def.kind === 'star' ? 1 : 0);
     const order = [...this.bodies].sort((a, b) => rank(b) - rank(a) || b.def.radius - a.def.radius);
     for (const b of order) {
@@ -1455,9 +1555,9 @@ export class Game {
       const isT = this.target === b;
       const show = (ang < 0.05 || isT) && dist > b.def.radius * 1.5;
       if (!show) { b.marker.style.display = 'none'; continue; }
+      const behind = v.dot(camFwd) <= 0;
       v.project(this.camera);
       let x = v.x, y = v.y;
-      const behind = v.z > 1 || v.z < -1;
       if (behind || Math.abs(x) > 1 || Math.abs(y) > 1) {
         if (!isT) { b.marker.style.display = 'none'; continue; }
         if (behind) { x = -x; y = -y; }
@@ -1573,6 +1673,7 @@ export class Game {
       quality: QUALITY_LEVELS[this.quality].name + (this.qualityManual ? '' : ' (auto)'),
       autopilot: this.autopilot,
       lightsMode: this.lightsMode,
+      fastStart: this.fastStart,
     };
   }
 

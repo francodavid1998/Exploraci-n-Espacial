@@ -66,6 +66,7 @@ vec2 rsi(vec3 ro, vec3 rd, float r){
 }
 `;
 
+
 const SHELL_VERT = /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_vertex>
@@ -380,12 +381,13 @@ export function makeSunMaterial(limb: [number, number, number], center: [number,
     uniforms: {
       uTime: { value: 0 }, uI: { value: 40 },
       uColA: { value: new THREE.Vector3(...limb) }, uColB: { value: new THREE.Vector3(...center) },
+      uTint: { value: new THREE.Vector3(1, 1, 1) }, // atmospheric transmittance towards the star
     },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform float uTime; uniform float uI; uniform vec3 uColA; uniform vec3 uColB;
+uniform float uTime; uniform float uI; uniform vec3 uColA; uniform vec3 uColB; uniform vec3 uTint;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 void main(){
@@ -399,7 +401,7 @@ void main(){
   vec3 col = mix(uColA, uColB, limb) * (1.0 + 0.22*g + 0.08*big);
   float spots = smoothstep(0.72, 0.8, snoise(n*14.0 + 2.0)) * smoothstep(0.5, 0.1, abs(n.y - 0.3*sign(n.y)));
   col *= 1.0 - 0.6*spots;
-  gl_FragColor = vec4(col * limb * uI, 1.0);
+  gl_FragColor = vec4(col * limb * uI * uTint, 1.0);
 }
 `,
   });
@@ -655,14 +657,21 @@ export function makeStars(count: number) {
   geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
   geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 1 }, uPR: { value: 1 } },
+    uniforms: { uAlpha: { value: 1 }, uPR: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 } },
     vertexShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_vertex>
-attribute vec3 aColor; attribute float aSize; uniform float uAlpha; uniform float uPR;
+attribute vec3 aColor; attribute float aSize; uniform float uAlpha; uniform float uPR; uniform vec3 uVel; uniform float uDop;
 varying vec3 vColor;
+// Pulse-engine Doppler tint: colour only, positions never change.
+// c = cosine of the angle between the star direction and the direction of travel.
+vec3 dopplerTint(float c, float k){
+  vec3 blue = vec3(0.62, 0.78, 1.0), red = vec3(1.0, 0.55, 0.42);
+  vec3 t = c > 0.0 ? mix(vec3(1.0), blue, c) : mix(vec3(1.0), red, -c);
+  return mix(vec3(1.0), t, k) * (1.0 + k * 0.55 * c);
+}
 void main(){
-  vColor = aColor * uAlpha;
+  vColor = aColor * uAlpha * dopplerTint(dot(normalize(position), uVel), uDop);
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * mv;
   gl_PointSize = aSize * uPR;
@@ -692,14 +701,21 @@ void main(){
 
 export function makeMilkyWay() {
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 1 } },
+    uniforms: { uAlpha: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 } },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform float uAlpha;
+uniform float uAlpha; uniform vec3 uVel; uniform float uDop;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
+// Pulse-engine Doppler tint: colour only, positions never change.
+// c = cosine of the angle between the star direction and the direction of travel.
+vec3 dopplerTint(float c, float k){
+  vec3 blue = vec3(0.62, 0.78, 1.0), red = vec3(1.0, 0.55, 0.42);
+  vec3 t = c > 0.0 ? mix(vec3(1.0), blue, c) : mix(vec3(1.0), red, -c);
+  return mix(vec3(1.0), t, k) * (1.0 + k * 0.55 * c);
+}
 void main(){
   #include <logdepthbuf_fragment>
   vec3 d = normalize(vObj);
@@ -714,7 +730,7 @@ void main(){
   vec3 col = vec3(0.5, 0.56, 0.72) * band * (0.35 + 0.9*n*n2) * (1.0 + 2.0*cb);
   col += vec3(0.95, 0.75, 0.5) * cb * band * 0.6;
   col *= 1.0 - 0.85*dust;
-  gl_FragColor = vec4(col * 0.05 * uAlpha, 1.0);
+  gl_FragColor = vec4(col * 0.05 * uAlpha * dopplerTint(dot(d, uVel), uDop), 1.0);
 }`,
     side: THREE.BackSide,
     depthWrite: false,
@@ -805,14 +821,19 @@ void main(){
   mat.needsUpdate = true;
 }
 
-/** Sanitize NaN/Inf right before tone mapping (a NaN tone-maps to black). */
+/**
+ * Sanitize NaN/Inf right before tone mapping (a NaN tone-maps to black) and add
+ * a global colour grade (`heliosGrade`, multiplied before tone mapping) used for
+ * the light-speed look: a multiplication shifts hue without washing out contrast.
+ */
 export function hardenOutputPass(pass: OutputPass) {
   const mat = pass.material;
   const anchor = 'gl_FragColor = texture2D( tDiffuse, vUv );';
   if (!mat.fragmentShader.includes(anchor)) return;
+  (mat.uniforms as Record<string, THREE.IUniform>).heliosGrade = { value: new THREE.Vector3(1, 1, 1) };
   mat.fragmentShader = mat.fragmentShader
-    .replace('void main() {', `${SANE_GLSL}\nvoid main() {`)
-    .replace(anchor, `${anchor}\n\t\t\tgl_FragColor.rgb = heliosSane(gl_FragColor.rgb, 1.0e4);`);
+    .replace('void main() {', `uniform vec3 heliosGrade;\n${SANE_GLSL}\nvoid main() {`)
+    .replace(anchor, `${anchor}\n\t\t\tgl_FragColor.rgb = heliosSane(gl_FragColor.rgb, 1.0e4) * heliosGrade;`);
   mat.needsUpdate = true;
 }
 
