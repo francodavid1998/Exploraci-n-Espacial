@@ -16,6 +16,11 @@ export interface StarDef {
   lightTint: [number, number, number]; // colour of the light cast on planets
   intensity: number; // disc brightness (keep low for red stars or tone mapping bleaches them white)
   glowIntensity: number; // halo sprite brightness
+  /** surface activity: convection contrast, starspot strength, spots at all latitudes (0..1), flare brightness, rotation (rad/s) */
+  surface: { gran: number; spots: number; spotsAll: number; flare: number; rot: number };
+  /** prominences / solar storms colour and brightness */
+  corona: [number, number, number];
+  coronaIntensity: number;
 }
 /** The Sun seen from space is white (G2V, 5 778 K); it only looks yellow or red through an atmosphere. */
 export const SUN_STAR: StarDef = {
@@ -23,6 +28,8 @@ export const SUN_STAR: StarDef = {
   colorLimb: [1.0, 0.8, 0.55], colorCenter: [1.0, 0.97, 0.92],
   glowStops: [[255, 250, 242], [255, 240, 222], [255, 226, 196], [255, 212, 172]],
   glowTint: [1, 0.97, 0.92], lightTint: [1, 1, 1], intensity: 40, glowIntensity: 2.2,
+  surface: { gran: 0.3, spots: 0.35, spotsAll: 0, flare: 0.3, rot: 0.02 },
+  corona: [1.0, 0.42, 0.3], coronaIntensity: 2.4, // H-alpha pink-red prominences
 };
 /** Proxima Centauri: M5.5Ve red dwarf (Teff ≈ 3 040 K, L ≈ 0.15 % L☉, Ribas et al. 2017). */
 export const PROXIMA_STAR: StarDef = {
@@ -30,6 +37,9 @@ export const PROXIMA_STAR: StarDef = {
   colorLimb: [0.55, 0.08, 0.02], colorCenter: [1.0, 0.32, 0.1],
   glowStops: [[255, 120, 70], [240, 70, 30], [200, 40, 12], [150, 25, 8]],
   glowTint: [1, 0.3, 0.12], lightTint: [1, 0.72, 0.55], intensity: 4, glowIntensity: 1.1,
+  // red dwarfs are fully convective: huge spots everywhere and frequent flares
+  surface: { gran: 0.55, spots: 0.9, spotsAll: 0.85, flare: 1.0, rot: 0.015 },
+  corona: [1.0, 0.3, 0.12], coronaIntensity: 1.8, // violent flare star
 };
 
 export type BodyKind = 'star' | 'rocky' | 'gas';

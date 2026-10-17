@@ -9,7 +9,7 @@ import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
   makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture,
-  hardenBloomPass, hardenOutputPass,
+  hardenBloomPass, hardenOutputPass, makeCoronaMaterial,
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
@@ -41,6 +41,7 @@ interface Body {
   collapsed: boolean;
   // stars only
   starMat?: THREE.ShaderMaterial;
+  coronaMat?: THREE.ShaderMaterial;
   glow?: THREE.Sprite;
   glow2?: THREE.Sprite;
   glowBase?: THREE.Color;
@@ -201,6 +202,9 @@ export class Game {
   lightsMode: LightsMode = 'comfort';
   /** brightness factor of glowing things for the current lights mode */
   private glowFactor = 1;
+  /** tone-mapping exposure for the lights mode, and the smoothed auto-exposure factor */
+  private baseExposure = 0.82;
+  private autoExp = 1;
   private glowMats: { mat: THREE.Material & { color: THREE.Color }; base: THREE.Color }[] = [];
   quality = 0;
   qualityManual = false;
@@ -405,9 +409,15 @@ export class Game {
 
       if (def.kind === 'star') {
         const st = def.star ?? SUN_STAR;
-        b.starMat = makeSunMaterial(st.colorLimb, st.colorCenter);
+        b.starMat = makeSunMaterial(st);
         const m = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), b.starMat);
         m.scale.setScalar(def.radius);
+        b.coronaMat = makeCoronaMaterial(st);
+        const corona = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), b.coronaMat);
+        corona.scale.setScalar(def.radius * 1.35); // = uShell
+        b.coronaMat.uniforms.uR.value = def.radius;
+        corona.renderOrder = 4;
+        root.add(corona);
         const g = st.glowStops;
         const stop = (k: number, a: number) => `rgba(${g[k][0]},${g[k][1]},${g[k][2]},${a})`;
         const glowTex = radialTexture([[0, stop(0, 1)], [0.12, stop(1, 0.55)], [0.35, stop(2, 0.12)], [1, stop(3, 0)]]);
@@ -617,8 +627,12 @@ export class Game {
     this.bloom.strength = comfort ? 0.25 : 0.55;
     this.bloom.threshold = comfort ? 1.2 : 0.9;
     (this.bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax.value = comfort ? 6 : 16;
-    this.renderer.toneMappingExposure = comfort ? 0.82 : 1.0;
-    for (const st of this.starBodies) st.starMat!.uniforms.uI.value = (st.def.star ?? SUN_STAR).intensity * (comfort ? 0.45 : 1);
+    this.baseExposure = comfort ? 0.82 : 1.0;
+    for (const st of this.starBodies) {
+      const sd = st.def.star ?? SUN_STAR;
+      st.starMat!.uniforms.uI.value = sd.intensity * (comfort ? 0.45 : 1);
+      st.coronaMat!.uniforms.uI.value = sd.coronaIntensity * (comfort ? 0.45 : 1);
+    }
     const f = comfort ? 0.45 : 1;
     this.glowFactor = f;
     for (const { mat, base } of this.glowMats) mat.color.copy(base).multiplyScalar(f);
@@ -1285,10 +1299,23 @@ export class Game {
     // stars: surface animation + halo. The halo keeps a fixed angular size out to
     // ~60 AU, shrinks to a point at interstellar range, and never grows beyond a
     // modest multiple of the disc up close.
+    // Auto-exposure: when a star fills a large part of the view the camera stops
+    // down, like a real one, instead of bleaching the whole frame white.
+    const angRad = Math.asin(Math.min(1, this.sunBody.def.radius / Math.max(sunDist, 1)));
+    const expTarget = clamp(0.05 / Math.max(angRad, 1e-4), 0.2, 1);
+    this.autoExp += (expTarget - this.autoExp) * Math.min(1, dt * 3);
+    this.renderer.toneMappingExposure = this.baseExposure * this.autoExp;
+    // the bloom budget and strength follow the exposure, otherwise a disc that
+    // fills the view still veils the whole frame and bleaches a red star white
+    const ae = this.autoExp;
+    (this.bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax.value = (this.lightsMode === 'comfort' ? 6 : 16) * ae * ae;
+    this.bloom.strength = (this.lightsMode === 'comfort' ? 0.25 : 0.55) * (0.4 + 0.6 * ae);
     const tint = new THREE.Vector3();
     for (const st of this.starBodies) {
       st.starMat!.uniforms.uTime.value = this.time;
+      st.coronaMat!.uniforms.uTime.value = this.time;
       const rel = st.pos.clone().sub(cw);
+      st.coronaMat!.uniforms.uCenter.value.copy(rel);
       const d = rel.length();
       const Rs = st.def.radius;
       const far = clamp((60 * AU) / d, 0.03, 1);
@@ -1297,6 +1324,7 @@ export class Game {
       // seen from inside an atmosphere the star is reddened and dimmed
       this.atmoTransmittance(b, rel.divideScalar(d), tint);
       st.starMat!.uniforms.uTint.value.copy(tint);
+      st.coronaMat!.uniforms.uTint.value.copy(tint);
       (st.glow!.material as THREE.SpriteMaterial).color.copy(st.glowBase!).multiplyScalar(this.glowFactor).multiply(new THREE.Color(tint.x, tint.y, tint.z));
       (st.glow2!.material as THREE.SpriteMaterial).color.copy(st.glow2Base!).multiplyScalar(this.glowFactor).multiply(new THREE.Color(tint.x, tint.y, tint.z));
     }
@@ -1363,9 +1391,14 @@ export class Game {
         this.setOverlay(fc, (1 - camAlt / 20000) * 0.45);
       }
     }
-    // heat haze when flying close to the Sun (ramps in from 4 solar radii)
+    // heat glare when flying close to a star: starts exactly where the hull begins
+    // to burn (3 radii from the centre) and whites out the view, slightly yellow,
+    // towards the photosphere. The HUD is DOM and stays readable.
     const starHeat = def.kind === 'star' ? clamp((3 - camR / def.radius) / 2, 0, 1) : 0;
-    if (starHeat > 0) this.setOverlay(new THREE.Color(1.0, 0.45, 0.15).multiplyScalar(1.2 * starHeat), starHeat * starHeat * 0.55);
+    if (starHeat > 0) {
+      const warm = new THREE.Color(1.0, 0.9, 0.7).lerp(new THREE.Color(1.0, 1.0, 0.95), starHeat).multiplyScalar(1.3);
+      this.setOverlay(warm, Math.pow(starHeat, 1.5) * 0.9);
+    }
     if (starHeat <= 0 && !this.inCloud && !(def.kind === 'gas' && camAlt < 20000)) this.setOverlay(fogC, 0);
     li *= shadowF;
     this.light.color.copy(lc);

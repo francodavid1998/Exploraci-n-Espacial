@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import type { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import type { StarDef } from './bodies';
 
 export const NOISE_GLSL = /* glsl */ `
 vec3 mod289(vec3 x){return x - floor(x*(1.0/289.0))*289.0;}
@@ -376,38 +377,114 @@ void main(){
 }
 
 // ---------------------------------------------------------------------------
-export function makeSunMaterial(limb: [number, number, number], center: [number, number, number]) {
+/**
+ * Star photosphere. Everything evolves slowly and smoothly (seconds to minutes),
+ * so it reads as a living star without any flicker: boiling convection cells,
+ * drifting starspots, faculae that swell near the limb and a chromosphere rim.
+ */
+export function makeSunMaterial(st: StarDef) {
+  const sf = st.surface;
   return new THREE.ShaderMaterial({
     uniforms: {
-      uTime: { value: 0 }, uI: { value: 40 },
-      uColA: { value: new THREE.Vector3(...limb) }, uColB: { value: new THREE.Vector3(...center) },
+      uTime: { value: 0 }, uI: { value: st.intensity },
+      uColA: { value: new THREE.Vector3(...st.colorLimb) }, uColB: { value: new THREE.Vector3(...st.colorCenter) },
       uTint: { value: new THREE.Vector3(1, 1, 1) }, // atmospheric transmittance towards the star
+      uGran: { value: sf.gran }, uSpots: { value: sf.spots }, uSpotsAll: { value: sf.spotsAll }, uFlare: { value: sf.flare }, uRot: { value: sf.rot },
     },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
 uniform float uTime; uniform float uI; uniform vec3 uColA; uniform vec3 uColB; uniform vec3 uTint;
+uniform float uGran; uniform float uSpots; uniform float uSpotsAll; uniform float uFlare; uniform float uRot;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 void main(){
   #include <logdepthbuf_fragment>
-  vec3 n = normalize(vObj);
-  float g = fbm(n*70.0 + vec3(uTime*0.03), 4);
-  float big = snoise(n*6.0 + uTime*0.01);
+  vec3 n0 = normalize(vObj);
+  // slow rotation of the whole surface about the star's axis
+  float ca = cos(uTime * uRot), sa = sin(uTime * uRot);
+  vec3 n = vec3(n0.x*ca - n0.z*sa, n0.y, n0.x*sa + n0.z*ca);
   vec3 V = normalize(-vWorld);
   float mu = max(dot(normalize(vNormalW), V), 0.0);
   float limb = 0.3 + 0.7*pow(mu, 0.5);
-  vec3 col = mix(uColA, uColB, limb) * (1.0 + 0.22*g + 0.08*big);
-  float spots = smoothstep(0.72, 0.8, snoise(n*14.0 + 2.0)) * smoothstep(0.5, 0.1, abs(n.y - 0.3*sign(n.y)));
-  col *= 1.0 - 0.6*spots;
+  // convection cells: two animated noise layers with contrast
+  float g1 = snoise(n*70.0 + vec3(uTime*0.05, 0.0, -uTime*0.03));
+  float g2 = snoise(n*150.0 + vec3(-uTime*0.08, uTime*0.04, 0.0));
+  float cells = smoothstep(-0.7, 0.7, g1*0.65 + g2*0.35);
+  float big = snoise(n*6.0 + uTime*0.01);
+  vec3 col = mix(uColA, uColB, limb) * (1.0 - 0.5*uGran + uGran*cells + 0.08*big);
+  // starspots: dark cores with a softer penumbra, drifting slowly
+  float sp = snoise(n*10.0 + 2.0 + vec3(0.0, uTime*0.004, uTime*0.003));
+  float lat = mix(smoothstep(0.5, 0.1, abs(n.y - 0.3*sign(n.y))), 1.0, uSpotsAll);
+  float core = smoothstep(0.78 - 0.3*uSpots, 0.86 - 0.2*uSpots, sp);
+  float pen = smoothstep(0.62 - 0.3*uSpots, 0.86 - 0.2*uSpots, sp);
+  col *= 1.0 - (0.75*core + 0.3*pen) * lat;
+  // faculae / flare regions: bright patches that swell over seconds, brighter near the limb
+  float fl = snoise(n*4.0 + vec3(uTime*0.06, -uTime*0.045, uTime*0.02));
+  float flare = smoothstep(0.5, 0.92, fl) * uFlare * (0.45 + 0.55*(1.0 - mu));
+  col += uColB * flare * 0.9;
+  // chromosphere rim
+  col += uColA * pow(1.0 - mu, 4.0) * 0.7;
   gl_FragColor = vec4(col * limb * uI * uTint, 1.0);
 }
 `,
   });
 }
 
-// ---------------------------------------------------------------------------
+/**
+ * Solar storms: prominences and eruptions rising from the limb. Drawn on a shell
+ * 1.35x the disc, but only where a pixel lies OUTSIDE the disc on screen (exact
+ * angular test against the star centre), tapering to nothing well before the
+ * shell's own silhouette, so there is never a visible rim or "shield". Some
+ * longitudes erupt for tens of seconds and throw taller plumes. Cheap: a few
+ * noise samples, no extra passes.
+ */
+export function makeCoronaMaterial(st: StarDef) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }, uI: { value: st.coronaIntensity },
+      uCol: { value: new THREE.Vector3(...st.corona) },
+      uTint: { value: new THREE.Vector3(1, 1, 1) },
+      uCenter: { value: new THREE.Vector3(0, 0, 1) }, // star centre relative to the camera
+      uR: { value: 1 }, // disc radius
+      uShell: { value: 1.35 }, // shell radius in disc radii (must match the mesh scale)
+    },
+    vertexShader: SHELL_VERT,
+    fragmentShader: /* glsl */ `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+uniform float uTime; uniform float uI; uniform vec3 uCol; uniform vec3 uTint; uniform vec3 uCenter; uniform float uR; uniform float uShell;
+varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
+${NOISE_GLSL}
+void main(){
+  #include <logdepthbuf_fragment>
+  // apparent distance of this pixel from the star centre, in disc radii
+  vec3 dc = normalize(uCenter);
+  float sinSep = length(cross(normalize(vWorld), dc));
+  float sinDisc = clamp(uR / length(uCenter), 1e-6, 1.0);
+  float h = (sinSep / sinDisc - 1.0) / (uShell - 1.0); // 0 at the limb, 1 at the shell edge
+  if (h <= 0.0 || h >= 1.0) discard;
+  vec3 n = normalize(vObj);
+  float lon = atan(n.z, n.x), lat = n.y;
+  // storms: some longitudes erupt for a while, slowly drifting
+  float storm = smoothstep(0.45, 0.9, snoise(vec3(lon * 1.3, lat * 2.0 + 3.1, uTime * 0.025)));
+  // flame filaments rising from the limb, tapering with height
+  float f = fbm(vec3(lon * 7.0, lat * 7.0, uTime * 0.09), 3) * 0.5 + 0.5;
+  float thr = 0.42 + h * 0.5 - storm * 0.3;
+  float flame = smoothstep(thr, thr + 0.25, f);
+  float a = flame * pow(1.0 - h, 1.5) * (0.5 + 0.8 * storm);
+  vec3 col = mix(uCol, uCol + vec3(0.3, 0.2, 0.15), flame * 0.5); // hotter cores
+  gl_FragColor = vec4(col * a * uI * uTint, 1.0);
+}
+`,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.FrontSide,
+  });
+}
+
 export function makeCloudMaterial(type: number) {
   return new THREE.ShaderMaterial({
     uniforms: {
@@ -798,7 +875,14 @@ const SANE_GLSL = /* glsl */ `
 // Comparisons are false for NaN, so NaN -> 0, +Inf -> lim. (No isnan(): the
 // OutputPass is a RawShaderMaterial compiled as GLSL ES 1.00.)
 float heliosSane1(float x, float lim){ return (x > 0.0) ? ((x < lim) ? x : lim) : 0.0; }
-vec3 heliosSane(vec3 c, float lim){ return vec3(heliosSane1(c.r, lim), heliosSane1(c.g, lim), heliosSane1(c.b, lim)); }
+// NaN/negative -> 0 per channel, then scale the colour uniformly so its brightest
+// channel is at most lim: clamping channels one by one would bleach an orange
+// star's glow to white.
+vec3 heliosSane(vec3 c, float lim){
+  c = vec3(heliosSane1(c.r, 1.0e30), heliosSane1(c.g, 1.0e30), heliosSane1(c.b, 1.0e30));
+  float m = max(c.r, max(c.g, c.b));
+  return (m > lim) ? c * (lim / m) : c;
+}
 `;
 
 /** Clamp + sanitize the bloom pass input. `maxValue` is the brightest value allowed to bloom. */
