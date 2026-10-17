@@ -16,7 +16,14 @@ import { clamp, smoothstep } from './noise';
 
 interface Body {
   def: BodyDef;
+  /** position in the current reference frame (relative to the star that lights the scene) */
   pos: THREE.Vector3;
+  /** position relative to the body's own star (exact, small numbers) */
+  local: THREE.Vector3;
+  /** the star this body belongs to (a star is its own star) */
+  star: Body;
+  /** absolute ecliptic position of that star (Sun = origin); shared reference */
+  starAbs: THREE.Vector3;
   root: THREE.Group;
   terrain?: PlanetTerrain;
   tUniforms?: ReturnType<typeof patchTerrainMaterial>;
@@ -150,6 +157,8 @@ export class Game {
   // state
   camWorld = V();
   lastCamWorld = V();
+  /** camera position minus the followed anchor (ship or player), computed with small exact numbers */
+  camOff = V();
   mode: 'ship' | 'foot' = 'ship';
   shipPos = V();
   shipVel = V();
@@ -343,15 +352,27 @@ export class Game {
   // -------------------------------------------------------------------------
   private createBodies() {
     for (const def of BODIES) {
-      const pos = V();
-      if (def.parent) {
+      // Reference frames: a body's position is stored relative to its own star
+      // (`local`, small exact numbers) and stars carry their absolute ecliptic
+      // position (`starAbs`). `pos`, used by the rest of the game, is rebuilt by
+      // refreshPositions() relative to the star that currently lights the scene,
+      // so coordinates inside any system stay precise to millimetres even
+      // light-years away from the Sun.
+      const local = V();
+      const starAbs = V();
+      let star: Body | null = null;
+      if (def.kind === 'star') {
+        // angle = ecliptic longitude from +X, lat = ecliptic latitude (+Y = north), orbit = distance to the Sun
+        const lat = def.lat ?? 0;
+        starAbs.set(Math.cos(lat) * Math.cos(def.angle) * def.orbit, Math.sin(lat) * def.orbit, Math.cos(lat) * Math.sin(def.angle) * def.orbit);
+      } else if (def.parent) {
         const p = this.byId.get(def.parent)!;
         const inc = def.incl ?? 0;
-        pos.set(Math.cos(def.angle) * def.orbit, Math.sin(def.angle) * def.orbit * Math.sin(inc), Math.sin(def.angle) * def.orbit * Math.cos(inc)).add(p.pos);
+        local.set(Math.cos(def.angle) * def.orbit, Math.sin(def.angle) * def.orbit * Math.sin(inc), Math.sin(def.angle) * def.orbit * Math.cos(inc)).add(p.local);
+        star = p.star;
       } else {
-        // top-level body: angle = ecliptic longitude from +X, lat = ecliptic latitude (+Y = north)
-        const lat = def.lat ?? 0;
-        pos.set(Math.cos(lat) * Math.cos(def.angle) * def.orbit, Math.sin(lat) * def.orbit, Math.cos(lat) * Math.sin(def.angle) * def.orbit);
+        local.set(Math.cos(def.angle) * def.orbit, 0, Math.sin(def.angle) * def.orbit);
+        star = this.byId.get('sun')!;
       }
       const root = new THREE.Group();
       this.scene.add(root);
@@ -365,7 +386,8 @@ export class Game {
       label.style.cssText = `position:absolute;left:10px;top:-7px;font-size:11px;color:${def.markerColor};text-shadow:0 0 4px #000;letter-spacing:.05em;`;
       marker.append(dot, label);
       this.markerLayer.appendChild(marker);
-      const b: Body = { def, pos, root, tiltQ, invRot, marker, label, collapsed: false };
+      const b: Body = { def, pos: V(), local, star: null as unknown as Body, starAbs: star ? star.starAbs : starAbs, root, tiltQ, invRot, marker, label, collapsed: false };
+      b.star = star ?? b;
 
       if (def.kind === 'star') {
         const st = def.star ?? SUN_STAR;
@@ -444,7 +466,23 @@ export class Game {
       this.bodies.push(b);
       this.byId.set(def.id, b);
     }
+    this.refreshPositions();
     this.nearest = this.byId.get('earth')!;
+  }
+
+  /** Express every body position in the current frame (relative to the star lighting the scene). */
+  private refreshPositions() {
+    const f = this.sunBody.starAbs;
+    for (const b of this.bodies) b.pos.copy(b.star.starAbs).sub(f).add(b.local);
+  }
+
+  /** Move the reference frame to another star: shift every dynamic position by the interstellar offset. */
+  private switchFrame(star: Body) {
+    const delta = star.starAbs.clone().sub(this.sunBody.starAbs);
+    for (const v of [this.shipPos, this.playerPos, this.camWorld, this.lastCamWorld]) v.sub(delta);
+    this.sunBody = star;
+    this.refreshPositions();
+    this.note(`Entrando en el sistema de ${star.def.name}`);
   }
 
   private spawnStart() {
@@ -1051,6 +1089,7 @@ export class Game {
       const q = this.camQ.clone().multiply(oq);
       const off = new THREE.Vector3(0, this.camDistShip * 0.2, this.camDistShip).applyQuaternion(q);
       eye = this.shipPos.clone().add(off);
+      this.camOff.copy(off);
       lookQ = q.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.1, 0, 0)));
     } else {
       const up = this.playerPos.clone().sub(b.pos).normalize();
@@ -1058,6 +1097,7 @@ export class Game {
       const look = this.camFwd.clone().multiplyScalar(Math.cos(this.camPitch)).addScaledVector(up, Math.sin(this.camPitch));
       const tgt = this.playerPos.clone().addScaledVector(up, 1.55).addScaledVector(right, 0.45);
       eye = tgt.clone().addScaledVector(look, -this.camDistFoot);
+      this.camOff.set(0, 0, 0).addScaledVector(up, 1.55).addScaledVector(right, 0.45).addScaledVector(look, -this.camDistFoot);
       const m = new THREE.Matrix4().lookAt(ZERO, look, up);
       lookQ = new THREE.Quaternion().setFromRotationMatrix(m);
     }
@@ -1067,7 +1107,10 @@ export class Game {
       const rr = d.length();
       d.divideScalar(rr);
       const minR = b.def.radius + this.terrainH(b, d) + 0.6;
-      if (rr < minR) eye.copy(b.pos).addScaledVector(d, minR);
+      if (rr < minR) {
+        eye.copy(b.pos).addScaledVector(d, minR);
+        this.camOff.copy(eye).sub(this.mode === 'ship' ? this.shipPos : this.playerPos); // near ground: precise anyway
+      }
     }
     this.lastCamWorld.copy(this.camWorld);
     this.camWorld.copy(eye);
@@ -1271,7 +1314,7 @@ export class Game {
     }
 
     // shadow light follows focus
-    const focus = (this.mode === 'ship' ? this.shipPos : this.playerPos).clone().sub(cw);
+    const focus = this.camOff.clone().negate();
     this.light.position.copy(focus).addScaledVector(sunDir, 1500);
     this.light.target.position.copy(focus);
     const sc = this.light.shadow.camera;
@@ -1285,7 +1328,8 @@ export class Game {
 
     // ship & astronaut
     const sm = this.ship;
-    sm.root.position.copy(this.shipPos).sub(cw);
+    if (this.mode === 'ship') sm.root.position.copy(this.camOff).negate();
+    else sm.root.position.copy(this.shipPos).sub(cw);
     sm.root.quaternion.copy(this.shipQ);
     const thr = this.warp ? 2.6 : Math.max(0, this.throttle) * ((this.keys.has('ShiftLeft') ? 1.7 : 1)) + (this.autoLand ? 0.3 : 0);
     for (const f of sm.flames) {
@@ -1313,7 +1357,7 @@ export class Game {
     as.root.visible = this.mode === 'foot';
     if (this.mode === 'foot') {
       const upP = this.playerPos.clone().sub(b.pos).normalize();
-      as.root.position.copy(this.playerPos).sub(cw);
+      as.root.position.copy(this.camOff).negate();
       const z = this.playerFacing.clone().negate();
       const x = new THREE.Vector3().crossVectors(upP, z).normalize();
       z.crossVectors(x, upP);
@@ -1398,7 +1442,13 @@ export class Game {
     const cw = this.camWorld;
     const v = new THREE.Vector3();
     const upd = this.frame % 6 === 0;
-    for (const b of this.bodies) {
+    // Bodies that project onto the same spot (a whole star system seen from
+    // light-years away) would stack their labels: keep only the most relevant
+    // one per spot: the destination, then stars, then the largest body.
+    const placed: { x: number; y: number }[] = [];
+    const rank = (b: Body) => (b === this.target ? 2 : 0) + (b.def.kind === 'star' ? 1 : 0);
+    const order = [...this.bodies].sort((a, b) => rank(b) - rank(a) || b.def.radius - a.def.radius);
+    for (const b of order) {
       v.copy(b.pos).sub(cw);
       const dist = v.length();
       const ang = b.def.radius / dist;
@@ -1414,8 +1464,11 @@ export class Game {
         const m = Math.max(Math.abs(x), Math.abs(y)) / 0.92;
         x /= m; y /= m;
       }
+      const sx = (x * 0.5 + 0.5) * w, sy = (-y * 0.5 + 0.5) * h;
+      if (!isT && placed.some((q) => Math.abs(q.x - sx) < 18 && Math.abs(q.y - sy) < 18)) { b.marker.style.display = 'none'; continue; }
+      placed.push({ x: sx, y: sy });
       b.marker.style.display = 'block';
-      b.marker.style.transform = `translate(${((x * 0.5 + 0.5) * w).toFixed(1)}px, ${((-y * 0.5 + 0.5) * h).toFixed(1)}px)`;
+      b.marker.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
       b.marker.style.opacity = isT ? '1' : '0.7';
       (b.marker.firstChild as HTMLDivElement).style.background = isT ? b.def.markerColor : 'transparent';
       if (upd) b.label.textContent = `${isT ? '◆ ' : ''}${b.def.name.toUpperCase()}  ${formatDist(dist - b.def.radius)}`;
@@ -1449,7 +1502,8 @@ export class Game {
     }
 
     const focus = this.mode === 'ship' ? this.shipPos : this.playerPos;
-    this.sunBody = this.nearestStar(focus);
+    const star = this.nearestStar(focus);
+    if (star !== this.sunBody) this.switchFrame(star);
     this.nearest = this.findNearest(focus).body;
     if (!this.dead && !this.menuOpen) {
       if (this.mode === 'ship') this.updateShip(dt);
