@@ -3,12 +3,15 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import type { Game } from './Game';
 import { hash3, mulberry32, Noise3, clamp } from './noise';
 import { LOGS, objectiveAt, type LogEntry, type Objective } from './story';
+import { EnemyDirector, SHOT_ENERGY } from './enemies';
+import { SoundFX } from './sound';
 
 /**
  * Survival mode, phase 1: life support (oxygen, battery, health), ship fuel, mining
  * ice and metal on the surface of rocky worlds, a mild death penalty (you wake up in
  * the ship; what you carried stays where you fell) and saved games.
  * Phase 2: Earth in ruins, the survivors' recordings and the objective they lead to.
+ * Phase 3: sentinels and stalkers (enemies.ts), the arc rifle, synthesised sound (sound.ts).
  *
  * Realistic exploration never creates this object, so nothing here can change it.
  */
@@ -79,6 +82,8 @@ export interface SurvivalSave {
   playTime: number;
   /** recordings already heard (phase 2; missing in older saves) */
   logs?: string[];
+  /** sentinels destroyed (phase 3) */
+  destroyed?: string[];
 }
 
 export interface SurvivalHud {
@@ -107,6 +112,10 @@ export interface SurvivalHud {
   reading: LogEntry | null;
   /** the wake-up sequence of a new game is playing */
   intro: boolean;
+  /** just hurt (0..1, fades): a soft red edge on the screen */
+  hurt: number;
+  shotCost: number;
+  sound: boolean;
 }
 
 /** How rich each world is: chance of a deposit per cell, and the share of ice among them. */
@@ -202,6 +211,8 @@ export class Survival {
   intro = false;
   /** Earth's ruins belong to the world (both modes); survival places its recordings in them */
   private get ruins() { return this.g.ruins; }
+  sfx = new SoundFX();
+  enemies: EnemyDirector;
 
   private g: Game;
   private deposits: Deposit[] = [];
@@ -264,6 +275,7 @@ export class Survival {
     this.objLabel.style.cssText = 'position:absolute;left:13px;top:-7px;font-size:11px;color:#fcd34d;text-shadow:0 0 4px #000;letter-spacing:.05em;';
     this.objMarker.append(od, this.objLabel);
     markerLayer.appendChild(this.objMarker);
+    this.enemies = new EnemyDirector(g, this.sfx);
     window.addEventListener('pagehide', this.onHide);
   }
 
@@ -325,6 +337,8 @@ export class Survival {
     window.removeEventListener('pagehide', this.onHide);
     this.crateMarker.remove();
     this.objMarker.remove();
+    this.enemies.dispose();
+    this.sfx.dispose();
   }
 
   private total(c: Cargo) { return c.ice + c.metal; }
@@ -379,6 +393,26 @@ export class Survival {
       this.mineTarget = null;
       this.nearDeposit = null;
     }
+    // what lives in the dark (and the machines)
+    this.enemies.update(dt);
+    if (g.suit <= 0 && !g.dead) {
+      g.die(this.enemies.lastHit === 'sentinel'
+        ? 'Un centinela te alcanzó. Las máquinas no perdonan a quien se acerca a sus torres.'
+        : 'Algo salió de la oscuridad. No lo viste llegar.');
+      return;
+    }
+    // the astronaut faces where you look: the flashlight and the weapon point there
+    if (foot) {
+      const up = g.playerPos.clone().sub(g.nearest.pos).normalize();
+      const f = g.camFwd.clone().projectOnPlane(up);
+      if (f.lengthSq() > 1e-6) g.playerFacing.copy(f.normalize());
+    }
+    // the arm comes up to fire
+    if (foot && this.enemies.sinceShot < 0.45) { g.astro.armR.rotation.x = -1.45; g.astro.armR.rotation.z = 0.15; }
+    else g.astro.armR.rotation.z = 0;
+    if (g.pressed.has('KeyN')) g.note(this.sfx.toggle() ? 'Sonido activado' : 'Sonido desactivado (N)');
+    const dark = 1 - clamp(g.light.intensity / 3.3 / 0.35, 0, 1);
+    this.sfx.update(dt, g.camera.quaternion, dark, this.enemies.tension(), g.suit, foot);
     // boarding the ship is a good moment to save
     if (this.wasFoot && !foot) this.save();
     this.wasFoot = foot;
@@ -387,6 +421,13 @@ export class Survival {
   }
 
   canLight() { return this.energy > 1; }
+
+  /** put things in the suit (up to its capacity); returns how many fitted */
+  addCargo(kind: Res, n: number) {
+    const got = Math.max(0, Math.min(n, CARGO_CAP - this.total(this.carried)));
+    this.carried[kind] += got;
+    return got;
+  }
 
   private updateMining(dt: number) {
     const g = this.g;
@@ -551,6 +592,7 @@ export class Survival {
   onDeath(onFoot: boolean) {
     const g = this.g;
     this.deaths++;
+    this.enemies.clear();
     if (onFoot) {
       if (this.total(this.carried) > 0) {
         const off = g.playerPos.clone().sub(g.nearest.pos);
@@ -596,6 +638,7 @@ export class Survival {
     const cw = g.camWorld;
     this.ruins.updateTerminals(this.logsRead, (site) => LOGS.find((l) => l.site === site)?.id);
     this.renderObjective();
+    this.enemies.render();
     const focus = g.mode === 'ship' ? g.shipPos : g.playerPos;
     const near = body.def.kind === 'rocky' && !!body.terrain && g.altitude < 2500 && !g.warp;
     if (near) this.refreshField(body, focus);
@@ -737,6 +780,9 @@ export class Survival {
       objectiveDist: this.objDist,
       reading: this.reading,
       intro: this.intro,
+      hurt: this.enemies.hurt,
+      shotCost: SHOT_ENERGY,
+      sound: this.sfx.enabled,
     };
   }
 
@@ -761,6 +807,7 @@ export class Survival {
       carried: this.carried, stored: this.stored, mined: [...this.mined], crate: this.crate,
       target: g.target?.def.id ?? null, deaths: this.deaths, playTime: this.playTime,
       logs: [...this.logsRead],
+      destroyed: [...this.enemies.destroyed],
     };
     try { localStorage.setItem(SAVE_KEY, JSON.stringify(s)); this.savedAt = g.time; } catch { /* storage full or unavailable */ }
   }
@@ -773,6 +820,7 @@ export class Survival {
     this.crate = s.crate;
     this.deaths = s.deaths; this.playTime = s.playTime;
     this.logsRead = new Set(s.logs ?? []);
+    this.enemies.destroyed = new Set(s.destroyed ?? []);
   }
 
   static load(): SurvivalSave | null {

@@ -69,7 +69,7 @@ function offsetDir(up: THREE.Vector3, east: THREE.Vector3, north: THREE.Vector3,
 }
 
 /** Places the sites on land: flat lowlands near the start (the first city is under the ship), a coast, mountains. */
-function findSites(gen: TerrainGen, R: number, start: THREE.Vector3): RuinSite[] {
+function findSites(gen: TerrainGen, R: number, start: THREE.Vector3, sun: THREE.Vector3): RuinSite[] {
   const rnd = mulberry32(2187);
   const land: { d: THREE.Vector3; h: number; coast: boolean }[] = [];
   const peaks: { d: THREE.Vector3; h: number }[] = [];
@@ -113,7 +113,7 @@ function findSites(gen: TerrainGen, R: number, start: THREE.Vector3): RuinSite[]
   for (const sd of SITE_DEFS) {
     const c = sd.kind === 'station'
       ? pick(peaks, from, 0.03) ?? pick(land, from, 0.03)
-      : pick(land, from, out.length ? 0.055 : 0, sd.id === 'alba' ? (x) => x.coast : undefined) ?? pick(land, from, 0.055);
+      : pick(land, from, out.length ? 0.055 : 0, sd.id === 'alba' ? (x) => x.coast : sd.id === 'telmo' ? (x) => x.d.dot(sun) < -0.25 : undefined) ?? pick(land, from, 0.055);
     if (!c) continue;
     chosen.push(c.d);
     from = c.d;
@@ -226,7 +226,8 @@ export class RuinedEarth {
     this.g = g;
     this.earth = earth;
     const R = earth.def.radius;
-    this.sites = findSites(earth.terrain!.gen, R, g.shipPos.clone().sub(earth.pos));
+    // San Telmo lies on the night side: the story's first night (the Sun never moves in this sky)
+    this.sites = findSites(earth.terrain!.gen, R, g.shipPos.clone().sub(earth.pos), earth.star.pos.clone().sub(earth.pos).normalize());
     for (const s of this.sites) {
       // the recording stands in the central square (cities) or beside the dome (station)
       const lx = s.kind === 'city' ? 0 : 14, lz = s.kind === 'city' ? 8 : -6;

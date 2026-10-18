@@ -762,7 +762,18 @@ export class Game {
     document.addEventListener('pointerlockchange', this.onLockChange);
     this.renderer.domElement.addEventListener('click', this.requestLock);
     this.renderer.domElement.addEventListener('wheel', this.onWheel, { passive: true });
+    document.addEventListener('mousedown', this.onMouseDown);
+    document.addEventListener('mouseup', this.onMouseUp);
   }
+  /** left button (while the pointer is locked): the survival weapon fires (held: repeats) */
+  private onMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0 || !this.locked) return;
+    if (!this.keys.has('Mouse0')) this.pressed.add('Mouse0');
+    this.keys.add('Mouse0');
+  };
+  private onMouseUp = (e: MouseEvent) => {
+    if (e.button === 0) this.keys.delete('Mouse0');
+  };
   /** camera / steering drag from the touch controls (pixels, like mouse movement) */
   touchLook(dx: number, dy: number) {
     this.mdx += dx;
@@ -770,6 +781,7 @@ export class Game {
     if (Math.abs(dx) + Math.abs(dy) > 2) this.lastMouseMove = this.time;
   }
   requestLock = () => {
+    this.surv?.sfx.init(); // a click: browsers allow sound from here on
     if (this.menuOpen || this.dead || this.touchMode) return;
     const el = this.renderer.domElement as HTMLCanvasElement & { requestPointerLock: () => Promise<void> | void };
     try {
@@ -971,6 +983,7 @@ export class Game {
   startSurvival(continueSave: boolean) {
     this.gameMode = 'survival';
     this.surv = new Survival(this, this.markerLayer);
+    this.surv.sfx.init(); // called from the start button: the sound may start
     const s = continueSave ? Survival.load() : null;
     if (s && this.restoreSurvival(s)) return true;
     Survival.clear();
@@ -2363,6 +2376,8 @@ export class Game {
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onBlur);
+    document.removeEventListener('mousedown', this.onMouseDown);
+    document.removeEventListener('mouseup', this.onMouseUp);
     document.removeEventListener('mousemove', this.onMouseMove);
     document.removeEventListener('pointerlockchange', this.onLockChange);
     window.removeEventListener('resize', this.onResize);

@@ -248,7 +248,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           <div className="text-sm tracking-widest text-white/85">{s.mode === 'ship' ? (s.warp ? (sv?.emergency ? 'EMERGENCIA' : 'PULSO') : s.landed ? 'ATERRIZADO' : 'VUELO') : 'A PIE'}</div>
           <div className="mt-1 text-[10px] text-white/40">{s.lights ? 'LUCES ON' : 'LUCES OFF'}</div>
           {sv && (s.mode === 'foot' ? (
-            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal</div></div>
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal</div><div className="mt-1 text-cyan-200/60">ARMA · {sv.shotCost}% por disparo</div></div>
           ) : (
             <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">BODEGA<div className="text-white/40">{sv.stored.ice} hielo · {sv.stored.metal} metal</div></div>
           ))}
@@ -257,6 +257,13 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
         </div>
       </div>
 
+      {/* survival: hurt, a soft red edge that fades (never a flash) */}
+      {sv && (
+        <div
+          className="absolute inset-0 transition-opacity duration-300"
+          style={{ opacity: Math.min(1, sv.hurt) * (s.lightsMode === 'comfort' ? 0.55 : 0.8), background: 'radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(120,10,10,0.55) 100%)' }}
+        />
+      )}
       {/* survival: mining prompt and progress, above the crosshair (the click prompt sits below it) */}
       {sv && s.mode === 'foot' && sv.nearLog && (
         <div className="absolute left-1/2 top-[38%] -translate-x-1/2 text-center text-[11px] tracking-[0.2em] text-amber-200/90">
@@ -305,6 +312,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
             {sv && <div><b className="text-white">R</b> extraer (mantener) · escuchar registros</div>}
+            {sv && <div><b className="text-white">Clic</b> disparar · <b className="text-white">N</b> sonido: {sv.sound ? 'ON' : 'OFF'}</div>}
             <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>

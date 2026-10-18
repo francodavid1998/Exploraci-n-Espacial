@@ -54,7 +54,7 @@ export const LOGS: LogEntry[] = [
       'Las máquinas no nos persiguen. Vigilan. Disparan a lo que se acerca a sus torres y vuelven a quedarse quietas.',
       'Las otras cosas son distintas. No aparecen en los sensores térmicos. Salen de la sombra y vuelven a ella.',
       'Regla número uno: no te alejes de la luz. Nunca he visto a una cruzar un charco de sol.',
-      'La doctora Ibarra dice que sabe qué las llama. Está en San Telmo, en el laboratorio de la universidad.',
+      'La doctora Ibarra dice que sabe qué las llama. Está en San Telmo, en el laboratorio de la universidad. San Telmo está del lado de la noche: lleva luz.',
     ],
   },
   {
@@ -93,7 +93,7 @@ export function objectiveAt(stage: number): Objective {
     case 0: return { text: 'Investiga la baliza de emergencia en las ruinas de Nueva Esperanza', place: 'esperanza' };
     case 1: return { text: 'Busca a los supervivientes en Puerto Alba, en la costa', place: 'alba' };
     case 2: return { text: 'Sigue a Lucía hasta Ciudad Meridiano', place: 'meridiano' };
-    case 3: return { text: 'Encuentra el laboratorio de la doctora Ibarra en San Telmo', place: 'telmo' };
+    case 3: return { text: 'Encuentra el laboratorio de la doctora Ibarra en San Telmo, del lado de la noche', place: 'telmo' };
     case 4: return { text: 'Sube al Observatorio Cumbre, en las montañas', place: 'cumbre' };
     default: return { text: 'Viaja a la cara oculta de la Luna: la Base Tsiolkovsky', place: 'tsiolkovsky' };
   }

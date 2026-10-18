@@ -129,6 +129,7 @@ export default function TouchControls({ game }: { game: Game }) {
         <>
           {/* right, bottom row: held controls */}
           <div className="absolute bottom-5 right-5 flex items-end gap-3">
+            {!ship && game.surv && <HoldButton game={game} code="Mouse0" label="FUEGO" />}
             {!ship && game.surv && <HoldButton game={game} code="KeyR" label="MINAR" />}
             <HoldButton game={game} code="ShiftLeft" label={ship ? 'TURBO' : 'CORRER'} />
             {ship && <HoldButton game={game} code="KeyC" label="▼" />}
