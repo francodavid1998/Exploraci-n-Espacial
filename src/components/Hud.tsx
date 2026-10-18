@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import type { Game, HudState } from '../game/Game';
 import { formatDist, formatSpeed } from '../game/Game';
 import { BODIES, C_LIGHT } from '../game/bodies';
-import { LOGS, WAKE_LINES, type LogEntry } from '../game/story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, WAKE_LINES, END_LINES, type LogEntry, type UpgradeId } from '../game/story';
+
+/** every recording of the story, in order (the pilot's own diaries last) */
+const ALL_LOGS: LogEntry[] = [...LOGS, ...BASE_LOGS, ...FRAGMENTS, ...CACHES.flatMap((c) => (c.log ? [c.log] : []))];
 
 const barColor = (v: number, ok: string) => (v > 50 ? ok : v > 25 ? '#fbbf24' : '#ef4444');
 
@@ -94,6 +97,32 @@ function WakeIntro({ onDone }: { onDone: () => void }) {
   );
 }
 
+/** The Spire falls silent: the last lines, soft fades, then the numbers of the journey. */
+function EndSequence({ stats, onDone }: { stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number }; onDone: () => void }) {
+  const [shown, setShown] = useState(0);
+  useEffect(() => {
+    if (shown > END_LINES.length) return;
+    const id = setTimeout(() => setShown(shown + 1), shown === 0 ? 1500 : 2600);
+    return () => clearTimeout(id);
+  }, [shown]);
+  const m = Math.floor(stats.time / 60);
+  return (
+    <div className="pointer-events-auto absolute inset-0 z-20 flex items-center justify-center bg-black/90 font-mono">
+      <div className="w-[min(90vw,38rem)] space-y-4 text-center">
+        {END_LINES.map((l, i) => (
+          <div key={l} className={`transition-opacity duration-[1500ms] ${i < shown ? 'opacity-100' : 'opacity-0'} ${i === 0 ? 'text-[12px] tracking-[0.6em] text-violet-300/80' : 'text-sm leading-relaxed text-white/80'}`}>{l}</div>
+        ))}
+        <div className={`pt-6 text-[11px] leading-6 tracking-[0.15em] text-white/50 transition-opacity duration-[1500ms] ${shown > END_LINES.length ? 'opacity-100' : 'opacity-0'}`}>
+          <div>TIEMPO · {m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`}</div>
+          <div>VECES QUE CAÍSTE · {stats.deaths}</div>
+          <div>REGISTROS · {stats.logs}/{stats.logsTotal} · SECRETOS · {stats.caches}/{stats.cachesTotal}</div>
+          <button onClick={onDone} className="mt-6 rounded-full border border-violet-200/30 bg-violet-200/10 px-8 py-2 text-xs tracking-[0.4em] text-violet-50 hover:bg-violet-200/20">SEGUIR EXPLORANDO</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Hud({ game, onOpenMap, touch = false }: { game: Game; onOpenMap: () => void; touch?: boolean }) {
   const [s, setS] = useState<HudState | null>(null);
   const [help, setHelp] = useState(true);
@@ -114,7 +143,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
   }, [vision]);
   if (!s) return null;
   // vision mode: nothing over the sky but that hint and the zoom factor
-  if (s.vision && !s.dead && !s.survival?.reading && !s.survival?.intro) {
+  if (s.vision && !s.dead && !s.survival?.reading && !s.survival?.intro && !s.survival?.ending) {
     return (
       <div className="pointer-events-none absolute inset-0 select-none font-mono text-white">
         <div className={`absolute bottom-5 left-1/2 -translate-x-1/2 text-center text-[11px] tracking-[0.3em] text-white/45 transition-opacity duration-1000 ${visionHint ? 'opacity-100' : 'opacity-0'}`}>
@@ -165,6 +194,17 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div className="text-[10px] tracking-[0.3em] text-amber-300/80">OBJETIVO</div>
             <div className="mt-1 text-[12px] leading-snug text-white/85">{sv.objective}</div>
             {sv.objectiveDist !== null && <div className="mt-1 text-[11px] text-amber-200/70">◆ {formatDist(sv.objectiveDist)}</div>}
+            {sv.scanner && (
+              <div className="mt-2 flex items-center gap-2 text-[10px] tracking-[0.2em] text-teal-200/70">
+                <span>ESCÁNER</span>
+                {sv.scan ? (
+                  <>
+                    <span className="inline-block" style={{ transform: `rotate(${sv.scan.angle.toFixed(0)}deg)` }}>↑</span>
+                    <span>señal escondida · {formatDist(sv.scan.dist)}</span>
+                  </>
+                ) : <span className="text-white/35">sin señales cerca</span>}
+              </div>
+            )}
           </div>
         )}
         <div className="text-[10px] tracking-[0.3em] text-amber-300/80">DESTINO</div>
@@ -248,9 +288,9 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           <div className="text-sm tracking-widest text-white/85">{s.mode === 'ship' ? (s.warp ? (sv?.emergency ? 'EMERGENCIA' : 'PULSO') : s.landed ? 'ATERRIZADO' : 'VUELO') : 'A PIE'}</div>
           <div className="mt-1 text-[10px] text-white/40">{s.lights ? 'LUCES ON' : 'LUCES OFF'}</div>
           {sv && (s.mode === 'foot' ? (
-            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal</div><div className="mt-1 text-cyan-200/60">ARMA · {sv.shotCost}% por disparo</div></div>
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal + sv.carried.crystal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal{sv.carried.crystal ? ` · ${sv.carried.crystal} cristal` : ''}</div><div className="mt-1 text-cyan-200/60">ARMA · {sv.shotCost}% por disparo</div></div>
           ) : (
-            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">BODEGA<div className="text-white/40">{sv.stored.ice} hielo · {sv.stored.metal} metal</div></div>
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">BODEGA<div className="text-white/40">{sv.stored.ice} hielo · {sv.stored.metal} metal</div><div className="text-violet-200/50">{sv.stored.crystal} cristal</div></div>
           ))}
           {sv?.refining && <div className="mt-1 text-[10px] text-orange-200/80">{sv.refining}</div>}
           {sv && <div className={`mt-1 text-[9px] tracking-[0.2em] text-white/45 transition-opacity duration-700 ${sv.saved ? 'opacity-100' : 'opacity-0'}`}>✓ GUARDADO</div>}
@@ -265,9 +305,19 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
         />
       )}
       {/* survival: mining prompt and progress, above the crosshair (the click prompt sits below it) */}
-      {sv && s.mode === 'foot' && sv.nearLog && (
+      {sv && s.mode === 'foot' && sv.prompt && (
         <div className="absolute left-1/2 top-[38%] -translate-x-1/2 text-center text-[11px] tracking-[0.2em] text-amber-200/90">
-          {touch ? 'MINAR' : 'R'}: escuchar el registro
+          {touch ? 'MINAR' : 'R'}: {sv.prompt}
+        </div>
+      )}
+      {/* the Guardian: its strength and its shield, while it is close */}
+      {sv?.boss && (
+        <div className="absolute left-1/2 top-16 w-[min(80vw,26rem)] -translate-x-1/2 text-center">
+          <div className="text-[10px] tracking-[0.5em] text-violet-200/90">EL GUARDIÁN</div>
+          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-violet-300/80 transition-all duration-300" style={{ width: `${sv.boss.hp * 100}%` }} />
+          </div>
+          {sv.boss.pylons > 0 && <div className="mt-1 text-[10px] tracking-[0.2em] text-violet-200/60">ESCUDO ACTIVO · destruye los pilones ({sv.boss.pylons})</div>}
         </div>
       )}
       {sv && s.mode === 'foot' && sv.near && !sv.nearLog && (
@@ -297,6 +347,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Espacio / C</b> subir / bajar (vertical)</div>
             <div><b className="text-white">J</b> salto luz (libre) · <b className="text-white">K</b> piloto automático</div>
             {sv && <div className="text-orange-200/80">El salto gasta combustible: más cuanto más lejos</div>}
+            {sv && <div><b className="text-white">Clic</b> cañones de la nave</div>}
             <div><b className="text-white">V</b> arranque rápido del pulso: {s.fastStart ? 'ON' : 'OFF'}</div>
             <div><b className="text-white">T / M</b> destino · mapa</div>
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
@@ -328,6 +379,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
 
       {sv?.reading && <LogReader log={sv.reading} touch={touch} onClose={() => game.surv?.closeLog()} />}
       {sv?.intro && <WakeIntro onDone={() => game.surv?.finishIntro()} />}
+      {sv?.ending && <EndSequence stats={sv.stats} onDone={() => game.surv?.finishEnding()} />}
 
       {s.dead && (
         <div className="pointer-events-auto absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur-sm">
@@ -356,8 +408,11 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
 
 export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }) {
   const [sel, setSel] = useState<string>(game.target?.def.id ?? 'earth');
-  const [logs, setLogs] = useState(false);
-  const heard = game.surv ? LOGS.filter((l) => game.surv!.logsRead.has(l.id)) : [];
+  const [tab, setTab] = useState<'map' | 'logs' | 'upg'>('map');
+  const [, redraw] = useState(0);
+  const [msg, setMsg] = useState<string | null>(null);
+  const sv = game.surv;
+  const heard = sv ? ALL_LOGS.filter((l) => sv.logsRead.has(l.id)) : [];
   const def = BODIES.find((b) => b.id === sel)!;
   const stars = BODIES.filter((b) => b.kind === 'star');
   const planetsOf = (star: typeof stars[number]) => BODIES.filter((b) => b.kind !== 'star' && (b.parent === star.id || (star.id === 'sun' && !b.parent)));
@@ -373,9 +428,14 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
             <div className="text-2xl font-extralight tracking-[0.2em]">SISTEMAS ESTELARES</div>
           </div>
           <div className="flex gap-2">
-            {game.surv && (
-              <button onClick={() => setLogs(!logs)} className={`rounded-md border border-amber-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-amber-100 hover:bg-amber-300/10 ${logs ? 'bg-amber-300/15' : ''}`}>
-                REGISTROS {heard.length}/{LOGS.length}
+            {sv && (
+              <button onClick={() => setTab(tab === 'logs' ? 'map' : 'logs')} className={`rounded-md border border-amber-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-amber-100 hover:bg-amber-300/10 ${tab === 'logs' ? 'bg-amber-300/15' : ''}`}>
+                REGISTROS {heard.length}
+              </button>
+            )}
+            {sv && (
+              <button onClick={() => setTab(tab === 'upg' ? 'map' : 'upg')} className={`rounded-md border border-violet-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-violet-100 hover:bg-violet-300/10 ${tab === 'upg' ? 'bg-violet-300/15' : ''}`}>
+                MEJORAS {sv.upgrades.size}/{UPGRADES.length}
               </button>
             )}
             <button onClick={onClose} className="rounded-md border border-white/20 px-4 py-1.5 text-xs tracking-[0.3em] text-white/80 hover:bg-white/10">CERRAR (M)</button>
@@ -410,9 +470,33 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               </div>
             ))}
           </div>
-          {logs ? (
+          {tab === 'upg' && sv ? (
             <div className="flex-1 overflow-y-auto p-8">
-              <div className="text-[10px] tracking-[0.4em] text-amber-300/70">REGISTROS DE LOS SUPERVIVIENTES</div>
+              <div className="text-[10px] tracking-[0.4em] text-violet-300/70">MEJORAS DEL TRAJE Y DE LA NAVE</div>
+              <div className="mt-2 text-sm text-white/70">En la bodega: {sv.stored.metal} metal · {sv.stored.crystal} cristal oscuro {game.mode !== 'ship' && <span className="text-white/40">· solo se instalan a bordo</span>}</div>
+              {msg && <div className="mt-2 text-xs text-amber-200/80">{msg}</div>}
+              <div className="mt-4 grid gap-2 md:grid-cols-2">
+                {UPGRADES.map((u) => {
+                  const own = sv.upgrades.has(u.id as UpgradeId);
+                  return (
+                    <div key={u.id} className={`rounded-lg border px-4 py-3 ${own ? 'border-violet-300/30 bg-violet-300/5' : 'border-white/10'}`}>
+                      <div className="text-sm text-white/90">{u.name}</div>
+                      <div className="text-[11px] text-white/55">{u.desc}</div>
+                      <div className="mt-2 flex items-center justify-between text-[11px]">
+                        <span className="text-white/45">{u.metal} metal · {u.crystal} cristal</span>
+                        {own ? <span className="tracking-[0.2em] text-violet-200/80">INSTALADA</span> : (
+                          <button onClick={() => { setMsg(sv.buy(u.id as UpgradeId)); redraw((x) => x + 1); }} className="rounded border border-violet-300/40 px-3 py-1 tracking-[0.2em] text-violet-100 hover:bg-violet-300/15">INSTALAR</button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-6 text-xs text-white/45">El metal sale de las rocas con vetas y de los centinelas; los cristales, de los lugares de la señal, de las criaturas y de los cazadores. Hay alijos escondidos que solo oye el escáner.</div>
+            </div>
+          ) : tab === 'logs' ? (
+            <div className="flex-1 overflow-y-auto p-8">
+              <div className="text-[10px] tracking-[0.4em] text-amber-300/70">REGISTROS ({heard.length}/{ALL_LOGS.length})</div>
               {heard.length === 0 && <div className="mt-4 text-sm text-white/50">Todavía no has encontrado ninguno.</div>}
               <div className="mt-4 space-y-2">
                 {heard.map((l) => (

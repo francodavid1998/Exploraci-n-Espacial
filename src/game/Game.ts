@@ -15,6 +15,7 @@ import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './mo
 import { clamp, smoothstep } from './noise';
 import { Survival, type GameMode, type SurvivalHud, type SurvivalSave } from './survival';
 import { RuinedEarth } from './ruins';
+import { AlienWorld } from './alien';
 
 interface Body {
   def: BodyDef;
@@ -288,6 +289,8 @@ export class Game {
   surv: Survival | null = null;
   /** Earth's ruined cities (part of the world in both modes) */
   ruins!: RuinedEarth;
+  /** the places of the signal: Base Tsiolkovsky, the monoliths, the Spire (both modes) */
+  alien!: AlienWorld;
   onMenuToggle?: (open: boolean) => void;
   /** lets the title screen's lights button follow the L key */
   onLightsModeChange?: (mode: LightsMode) => void;
@@ -459,6 +462,7 @@ export class Game {
 
     this.spawnStart();
     this.ruins = new RuinedEarth(this, this.byId.get('earth')!);
+    this.alien = new AlienWorld(this);
     this.bindInput();
     window.addEventListener('resize', this.onResize);
     this.lastT = performance.now();
@@ -1451,6 +1455,7 @@ export class Game {
       this.onGround = false;
     }
     if (def.id === 'earth') this.ruins.collide(this.playerPos, this.playerVel);
+    this.alien.collide(this.playerPos, this.playerVel);
     this.altitude = r - gr;
     // facing / animation
     const tSpeed = vt.length();
@@ -2283,7 +2288,7 @@ export class Game {
       sv.closeLog();
       this.pressed.clear(); // that key must not also jump or mine
     }
-    if (!this.dead && !this.menuOpen && !sv?.reading) {
+    if (!this.dead && !this.menuOpen && !sv?.reading && !sv?.ending && !sv?.intro) {
       if (this.mode === 'ship') this.updateShip(dt);
       else this.updateFoot(dt);
       this.updateEnvironment(dt);
@@ -2294,6 +2299,7 @@ export class Game {
     this.updateTerrain();
     this.updateScene(dt);
     this.ruins.update();
+    this.alien.update();
     this.surv?.render();
     this.updateGasBake();
     this.updateMarkers();
@@ -2372,6 +2378,7 @@ export class Game {
     this.disposed = true;
     this.surv?.dispose();
     this.ruins.dispose();
+    this.alien.dispose();
     cancelAnimationFrame(this.raf);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);

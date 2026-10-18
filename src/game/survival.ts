@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Game } from './Game';
 import { hash3, mulberry32, Noise3, clamp } from './noise';
-import { LOGS, objectiveAt, type LogEntry, type Objective } from './story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, objectiveAt, type LogEntry, type Objective, type UpgradeId, type CacheDef } from './story';
+import { SITE_POINTS } from './alien';
 import { EnemyDirector, SHOT_ENERGY } from './enemies';
 import { SoundFX } from './sound';
 
@@ -12,17 +13,24 @@ import { SoundFX } from './sound';
  * the ship; what you carried stays where you fell) and saved games.
  * Phase 2: Earth in ruins, the survivors' recordings and the objective they lead to.
  * Phase 3: sentinels and stalkers (enemies.ts), the arc rifle, synthesised sound (sound.ts).
+ * Phase 4: Base Tsiolkovsky and the scanner, the three map fragments on alien monoliths.
+ * Phase 5: hunters in orbit, the Guardian of the Spire and the end; hidden caches heard by
+ * the scanner; dark crystals and upgrades bought in the ship.
  *
  * Realistic exploration never creates this object, so nothing here can change it.
  */
 export type GameMode = 'explore' | 'survival';
-export type Res = 'ice' | 'metal';
-export const RES_LABEL: Record<Res, string> = { ice: 'hielo', metal: 'metal' };
+export type Res = 'ice' | 'metal' | 'crystal';
+export const RES_LABEL: Record<Res, string> = { ice: 'hielo', metal: 'metal', crystal: 'cristal oscuro' };
+const RES_KINDS: Res[] = ['ice', 'metal', 'crystal'];
+const emptyCargo = (): Cargo => ({ ice: 0, metal: 0, crystal: 0 });
+/** old saves had no crystals */
+const fixCargo = (c: Partial<Cargo> | undefined): Cargo => ({ ice: c?.ice ?? 0, metal: c?.metal ?? 0, crystal: c?.crystal ?? 0 });
 
 type Body = Game['bodies'][number];
 type Cargo = Record<Res, number>;
 
-/** what the suit can carry (units); the ship's hold has no limit */
+/** what the suit can carry (units; 40 with the upgrade); the ship's hold has no limit */
 export const CARGO_CAP = 24;
 /** survival-mode tuning (percent per second unless noted) */
 const O2_RATE = 100 / 360; // a full tank lasts 6 minutes on foot
@@ -82,8 +90,12 @@ export interface SurvivalSave {
   playTime: number;
   /** recordings already heard (phase 2; missing in older saves) */
   logs?: string[];
-  /** sentinels destroyed (phase 3) */
+  /** sentinels destroyed (phase 3); also the Spire's pylons and the Guardian (phase 5) */
   destroyed?: string[];
+  /** phase 5: caches opened, upgrades owned, the story finished */
+  caches?: string[];
+  upgrades?: string[];
+  ended?: boolean;
 }
 
 export interface SurvivalHud {
@@ -116,7 +128,21 @@ export interface SurvivalHud {
   hurt: number;
   shotCost: number;
   sound: boolean;
+  /** what R does here ("escuchar el registro", "leer la inscripción"...) */
+  prompt: string | null;
+  scanner: boolean;
+  /** the scanner hears a hidden cache on this world: distance and bearing on screen (degrees) */
+  scan: { dist: number; angle: number } | null;
+  boss: { hp: number; pylons: number } | null;
+  upgrades: string[];
+  /** the end sequence is playing */
+  ending: boolean;
+  stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number };
+  flying: boolean;
+  hunters: boolean;
 }
+
+interface Interactable { pos: THREE.Vector3; prompt: string; act: () => void }
 
 /** How rich each world is: chance of a deposit per cell, and the share of ice among them. */
 function richness(id: string): { p: number; ice: number } {
@@ -127,6 +153,7 @@ function richness(id: string): { p: number; ice: number } {
     case 'mercury': case 'venus': case 'io': case 'trappist-1b': case 'trappist-1c': case 'proxima-d':
       return { p: 0.1, ice: 0.08 };
     case 'mars': return { p: 0.1, ice: 0.4 };
+    case 'proxima-b': case 'trappist-1e': return { p: 0.1, ice: 0.5 };
     case 'moon': case 'phobos': case 'deimos': return { p: 0.1, ice: 0.3 };
     case 'earth': return { p: 0.08, ice: 0.2 };
     default: return { p: 0.1, ice: 0.5 };
@@ -196,8 +223,14 @@ export class Survival {
   oxygen = 100;
   energy = 100;
   fuel = START_FUEL;
-  carried: Cargo = { ice: 0, metal: 0 };
-  stored: Cargo = { ice: 0, metal: 0 };
+  carried: Cargo = emptyCargo();
+  stored: Cargo = emptyCargo();
+  /** phase 5 */
+  cachesOpen = new Set<string>();
+  upgrades = new Set<UpgradeId>();
+  ended = false;
+  /** the end sequence on screen */
+  ending = false;
   mined = new Set<string>();
   crate: Crate | null = null;
   deaths = 0;
@@ -230,16 +263,27 @@ export class Survival {
   private crateMarker: HTMLDivElement;
   private crateLabel: HTMLDivElement;
   private crateDist: number | null = null;
-  private nearLog: LogEntry | null = null;
   private objMarker: HTMLDivElement;
   private objLabel: HTMLDivElement;
   private objDist: number | null = null;
+  private prompt: string | null = null;
+  private scan: { dist: number; angle: number } | null = null;
+  private cacheMeshes = new Map<string, THREE.Group>();
+  private cacheBox = new THREE.BoxGeometry(0.9, 0.55, 0.6).translate(0, 0.27, 0);
+  private cacheMat = new THREE.MeshStandardMaterial({ color: 0x2f3a3f, roughness: 0.5, metalness: 0.6 });
+  private cacheGlow = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 0.7, 0.62) });
+  private signalFade = 0;
 
   constructor(g: Game, markerLayer: HTMLElement) {
     this.g = g;
     const ice = new THREE.MeshStandardMaterial({ color: 0xcfe8ff, roughness: 0.18, metalness: 0, emissive: 0x0b1c2b, flatShading: true });
     const ore = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.55, flatShading: true });
-    this.meshes = { ice: new THREE.InstancedMesh(iceGeo(), ice, MAX_DEPOSITS), metal: new THREE.InstancedMesh(oreGeo(), ore, MAX_DEPOSITS) };
+    // dark crystals grow around the alien places: violet, faintly glowing
+    const cry = new THREE.MeshStandardMaterial({ color: 0x3a2350, roughness: 0.12, metalness: 0.2, emissive: 0x1a0b2e, flatShading: true });
+    this.meshes = {
+      ice: new THREE.InstancedMesh(iceGeo(), ice, MAX_DEPOSITS), metal: new THREE.InstancedMesh(oreGeo(), ore, MAX_DEPOSITS),
+      crystal: new THREE.InstancedMesh(iceGeo(), cry, MAX_DEPOSITS),
+    };
     for (const m of Object.values(this.meshes)) {
       m.count = 0;
       m.frustumCulled = false; // instances move with the camera-relative origin every frame
@@ -276,25 +320,82 @@ export class Survival {
     this.objMarker.append(od, this.objLabel);
     markerLayer.appendChild(this.objMarker);
     this.enemies = new EnemyDirector(g, this.sfx);
+    this.enemies.onGuardianDown = () => this.guardianDown();
     window.addEventListener('pagehide', this.onHide);
   }
 
-  /** the next recording to find (in story order), or the far side of the Moon once all are heard */
+  // -------------------------------------------------------------------------
+  // Upgrades and their effects
+  /** multipliers from the upgrades: damage taken / dealt, battery use, oxygen use, fuel use, suit capacity */
+  mods() {
+    const u = this.upgrades;
+    return {
+      taken: u.has('armor') ? 0.65 : 1,
+      dealt: u.has('rifle') ? 1.6 : 1,
+      energy: u.has('battery') ? 0.65 : 1,
+      o2: u.has('o2') ? 0.6 : 1,
+      fuel: u.has('engine') ? 0.7 : 1,
+      cap: u.has('cargo') ? 40 : CARGO_CAP,
+    };
+  }
+  /** buy an upgrade with what is in the ship's hold (only aboard) */
+  buy(id: UpgradeId): string | null {
+    const up = UPGRADES.find((x) => x.id === id)!;
+    if (this.upgrades.has(id)) return 'Ya la tienes';
+    if (this.g.mode !== 'ship') return 'Solo a bordo de la nave';
+    if (this.stored.metal < up.metal || this.stored.crystal < up.crystal) return 'Faltan materiales en la bodega';
+    this.stored.metal -= up.metal;
+    this.stored.crystal -= up.crystal;
+    this.upgrades.add(id);
+    this.g.note(`Mejora instalada: ${up.name}`);
+    this.save();
+    return null;
+  }
+  get hasScanner() { return this.logsRead.has('tsio-3'); }
+
+  // -------------------------------------------------------------------------
+  // The story: Earth's recordings, Base Tsiolkovsky, the three fragments, the Spire
   objective(): Objective {
     const i = LOGS.findIndex((l) => !this.logsRead.has(l.id));
-    return objectiveAt(i < 0 ? LOGS.length : i);
+    if (i >= 0) return objectiveAt(i);
+    const base = BASE_LOGS.filter((l) => this.logsRead.has(l.id)).length;
+    if (base < BASE_LOGS.length) {
+      return { text: base === 0 ? 'Viaja a la cara oculta de la Luna: la Base Tsiolkovsky' : `Explora la Base Tsiolkovsky: registros y el artefacto (${base}/${BASE_LOGS.length})`, place: 'tsiolkovsky' };
+    }
+    const left = FRAGMENTS.filter((f) => !this.logsRead.has(f.id));
+    if (left.length) {
+      // the nearest one in this star system first, else the next in order
+      const g = this.g;
+      const here = left.filter((f) => g.alien.body(g.alien.site(f.site)!).star === g.sunBody);
+      const pick = (here.length ? here : left)[0];
+      return { text: `Recupera los fragmentos del mapa (${FRAGMENTS.length - left.length}/${FRAGMENTS.length}): Marte, Europa y Próxima b`, place: pick.site };
+    }
+    if (!this.enemies.guardianDown) return { text: 'Viaja a TRAPPIST-1 e y apaga el faro: la Aguja', place: 'spire' };
+    return { text: 'La señal se ha apagado. El universo es tuyo', place: '' };
+  }
+  private guardianDown() {
+    this.ending = true;
+    this.ended = true;
+    this.signalFade = 0.001;
+    this.save();
+  }
+  /** the end sequence closed */
+  finishEnding() {
+    this.ending = false;
+    this.g.note('La señal se ha apagado. Puedes seguir explorando: los secretos y las mejoras siguen ahí');
+    this.g.requestLock();
   }
 
   /** world position of the objective, or null when it is not in this star system */
   private objectivePos(o: Objective, out: THREE.Vector3): THREE.Vector3 | null {
     const g = this.g;
-    if (o.place === 'tsiolkovsky') {
-      const moon = g.byId.get('moon')!, earth = g.byId.get('earth')!;
-      if (moon.star !== g.sunBody) return null;
-      // the crater lies on the far side, 20 degrees south of the point facing away from Earth
-      const away = moon.pos.clone().sub(earth.pos).normalize();
-      const d = away.multiplyScalar(Math.cos(0.35)).add(new THREE.Vector3(0, -Math.sin(0.35), 0)).normalize();
-      return out.copy(moon.pos).addScaledVector(d, moon.def.radius + g.terrainH(moon, d));
+    if (!o.place) return null;
+    const al = g.alien.site(o.place);
+    if (al) {
+      const b = g.alien.body(al);
+      // in another star system: point at its star
+      if (b.star !== g.sunBody) return out.copy(b.star.pos);
+      return g.alien.centre(al, out);
     }
     const s = this.ruins.site(o.place);
     const earth = g.byId.get('earth')!;
@@ -313,8 +414,11 @@ export class Survival {
     const first = !this.logsRead.has(l.id);
     this.logsRead.add(l.id);
     if (first) {
-      this.g.note(`Registro guardado: ${l.title} (${this.logsRead.size}/${LOGS.length}). Puedes releerlo en el mapa`);
-      this.g.note(`Nuevo objetivo: ${this.objective().text}`);
+      const g = this.g;
+      if (l.id === 'tsio-3') g.note('Escáner sincronizado: ahora oyes los fragmentos del mapa y las señales escondidas');
+      else if (FRAGMENTS.includes(l)) g.note(`Fragmento del mapa recuperado (${FRAGMENTS.filter((f) => this.logsRead.has(f.id)).length}/${FRAGMENTS.length})`);
+      else g.note(`Registro guardado: ${l.title}. Puedes releerlo en el mapa`);
+      g.note(`Objetivo: ${this.objective().text}`);
       this.save();
     }
     this.g.requestLock();
@@ -341,11 +445,12 @@ export class Survival {
     this.sfx.dispose();
   }
 
-  private total(c: Cargo) { return c.ice + c.metal; }
+  private total(c: Cargo) { return c.ice + c.metal + c.crystal; }
   private cargoText(c: Cargo) {
     const p: string[] = [];
     if (c.ice) p.push(`${c.ice} hielo`);
     if (c.metal) p.push(`${c.metal} metal`);
+    if (c.crystal) p.push(`${c.crystal} cristal`);
     return p.join(' · ');
   }
 
@@ -359,7 +464,7 @@ export class Survival {
       // breathing: Earth's air is still breathable (the suit tops its tank up); anywhere else the tank empties
       const run = g.keys.has('ShiftLeft') || g.keys.has('ShiftRight');
       if (g.nearest.def.id === 'earth') this.oxygen = Math.min(100, this.oxygen + dt * 5);
-      else this.oxygen = Math.max(0, this.oxygen - dt * O2_RATE * (run ? O2_RUN : 1));
+      else this.oxygen = Math.max(0, this.oxygen - dt * O2_RATE * this.mods().o2 * (run ? O2_RUN : 1));
       if (this.oxygen <= 0) {
         g.suit -= dt * NO_O2_DAMAGE;
         g.warnings.push('SIN OXÍGENO · VUELVE A LA NAVE');
@@ -369,7 +474,7 @@ export class Survival {
       if (g.dead) return;
       // battery: the flashlight drains it, the suit's panels charge it in sunlight
       const sunlit = clamp(g.light.intensity / 3.3, 0, 1);
-      this.energy = clamp(this.energy + dt * (SOLAR_CHARGE * sunlit - (g.lightsOn ? LAMP_DRAIN : 0)), 0, 100);
+      this.energy = clamp(this.energy + dt * (SOLAR_CHARGE * sunlit - (g.lightsOn ? LAMP_DRAIN * this.mods().energy : 0)), 0, 100);
       if (this.energy <= 0 && g.lightsOn) {
         g.lightsOn = false;
         g.note('Batería agotada: la linterna se apagó. Se recarga al sol o en la nave');
@@ -383,9 +488,8 @@ export class Survival {
       g.suit = Math.min(100, g.suit + dt * 2);
       if (this.total(this.carried) > 0) {
         g.note(`Descargado en la bodega: ${this.cargoText(this.carried)}`);
-        this.stored.ice += this.carried.ice;
-        this.stored.metal += this.carried.metal;
-        this.carried = { ice: 0, metal: 0 };
+        for (const k of RES_KINDS) this.stored[k] += this.carried[k];
+        this.carried = emptyCargo();
       }
       this.updateRefinery(dt);
       if (this.fuel < 15 && !g.warp) g.warnings.push(`COMBUSTIBLE ${this.fuel.toFixed(0)}%`);
@@ -396,9 +500,14 @@ export class Survival {
     // what lives in the dark (and the machines)
     this.enemies.update(dt);
     if (g.suit <= 0 && !g.dead) {
-      g.die(this.enemies.lastHit === 'sentinel'
-        ? 'Un centinela te alcanzó. Las máquinas no perdonan a quien se acerca a sus torres.'
+      const why = this.enemies.lastHit;
+      g.die(why === 'guardian' ? 'El Guardián de la Aguja te alcanzó. El faro sigue ardiendo.'
+        : why === 'sentinel' ? 'Un centinela te alcanzó. Las máquinas no perdonan a quien se acerca a sus torres.'
         : 'Algo salió de la oscuridad. No lo viste llegar.');
+      return;
+    }
+    if (g.mode === 'ship' && g.hull <= 0 && !g.dead && this.enemies.lastHit === 'hunter') {
+      g.die('Los cazadores alienígenas destruyeron la nave.');
       return;
     }
     // the astronaut faces where you look: the flashlight and the weapon point there
@@ -424,7 +533,7 @@ export class Survival {
 
   /** put things in the suit (up to its capacity); returns how many fitted */
   addCargo(kind: Res, n: number) {
-    const got = Math.max(0, Math.min(n, CARGO_CAP - this.total(this.carried)));
+    const got = Math.max(0, Math.min(n, this.mods().cap - this.total(this.carried)));
     this.carried[kind] += got;
     return got;
   }
@@ -432,17 +541,16 @@ export class Survival {
   private updateMining(dt: number) {
     const g = this.g;
     const p = g.playerPos;
-    // a survivor's recording within reach: R plays it
-    this.nearLog = null;
-    if (g.nearest.def.id === 'earth') {
-      const E = g.nearest;
-      for (const l of LOGS) {
-        const s = this.ruins.site(l.site);
-        if (s && s.logPos.clone().add(E.pos).distanceTo(p) < READ_RANGE) { this.nearLog = l; break; }
-      }
+    // something to listen to, read or open within reach: R does it
+    this.prompt = null;
+    let near: Interactable | null = null, nd = READ_RANGE;
+    for (const it of this.interactables()) {
+      const d = it.pos.distanceTo(p);
+      if (d < nd) { nd = d; near = it; }
     }
-    if (this.nearLog) {
-      if (g.pressed.has('KeyR')) this.openLog(this.nearLog);
+    if (near) {
+      this.prompt = near.prompt;
+      if (g.pressed.has('KeyR')) near.act();
       this.mineProgress = 0;
       this.mineTarget = null;
       this.nearDeposit = null;
@@ -462,25 +570,26 @@ export class Survival {
       if (this.mineProgress === 0) this.mineTarget = null;
       return;
     }
-    if (this.total(this.carried) >= CARGO_CAP) {
-      if (g.pressed.has('KeyR')) g.note(`Carga llena (${CARGO_CAP}): vuelve a la nave para descargarla`);
+    const cap = this.mods().cap;
+    if (this.total(this.carried) >= cap) {
+      if (g.pressed.has('KeyR')) g.note(`Carga llena (${cap}): vuelve a la nave para descargarla`);
       return;
     }
-    if (this.energy < MINE_ENERGY) {
+    if (this.energy < MINE_ENERGY * this.mods().energy) {
       if (g.pressed.has('KeyR')) g.note('Batería insuficiente para extraer: recárgala al sol o en la nave');
       return;
     }
     if (this.mineTarget !== best) { this.mineTarget = best; this.mineProgress = 0; }
     this.mineProgress += dt / MINE_TIME;
     if (this.mineProgress >= 1) {
-      const room = CARGO_CAP - this.total(this.carried);
+      const room = cap - this.total(this.carried);
       const got = Math.min(best.amount, room);
       this.carried[best.kind] += got;
-      this.energy -= MINE_ENERGY;
+      this.energy -= MINE_ENERGY * this.mods().energy;
       this.mined.add(best.key);
       if (this.mined.size > 4000) this.mined.delete(this.mined.values().next().value!);
       this.deposits.splice(this.deposits.indexOf(best), 1);
-      g.note(`+${got} ${RES_LABEL[best.kind]} · carga ${this.total(this.carried)}/${CARGO_CAP}`);
+      g.note(`+${got} ${RES_LABEL[best.kind]} · carga ${this.total(this.carried)}/${cap}`);
       this.mineProgress = 0;
       this.mineTarget = null;
       this.nearDeposit = null;
@@ -492,16 +601,15 @@ export class Survival {
     if (!c || c.body !== g.nearest.def.id) return;
     const pos = new THREE.Vector3(...c.off).add(g.nearest.pos);
     if (pos.distanceTo(g.playerPos) > 3) return;
-    const room = CARGO_CAP - this.total(this.carried);
+    const room = this.mods().cap - this.total(this.carried);
     if (room <= 0) { if (g.pressed.has('KeyR')) g.note('Carga llena: no puedes recoger tus cosas'); return; }
-    const take: Cargo = { ice: 0, metal: 0 };
+    const take = emptyCargo();
     let left = room;
-    for (const k of ['metal', 'ice'] as Res[]) {
+    for (const k of ['crystal', 'metal', 'ice'] as Res[]) {
       const n = Math.min(c.cargo[k], left);
       take[k] = n; c.cargo[k] -= n; left -= n;
     }
-    this.carried.ice += take.ice;
-    this.carried.metal += take.metal;
+    for (const k of RES_KINDS) this.carried[k] += take[k];
     if (this.total(c.cargo) === 0) {
       this.crate = null;
       g.note(`Recuperaste tus cosas: ${this.cargoText(take)}`);
@@ -529,8 +637,8 @@ export class Survival {
   /** Pulse engine ignition. 'go' = jump, 'emergency' = jump on the reserve towards the nearest world, 'no' = stay. */
   jumpStart(): 'go' | 'emergency' | 'no' {
     const g = this.g;
-    if (this.fuel >= JUMP_COST + 1) {
-      this.fuel -= JUMP_COST;
+    if (this.fuel >= JUMP_COST * this.mods().fuel + 1) {
+      this.fuel -= JUMP_COST * this.mods().fuel;
       this.emergency = false;
       return 'go';
     }
@@ -568,7 +676,7 @@ export class Survival {
   /** Fuel burnt while warping; switches to an emergency jump when the tank runs dry. */
   warpBurn(dt: number, speed: number) {
     if (this.emergency) return;
-    const rate = 0.25 + 0.12 * Math.max(0, Math.log10(speed / 1e6));
+    const rate = (0.25 + 0.12 * Math.max(0, Math.log10(speed / 1e6))) * this.mods().fuel;
     this.fuel = Math.max(0, this.fuel - rate * dt);
     if (this.fuel <= 0) {
       const w = this.nearestWorld(this.g.shipPos);
@@ -596,19 +704,16 @@ export class Survival {
     if (onFoot) {
       if (this.total(this.carried) > 0) {
         const off = g.playerPos.clone().sub(g.nearest.pos);
-        const keep = this.crate && this.crate.body === g.nearest.def.id ? this.crate.cargo : { ice: 0, metal: 0 };
         // a second death before recovering them: everything is kept, in the newest place
-        const old = this.crate && this.crate.body !== g.nearest.def.id ? this.crate.cargo : { ice: 0, metal: 0 };
-        this.crate = {
-          body: g.nearest.def.id, off: [off.x, off.y, off.z],
-          cargo: { ice: this.carried.ice + keep.ice + old.ice, metal: this.carried.metal + keep.metal + old.metal },
-        };
-        this.carried = { ice: 0, metal: 0 };
+        const prev = this.crate ? this.crate.cargo : emptyCargo();
+        const cargo = emptyCargo();
+        for (const k of RES_KINDS) cargo[k] = this.carried[k] + prev[k];
+        this.crate = { body: g.nearest.def.id, off: [off.x, off.y, off.z], cargo };
+        this.carried = emptyCargo();
       }
     } else {
       // the wreck: part of the hold is lost
-      this.stored.ice = Math.floor(this.stored.ice * 0.7);
-      this.stored.metal = Math.floor(this.stored.metal * 0.7);
+      for (const k of RES_KINDS) this.stored[k] = Math.floor(this.stored[k] * 0.7);
     }
   }
 
@@ -639,11 +744,15 @@ export class Survival {
     this.ruins.updateTerminals(this.logsRead, (site) => LOGS.find((l) => l.site === site)?.id);
     this.renderObjective();
     this.enemies.render();
+    this.renderCaches();
+    // the signal dies: the alien glyphs fade out over a few seconds
+    if (this.signalFade > 0 && g.alien.signal > 0) g.alien.signal = Math.max(0, 1 - (this.signalFade += 1 / 60) / 5);
+    else if (this.ended) g.alien.signal = 0;
     const focus = g.mode === 'ship' ? g.shipPos : g.playerPos;
     const near = body.def.kind === 'rocky' && !!body.terrain && g.altitude < 2500 && !g.warp;
     if (near) this.refreshField(body, focus);
     else if (this.fieldKey) { this.fieldKey = ''; this.deposits = []; }
-    const counts: Record<Res, number> = { ice: 0, metal: 0 };
+    const counts: Record<Res, number> = { ice: 0, metal: 0, crystal: 0 };
     const m = new THREE.Matrix4(), p = new THREE.Vector3(), s = new THREE.Vector3();
     for (const d of this.deposits) {
       const im = this.meshes[d.kind];
@@ -655,7 +764,7 @@ export class Survival {
       s.setScalar(d.scale * k);
       im.setMatrixAt(i, m.compose(p, d.q, s));
     }
-    for (const k of ['ice', 'metal'] as Res[]) {
+    for (const k of RES_KINDS) {
       const im = this.meshes[k];
       im.count = Math.min(counts[k], MAX_DEPOSITS);
       im.visible = im.count > 0;
@@ -706,6 +815,8 @@ export class Survival {
     const seed = (body.def.seed * 7919 + face * 104729) | 0;
     const sea = body.terrain!.gen.seaLevel;
     const d = new THREE.Vector3();
+    // dark crystals grow within ~3 km of the places of the signal
+    const alienHere = this.g.alien.sites.find((s) => s.body === body.def.id && s.dir.angleTo(dir) * R < 3000);
     const up = new THREE.Vector3(0, 1, 0);
     for (let di = -REACH; di <= REACH; di++) {
       for (let dj = -REACH; dj <= REACH; dj++) {
@@ -717,14 +828,15 @@ export class Survival {
         fromFace(face, -1 + (2 * (i + 0.15 + 0.7 * hash3(i, j, face, seed + 1))) / N, -1 + (2 * (j + 0.15 + 0.7 * hash3(i, j, face, seed + 2))) / N, d);
         const h = this.g.terrainH(body, d);
         if (sea !== null && h < sea + 0.3) continue; // nothing under the sea
-        const kind: Res = hash3(i, j, face, seed + 3) < rich.ice ? 'ice' : 'metal';
+        const kr = hash3(i, j, face, seed + 3);
+        const kind: Res = alienHere && hash3(i, j, face, seed + 7) < 0.5 ? 'crystal' : kr < rich.ice ? 'ice' : 'metal';
         const scale = 0.75 + 0.6 * hash3(i, j, face, seed + 4);
         const q = new THREE.Quaternion().setFromUnitVectors(up, d)
           .multiply(new THREE.Quaternion().setFromAxisAngle(up, hash3(i, j, face, seed + 5) * Math.PI * 2));
         this.deposits.push({
           key: dk, kind, body, scale, q,
           off: d.clone().multiplyScalar(R + h - 0.2 * scale),
-          amount: (kind === 'ice' ? 3 : 2) + Math.floor(hash3(i, j, face, seed + 6) * 3),
+          amount: (kind === 'ice' ? 3 : kind === 'crystal' ? 1 : 2) + Math.floor(hash3(i, j, face, seed + 6) * (kind === 'crystal' ? 2 : 3)),
         });
       }
     }
@@ -755,7 +867,9 @@ export class Survival {
     if (!inView) return;
     this.objMarker.style.transform = `translate(${((v.x * 0.5 + 0.5) * lay.clientWidth).toFixed(1)}px, ${((-v.y * 0.5 + 0.5) * lay.clientHeight).toFixed(1)}px)`;
     this.objMarker.style.opacity = hidden ? '0.35' : '1';
-    const name = o.place === 'tsiolkovsky' ? 'BASE TSIOLKOVSKY' : (this.ruins.site(o.place)?.name ?? '').toUpperCase();
+    const al = g.alien.site(o.place);
+    const far = al && g.alien.body(al).star !== g.sunBody;
+    const name = al ? (far ? `→ ${g.alien.body(al).star.def.name}` : al.name).toUpperCase() : (this.ruins.site(o.place)?.name ?? '').toUpperCase();
     const txt = dist < 1000 ? `${dist.toFixed(0)} m` : dist < 1e6 ? `${(dist / 1000).toFixed(1)} km` : `${Math.round(dist / 1000).toLocaleString('es-ES')} km`;
     this.objLabel.textContent = `${name}  ${txt}`;
   }
@@ -768,21 +882,35 @@ export class Survival {
       fuel: this.fuel,
       carried: { ...this.carried },
       stored: { ...this.stored },
-      cap: CARGO_CAP,
+      cap: this.mods().cap,
       mining: this.mineTarget ? clamp(this.mineProgress, 0, 1) : 0,
       near: this.nearDeposit ? RES_LABEL[this.nearDeposit.kind] : null,
       crateDist: this.crateDist,
       refining: this.g.mode === 'ship' ? this.refining : null,
       saved: this.g.time - this.savedAt < 2,
       emergency: this.emergency,
-      nearLog: !!this.nearLog && this.g.mode === 'foot',
+      nearLog: !!this.prompt && this.g.mode === 'foot',
       objective: this.objective().text,
       objectiveDist: this.objDist,
       reading: this.reading,
       intro: this.intro,
       hurt: this.enemies.hurt,
-      shotCost: SHOT_ENERGY,
+      shotCost: Math.round(SHOT_ENERGY * this.mods().energy * 10) / 10,
       sound: this.sfx.enabled,
+      prompt: this.g.mode === 'foot' ? this.prompt : null,
+      scanner: this.hasScanner,
+      scan: this.scan,
+      boss: this.enemies.boss(),
+      upgrades: [...this.upgrades],
+      ending: this.ending,
+      stats: {
+        time: this.playTime, deaths: this.deaths,
+        logs: [...LOGS, ...BASE_LOGS, ...FRAGMENTS].filter((l) => this.logsRead.has(l.id)).length,
+        logsTotal: LOGS.length + BASE_LOGS.length + FRAGMENTS.length,
+        caches: this.cachesOpen.size, cachesTotal: CACHES.length,
+      },
+      flying: this.g.mode === 'ship' && !this.g.landed,
+      hunters: this.enemies.tension() >= 0.7 && this.g.mode === 'ship',
     };
   }
 
@@ -808,6 +936,9 @@ export class Survival {
       target: g.target?.def.id ?? null, deaths: this.deaths, playTime: this.playTime,
       logs: [...this.logsRead],
       destroyed: [...this.enemies.destroyed],
+      caches: [...this.cachesOpen],
+      upgrades: [...this.upgrades],
+      ended: this.ended,
     };
     try { localStorage.setItem(SAVE_KEY, JSON.stringify(s)); this.savedAt = g.time; } catch { /* storage full or unavailable */ }
   }
@@ -815,12 +946,107 @@ export class Survival {
   /** restore everything but the ship's position (Game.restoreSurvival places it) */
   apply(s: SurvivalSave) {
     this.oxygen = s.oxygen; this.energy = s.energy; this.fuel = s.fuel;
-    this.carried = { ...s.carried }; this.stored = { ...s.stored };
+    this.carried = fixCargo(s.carried); this.stored = fixCargo(s.stored);
     this.mined = new Set(s.mined);
-    this.crate = s.crate;
+    this.crate = s.crate ? { ...s.crate, cargo: fixCargo(s.crate.cargo) } : null;
     this.deaths = s.deaths; this.playTime = s.playTime;
     this.logsRead = new Set(s.logs ?? []);
     this.enemies.destroyed = new Set(s.destroyed ?? []);
+    this.cachesOpen = new Set(s.caches ?? []);
+    this.upgrades = new Set((s.upgrades ?? []) as UpgradeId[]);
+    this.ended = !!s.ended;
+  }
+
+  // -------------------------------------------------------------------------
+  // Things R does: recordings, the artefact, the inscriptions, the caches
+  private interactables(): Interactable[] {
+    const g = this.g, b = g.nearest, out: Interactable[] = [];
+    if (b.def.id === 'earth') {
+      for (const l of LOGS) {
+        const s = this.ruins.site(l.site);
+        if (s) out.push({ pos: s.logPos.clone().add(b.pos), prompt: 'escuchar el registro', act: () => this.openLog(l) });
+      }
+    }
+    for (const s of g.alien.sites) {
+      if (s.body !== b.def.id || !b.terrain) continue;
+      if (s.kind === 'base') {
+        const pts = SITE_POINTS.base;
+        BASE_LOGS.forEach((l) => {
+          const [x, z] = l.site === 't1' ? pts.t1 : l.site === 't2' ? pts.t2 : pts.artefact;
+          out.push({ pos: g.alien.point(s, x, z), prompt: l.site === 'artefact' ? 'examinar el artefacto' : 'escuchar el registro', act: () => this.openLog(l) });
+        });
+      } else if (s.kind === 'monolith') {
+        const f = FRAGMENTS.find((x) => x.site === s.id);
+        if (!f) continue;
+        const [x, z] = SITE_POINTS.monolith.glyph;
+        out.push({
+          pos: g.alien.point(s, x, z),
+          prompt: this.hasScanner ? 'leer la inscripción con el escáner' : 'tocar la piedra',
+          act: () => (this.hasScanner ? this.openLog(f) : g.note('Las líneas brillan, pero no entiendes nada. Quizá con el escáner de Tsiolkovsky…')),
+        });
+      }
+    }
+    if (this.hasScanner) {
+      for (const c of CACHES) {
+        if (c.body !== b.def.id || this.cachesOpen.has(c.id) || !b.terrain) continue;
+        out.push({ pos: this.cachePos(c, b), prompt: 'abrir el alijo', act: () => this.openCache(c) });
+      }
+    }
+    return out;
+  }
+
+  private cachePos(c: CacheDef, b: Body) {
+    const d = new THREE.Vector3(...c.dir).normalize();
+    return d.multiplyScalar(b.def.radius + this.g.terrainH(b, d)).add(b.pos);
+  }
+
+  private openCache(c: CacheDef) {
+    const g = this.g;
+    this.cachesOpen.add(c.id);
+    const up = UPGRADES.find((u) => u.id === c.upgrade)!;
+    const had = this.upgrades.has(c.upgrade);
+    this.upgrades.add(c.upgrade);
+    const got = this.addCargo('crystal', 4);
+    g.note(had ? `Alijo abierto: piezas de repuesto y ${got} cristales` : `Alijo abierto: ${up.name} instalada${got ? ` · +${got} cristales` : ''}`);
+    this.sfx.play('alert');
+    if (c.log) this.openLog(c.log);
+    else this.save();
+  }
+
+  /** the caches only exist for the scanner (and are drawn when close) */
+  private renderCaches() {
+    const g = this.g, b = g.nearest, cw = g.camWorld;
+    this.scan = null;
+    let best = Infinity, bestPos: THREE.Vector3 | null = null;
+    const focus = g.mode === 'ship' ? g.shipPos : g.playerPos;
+    for (const c of CACHES) {
+      let m = this.cacheMeshes.get(c.id);
+      const show = this.hasScanner && !this.cachesOpen.has(c.id) && c.body === b.def.id && !!b.terrain;
+      if (!show) { if (m) m.visible = false; continue; }
+      const pos = this.cachePos(c, b);
+      const dist = pos.distanceTo(focus);
+      if (dist < best) { best = dist; bestPos = pos; }
+      if (!m && dist < 3000) {
+        m = new THREE.Group();
+        const box = new THREE.Mesh(this.cacheBox, this.cacheMat);
+        box.castShadow = true;
+        const strip = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.05, 0.62), this.cacheGlow);
+        strip.position.y = 0.42;
+        m.add(box, strip);
+        g.scene.add(m);
+        this.cacheMeshes.set(c.id, m);
+      }
+      if (m) {
+        m.visible = dist < 3000;
+        m.position.copy(pos).sub(cw);
+        m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), pos.clone().sub(b.pos).normalize());
+      }
+    }
+    // the scanner's needle: bearing of the hidden cache relative to the view
+    if (bestPos && best < 2e7) {
+      const v = bestPos.clone().sub(cw).applyQuaternion(g.camera.quaternion.clone().invert());
+      this.scan = { dist: best, angle: (Math.atan2(v.x, -v.z) * 180) / Math.PI };
+    }
   }
 
   static load(): SurvivalSave | null {

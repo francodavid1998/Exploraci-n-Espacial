@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { Game } from './Game';
 import type { SoundFX } from './sound';
 import { clamp } from './noise';
+import { nightDir, tsiolkovskyDir, SITE_POINTS } from './alien';
 
 /**
  * Survival mode, phase 3: what lives in the ruins.
@@ -12,6 +13,12 @@ import { clamp } from './noise';
  *    one alone in deep darkness. They creep up when you are not looking, flee from the
  *    flashlight and strike, then pull back.
  * Never many at once (at most MAX_STALKERS), only around the player, only on foot.
+ * Phase 5:
+ *  - Hunters: alien drones in low orbit of Proxima b and TRAPPIST-1 e. They keep pace with
+ *    the ship whatever its speed (positions are ship-relative) and are fought with the
+ *    ship's cannons (left click while flying).
+ *  - The Guardian of the Spire (TRAPPIST-1 e): shielded while any of its three pylons
+ *    stands; volleys of bolts; the creatures of the night come to its call.
  * Nothing flashes: lights ramp smoothly, hits are soft fading puffs.
  */
 type Body = Game['bodies'][number];
@@ -23,6 +30,9 @@ const SENT_SCALE = 1.5;
 const SENTINEL_HP = 120, SENTINEL_RANGE = 110, SENTINEL_BOLT = 12, SENTINEL_RATE = 2.2, SENTINEL_BOLT_SPEED = 30;
 const PLAYER_BOLT = 20, PLAYER_BOLT_SPEED = 140, PLAYER_RATE = 0.32;
 export const SHOT_ENERGY = 3;
+const GUARDIAN_HP = 400, PYLON_HP = 60, GUARDIAN_RANGE = 420, GUARDIAN_SCALE = 3.2;
+const HUNTER_HP = 60, HUNTER_BOLT = 5, HUNTER_RATE = 1.7, HUNTER_ALT = 2.5e6, MAX_HUNTERS = 3;
+const CANNON = 30, CANNON_SPEED = 1500, CANNON_RATE = 0.22;
 
 interface Zone {
   id: string;
@@ -59,6 +69,10 @@ interface Sentinel {
   mesh: SentinelMesh;
 }
 interface Bolt { pos: THREE.Vector3; vel: THREE.Vector3; enemy: boolean; ttl: number; mesh: THREE.Mesh }
+/** orbit fights happen in the ship's frame: rel = position minus the ship's */
+interface RelBolt { rel: THREE.Vector3; vel: THREE.Vector3; enemy: boolean; ttl: number; mesh: THREE.Mesh }
+interface Hunter { rel: THREE.Vector3; vel: THREE.Vector3; hp: number; fireT: number; orbit: number; mesh: THREE.Group; dying: number }
+interface Guardian { hp: number; pylons: number[]; fireT: number; mesh: SentinelMesh; dead: number; shieldNote: boolean }
 interface Puff { pos: THREE.Vector3; t: number; mesh: THREE.Mesh }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +158,34 @@ function buildSentinel(): SentinelMesh {
   return { root, head, eye, body };
 }
 
-const UP = new THREE.Vector3(0, 1, 0);
+/** a hunter drone: a dark arrowhead with three fins and a violet eye (~6 m) */
+function buildHunter() {
+  const root = new THREE.Group();
+  const hullG = new THREE.OctahedronGeometry(1, 0);
+  const hull = new THREE.Mesh(hullG, skin);
+  hull.scale.set(1.3, 0.6, 3.2);
+  root.add(hull);
+  // dark hulls vanish against space: the fins' edges and the drive glow, steady and dim
+  const glow = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.32, 0.14, 0.55) });
+  for (let i = 0; i < 3; i++) {
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.6, 1.8), glow);
+    fin.position.z = 1.4;
+    fin.rotation.z = (i / 3) * Math.PI * 2;
+    fin.position.x = Math.sin(fin.rotation.z) * -0.8;
+    fin.position.y = Math.cos(fin.rotation.z) * 0.8;
+    root.add(fin);
+  }
+  const eye = new THREE.Mesh(G.sEye, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.5, 0.2, 0.9) }));
+  eye.position.z = -2.9;
+  eye.scale.setScalar(1.4);
+  const drive = new THREE.Mesh(G.puff, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 0.2, 0.75), transparent: true, opacity: 0.6, depthWrite: false }));
+  drive.position.z = 3.2;
+  drive.scale.set(1.2, 1.2, 2);
+  root.add(eye, drive);
+  root.scale.setScalar(1.8);
+  return root;
+}
+
 const Z_AXIS = new THREE.Vector3(0, 0, 1);
 /** a quaternion standing an object on the ground (up = radial) facing `fwd` */
 function standing(up: THREE.Vector3, fwd: THREE.Vector3, out: THREE.Quaternion) {
@@ -175,6 +216,14 @@ export class EnemyDirector {
   lastHit = '';
   /** seconds since the player last fired (arm pose) */
   sinceShot = 10;
+  private hunters: Hunter[] = [];
+  private relBolts: RelBolt[] = [];
+  private hunterT = 0;
+  private cannonT = 0;
+  private guardian: Guardian | null = null;
+  /** called once when the Guardian falls (the end of the story) */
+  onGuardianDown?: () => void;
+  get guardianDown() { return this.destroyed.has('guardian'); }
   private boltMats = {
     player: new THREE.MeshBasicMaterial({ color: new THREE.Color(0.35, 0.85, 1.0) }),
     enemy: new THREE.MeshBasicMaterial({ color: new THREE.Color(1.0, 0.35, 0.12) }),
@@ -197,17 +246,12 @@ export class EnemyDirector {
       // only where the Sun does not shine: night and deep twilight
       if (elev < 0.05) this.zones.push({ id: s.id, body: 'earth', dir: s.dir.clone(), radius: s.radius + 350, stalkers: elev < -0.3 ? 4 : elev < -0.1 ? 3 : 2 });
     }
-    // the far side of the Moon (the Tsiolkovsky crater), and the night side of a few worlds
-    const moon = g.byId.get('moon')!;
-    const away = moon.pos.clone().sub(earth.pos).normalize();
-    this.zones.push({ id: 'moon-far', body: 'moon', dir: away.multiplyScalar(Math.cos(0.35)).add(new THREE.Vector3(0, -Math.sin(0.35), 0)).normalize(), radius: 4000, stalkers: 5 });
+    // the far side of the Moon (Base Tsiolkovsky) and the night side of a few worlds: the places
+    // of the signal (alien.ts puts its structures at the very same points)
+    this.zones.push({ id: 'moon-far', body: 'moon', dir: tsiolkovskyDir(g), radius: 4000, stalkers: 5 });
     for (const [id, n] of [['mars', 4], ['europa', 3], ['proxima-b', 5], ['trappist-1e', 6]] as const) {
       const b = g.byId.get(id);
-      if (!b) continue;
-      // 50° from the anti-star point: deep night, but not too far from the dawn
-      const night = toSun(b).negate();
-      const side = new THREE.Vector3().crossVectors(night, UP).normalize();
-      this.zones.push({ id: `${id}-night`, body: id, dir: night.multiplyScalar(Math.cos(0.87)).addScaledVector(side, Math.sin(0.87)).normalize(), radius: 3500, stalkers: n });
+      if (b) this.zones.push({ id: `${id}-night`, body: id, dir: nightDir(b), radius: 3500, stalkers: n });
     }
     // sentinels: in the open square of a few ruined cities (where the recordings are)
     const towers: [string, number, number][] = [
@@ -244,8 +288,10 @@ export class EnemyDirector {
     const pRel = g.playerPos.clone().sub(b.pos);
     const dark = 1 - clamp(g.light.intensity / 3.3 / 0.35, 0, 1); // 1 = no sunlight at all
 
-    // --- the player's weapon
+    // --- the player's weapon (on foot) or the ship's cannons (flying)
     if (onFoot && g.keys.has('Mouse0') && this.fireT <= 0) this.fire();
+    this.updateHunters(dt);
+    this.updateGuardian(dt, onFoot, pRel);
 
     // --- sentinels near the player (built and dropped as the player comes and goes)
     for (const def of this.sentinelDefs) {
@@ -268,7 +314,7 @@ export class EnemyDirector {
     const zone = onFoot ? this.zoneAt(b, pRel) : null;
     this.darkT = onFoot && dark > 0.9 ? this.darkT + dt : 0;
     const live = this.stalkers.filter((s) => s.state !== 'dying');
-    const want = zone ? Math.round(zone.stalkers * dark) : 0;
+    const want = zone ? Math.min(Math.round(zone.stalkers * dark), this.guardian && !this.guardian.dead ? 3 : 99) : 0;
     this.spawnT -= dt;
     if (onFoot && live.length < Math.min(want, MAX_STALKERS) && this.spawnT <= 0) {
       this.spawn(b, pRel, false);
@@ -345,7 +391,7 @@ export class EnemyDirector {
       // they creep when watched and rush when you look away
       speed = watched ? 1.1 : 5.5;
       if (dist < 2.1) {
-        g.suit -= STALKER_HIT;
+        g.suit -= STALKER_HIT * g.surv!.mods().taken;
         this.hurt = 1;
         this.lastHit = 'stalker';
         this.sfx.play('growl', fromCam);
@@ -440,11 +486,12 @@ export class EnemyDirector {
   /** the arc rifle: a fast bolt along the view, costs battery */
   private fire() {
     const g = this.g, sv = g.surv!;
-    if (sv.energy < SHOT_ENERGY) {
+    const cost = SHOT_ENERGY * sv.mods().energy;
+    if (sv.energy < cost) {
       if (g.pressed.has('Mouse0')) g.note('Batería agotada: el arma no dispara. Recárgala al sol o en la nave');
       return;
     }
-    sv.energy -= SHOT_ENERGY;
+    sv.energy -= cost;
     this.fireT = PLAYER_RATE;
     this.sinceShot = 0;
     const b = g.nearest;
@@ -469,7 +516,7 @@ export class EnemyDirector {
     const mesh = new THREE.Mesh(G.bolt, enemy ? this.boltMats.enemy : this.boltMats.player);
     mesh.scale.set(1, 1, enemy ? 2.2 : 4);
     this.g.scene.add(mesh);
-    this.bolts.push({ pos: pos.clone(), vel, enemy, ttl: enemy ? 6 : 1.6, mesh });
+    this.bolts.push({ pos: pos.clone(), vel, enemy, ttl: enemy ? 8 : 1.6, mesh });
   }
 
   private updateBolts(dt: number) {
@@ -493,9 +540,9 @@ export class EnemyDirector {
         const chest = g.playerPos.clone().addScaledVector(g.playerPos.clone().sub(b.pos).normalize(), 1.1);
         if (seg(chest, 0.75)) {
           hit = true;
-          g.suit -= SENTINEL_BOLT;
+          g.suit -= SENTINEL_BOLT * g.surv!.mods().taken;
           this.hurt = 1;
-          this.lastHit = 'sentinel';
+          this.lastHit = this.guardian && !this.guardian.dead ? 'guardian' : 'sentinel';
           this.sfx.play('hurt');
         }
       }
@@ -505,9 +552,14 @@ export class EnemyDirector {
           const c = s.body.pos.clone().add(s.pos).addScaledVector(s.pos.clone().normalize(), 1);
           if (seg(c, 0.9)) {
             hit = true;
-            s.hp -= PLAYER_BOLT;
+            s.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
             this.sfx.play('hit', c.clone().sub(g.camWorld));
-            if (s.hp <= 0) { s.state = 'dying'; s.t = 0; this.sfx.play('shriek', c.clone().sub(g.camWorld)); }
+            if (s.hp <= 0) {
+              s.state = 'dying'; s.t = 0;
+              this.sfx.play('shriek', c.clone().sub(g.camWorld));
+              // what is left of it hardens into a dark crystal
+              if (g.surv!.addCargo('crystal', 1)) g.note('+1 cristal oscuro: lo que queda de la criatura');
+            }
             else { s.state = 'retreat'; s.t = 0; }
             break;
           }
@@ -518,12 +570,13 @@ export class EnemyDirector {
           const c1 = s.body.pos.clone().add(s.pos).addScaledVector(up, 6.2 * SENT_SCALE);
           if (seg(c1, 1.4 * SENT_SCALE)) {
             hit = true;
-            s.hp -= PLAYER_BOLT;
+            s.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
             s.alert = 1;
             this.sfx.play('clank', c1.clone().sub(g.camWorld));
             if (s.hp <= 0) this.destroySentinel(s);
           }
         }
+        if (!hit) hit = this.hitGuardian(seg);
       }
       if (hit) {
         this.g.scene.remove(bo.mesh);
@@ -581,6 +634,228 @@ export class EnemyDirector {
       b.mesh.quaternion.setFromUnitVectors(Z_AXIS, b.vel.clone().normalize());
     }
     for (const p of this.puffs) p.mesh.position.copy(p.pos).sub(cw);
+    // orbit fight: the ship sits at -camOff from the camera
+    const ship = this.g.camOff.clone().negate();
+    if (this.g.mode !== 'ship') ship.copy(this.g.shipPos).sub(cw);
+    for (const h of this.hunters) {
+      h.mesh.position.copy(ship).add(h.rel);
+      const look = h.vel.lengthSq() > 1 ? h.vel.clone().normalize() : h.rel.clone().negate().normalize();
+      h.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), look);
+    }
+    for (const b of this.relBolts) {
+      b.mesh.position.copy(ship).add(b.rel);
+      b.mesh.quaternion.setFromUnitVectors(Z_AXIS, b.vel.clone().normalize());
+    }
+    if (this.guardian) {
+      const s = this.g.alien.site('spire')!;
+      const [gx, gz] = SITE_POINTS.spire.guardian;
+      this.guardian.mesh.root.position.copy(this.g.alien.point(s, gx, gz)).sub(cw);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Orbit: the hunters of Proxima b and TRAPPIST-1 e
+  private updateHunters(dt: number) {
+    const g = this.g, b = g.nearest;
+    const flying = g.mode === 'ship' && !g.warp && !g.landed && !g.dead;
+    const zone = flying && (b.def.id === 'proxima-b' || b.def.id === 'trappist-1e') && g.altitude < HUNTER_ALT && !this.guardianDown;
+    // the ship's cannons
+    this.cannonT -= dt;
+    if (flying && g.keys.has('Mouse0') && this.cannonT <= 0) {
+      this.cannonT = CANNON_RATE;
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(g.shipQ);
+      for (const side of [-1, 1]) {
+        const rel = new THREE.Vector3(side * 5.2, -0.3, -3).applyQuaternion(g.shipQ);
+        const mesh = new THREE.Mesh(G.bolt, this.boltMats.player);
+        mesh.scale.set(2, 2, 14);
+        g.scene.add(mesh);
+        this.relBolts.push({ rel, vel: fwd.clone().multiplyScalar(CANNON_SPEED), enemy: false, ttl: 2, mesh });
+      }
+      this.sfx.play('shot');
+    }
+    this.hunterT -= dt;
+    if (zone && this.hunters.length < MAX_HUNTERS && this.hunterT <= 0) {
+      this.hunterT = 4 + Math.random() * 3;
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+      const mesh = buildHunter();
+      g.scene.add(mesh);
+      this.hunters.push({ rel: d.multiplyScalar(1600), vel: new THREE.Vector3(), hp: HUNTER_HP, fireT: 2 + Math.random() * 2, orbit: Math.random() * 6, mesh, dying: 0 });
+      if (this.hunters.length === 1) g.note('⚠ Contactos no identificados acercándose a la nave. Clic: cañones');
+    }
+    for (const h of [...this.hunters]) {
+      const remove = () => { g.scene.remove(h.mesh); this.hunters.splice(this.hunters.indexOf(h), 1); };
+      if (h.dying > 0) {
+        h.dying += dt;
+        h.mesh.scale.setScalar(1.8 * Math.max(0.05, 1 - h.dying / 0.8));
+        if (h.dying > 0.8) remove();
+        continue;
+      }
+      if (!zone) { h.rel.multiplyScalar(1 + dt * 1.5); if (h.rel.length() > 5000) remove(); continue; }
+      // circle the ship at ~350 m, weaving
+      h.orbit += dt * 0.35;
+      const want = new THREE.Vector3(Math.cos(h.orbit), Math.sin(h.orbit * 0.7) * 0.5, Math.sin(h.orbit)).normalize().multiplyScalar(350);
+      const steer = want.sub(h.rel).multiplyScalar(1.2);
+      if (steer.length() > 140) steer.setLength(140);
+      h.vel.lerp(steer, 1 - Math.exp(-dt * 2));
+      h.rel.addScaledVector(h.vel, dt);
+      h.fireT -= dt;
+      if (h.fireT <= 0 && h.rel.length() < 900) {
+        h.fireT = HUNTER_RATE * (0.8 + Math.random() * 0.4);
+        const spread = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.06);
+        const mesh = new THREE.Mesh(G.bolt, this.boltMats.enemy);
+        mesh.scale.set(3, 3, 8);
+        g.scene.add(mesh);
+        this.relBolts.push({ rel: h.rel.clone(), vel: h.rel.clone().negate().normalize().add(spread).normalize().multiplyScalar(260), enemy: true, ttl: 5, mesh });
+        this.sfx.play('bolt', h.rel.clone().sub(g.camOff));
+      }
+    }
+    for (const bo of [...this.relBolts]) {
+      const prev = bo.rel.clone();
+      bo.rel.addScaledVector(bo.vel, dt);
+      bo.ttl -= dt;
+      let hit = bo.ttl <= 0 || g.mode !== 'ship';
+      const ab = bo.rel.clone().sub(prev);
+      const near = (c: THREE.Vector3, r: number) => {
+        const t = clamp(c.clone().sub(prev).dot(ab) / Math.max(ab.lengthSq(), 1e-9), 0, 1);
+        return prev.clone().addScaledVector(ab, t).distanceTo(c) < r;
+      };
+      if (!hit && bo.enemy && near(new THREE.Vector3(), 8)) {
+        hit = true;
+        g.hull -= HUNTER_BOLT * g.surv!.mods().taken;
+        this.hurt = 0.7;
+        this.lastHit = 'hunter';
+        this.sfx.play('hurt');
+      }
+      if (!hit && !bo.enemy) {
+        for (const h of this.hunters) {
+          if (h.dying || !near(h.rel, 7)) continue;
+          hit = true;
+          h.hp -= CANNON;
+          this.sfx.play('clank', h.rel.clone().sub(g.camOff));
+          if (h.hp <= 0) {
+            h.dying = 0.001;
+            this.sfx.play('down', h.rel.clone().sub(g.camOff));
+            g.surv!.stored.crystal += 2;
+            g.note('Cazador destruido: +2 cristales oscuros a la bodega');
+          }
+          break;
+        }
+      }
+      if (hit) { g.scene.remove(bo.mesh); this.relBolts.splice(this.relBolts.indexOf(bo), 1); }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The Guardian of the Spire (TRAPPIST-1 e)
+  private updateGuardian(dt: number, onFoot: boolean, pRel: THREE.Vector3) {
+    const g = this.g;
+    const s = g.alien.site('spire')!;
+    const b = g.alien.body(s);
+    const here = g.nearest === b && b.star === g.sunBody && !!b.terrain;
+    const [gx, gz] = SITE_POINTS.spire.guardian;
+    const gpos = here ? g.alien.point(s, gx, gz).sub(b.pos) : null;
+    const dist = gpos ? gpos.distanceTo(pRel) : Infinity;
+    if (!this.guardian && here && dist < 3000) {
+      const mesh = buildSentinel();
+      mesh.root.scale.setScalar(GUARDIAN_SCALE);
+      mesh.eye.color.setRGB(0.5, 0.2, 0.9);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(1.6, 0.12, 8, 32), new THREE.MeshBasicMaterial({ color: new THREE.Color(0.35, 0.15, 0.6) }));
+      ring.rotation.x = Math.PI / 2;
+      mesh.head.add(ring);
+      g.scene.add(mesh.root);
+      const dead = this.guardianDown;
+      this.guardian = {
+        hp: dead ? 0 : GUARDIAN_HP, mesh, fireT: 3, dead: dead ? 99 : 0, shieldNote: false,
+        pylons: [0, 1, 2].map((i) => (this.destroyed.has(`pylon-${i}`) || dead ? 0 : PYLON_HP)),
+      };
+    } else if (this.guardian && (!here || dist > 4000)) {
+      g.scene.remove(this.guardian.mesh.root);
+      this.guardian = null;
+      return;
+    }
+    const gd = this.guardian;
+    if (!gd || !gpos) return;
+    gd.pylons.forEach((hp, i) => { if (hp <= 0) g.alien.pylonCores[i].color.setRGB(0.04, 0.02, 0.06); });
+    const m = gd.mesh;
+    const up = gpos.clone().normalize();
+    standing(up, new THREE.Vector3(0, 0, 1), m.root.quaternion);
+    if (gd.dead > 0) {
+      gd.dead += dt;
+      const f = clamp(gd.dead / 3, 0, 1);
+      m.body.rotation.set(f * 1.1, 0, f * 0.25);
+      m.body.position.y = 5.4 - f * 4;
+      m.eye.color.setRGB(0.03, 0.01, 0.04);
+      return;
+    }
+    const engaged = onFoot && dist < GUARDIAN_RANGE;
+    // the head follows the player; the eye glows steadily brighter as it wakes
+    const head = gpos.clone().addScaledVector(up, 7.1 * GUARDIAN_SCALE);
+    const toP = pRel.clone().addScaledVector(pRel.clone().normalize(), 1.2).sub(head);
+    const local = toP.clone().applyQuaternion(m.root.quaternion.clone().invert());
+    m.head.rotation.y = engaged ? Math.atan2(local.x, local.z) : m.head.rotation.y + dt * 0.2;
+    const k = engaged ? 1 : 0.4, c = g.lightsMode === 'comfort' ? 0.7 : 1;
+    m.eye.color.setRGB(0.5 * k * c, 0.2 * k * c, 0.9 * k * c);
+    gd.fireT -= dt;
+    const shield = gd.pylons.some((hp) => hp > 0);
+    if (engaged && gd.fireT <= 0) {
+      gd.fireT = shield ? 2.6 : 1.8;
+      for (let i = 0; i < 3; i++) {
+        const spread = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.06 * toP.length());
+        this.addBolt(head.clone().add(b.pos), toP.clone().add(spread).normalize().multiplyScalar(34), true);
+      }
+      this.sfx.play('bolt', head.clone().add(b.pos).sub(g.camWorld));
+    }
+  }
+
+  /** a player bolt against the Guardian and its pylons (seg = the bolt's path test) */
+  private hitGuardian(seg: (c: THREE.Vector3, r: number) => boolean) {
+    const gd = this.guardian, g = this.g;
+    if (!gd || gd.dead) return false;
+    const s = g.alien.site('spire')!;
+    for (let i = 0; i < 3; i++) {
+      if (gd.pylons[i] <= 0) continue;
+      const [px, pz] = SITE_POINTS.spire.pylons[i];
+      const c = g.alien.point(s, px, pz, 16.5);
+      if (!seg(c, 2.6)) continue;
+      gd.pylons[i] -= PLAYER_BOLT * g.surv!.mods().dealt;
+      this.sfx.play('clank', c.clone().sub(g.camWorld));
+      if (gd.pylons[i] <= 0) {
+        this.destroyed.add(`pylon-${i}`);
+        this.sfx.play('down', c.clone().sub(g.camWorld));
+        const left = gd.pylons.filter((hp) => hp > 0).length;
+        g.note(left ? `Pilón destruido. Quedan ${left}` : 'El escudo del Guardián ha caído. ¡Ahora!');
+        g.surv!.save();
+      }
+      return true;
+    }
+    const [gx, gz] = SITE_POINTS.spire.guardian;
+    const up = g.alien.point(s, gx, gz).sub(g.alien.body(s).pos).normalize();
+    const core = g.alien.point(s, gx, gz).addScaledVector(up, 6.2 * GUARDIAN_SCALE);
+    if (!seg(core, 1.5 * GUARDIAN_SCALE)) return false;
+    if (gd.pylons.some((hp) => hp > 0)) {
+      this.sfx.play('clank', core.clone().sub(g.camWorld));
+      if (!gd.shieldNote) { gd.shieldNote = true; g.note('Un escudo protege al Guardián: destruye primero los tres pilones'); }
+      return true;
+    }
+    gd.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
+    this.sfx.play('hit', core.clone().sub(g.camWorld));
+    if (gd.hp <= 0) {
+      gd.dead = 0.001;
+      this.destroyed.add('guardian');
+      this.sfx.play('down', core.clone().sub(g.camWorld));
+      this.onGuardianDown?.();
+    }
+    return true;
+  }
+
+  /** the boss bar: only while the Guardian is close */
+  boss() {
+    const gd = this.guardian;
+    if (!gd || gd.dead) return null;
+    const g = this.g, s = g.alien.site('spire')!;
+    const [gx, gz] = SITE_POINTS.spire.guardian;
+    if (g.alien.point(s, gx, gz).distanceTo(g.mode === 'ship' ? g.shipPos : g.playerPos) > GUARDIAN_RANGE * 1.4) return null;
+    return { hp: Math.max(0, gd.hp) / GUARDIAN_HP, pylons: gd.pylons.filter((hp) => hp > 0).length };
   }
 
   /** how threatening things are now (0..1), for the music of fear */
@@ -590,6 +865,8 @@ export class EnemyDirector {
     const pRel = g.playerPos.clone().sub(g.nearest.pos);
     for (const s of this.stalkers) if (s.state !== 'dying') t = Math.max(t, clamp(1 - s.pos.distanceTo(pRel) / 70, 0, 1));
     for (const s of this.sentinels.values()) if (!s.dead) t = Math.max(t, s.alert * 0.8);
+    if (this.hunters.length) t = Math.max(t, 0.7);
+    if (this.boss()) t = 1;
     return t;
   }
 
@@ -599,6 +876,10 @@ export class EnemyDirector {
     this.stalkers = [];
     for (const b of this.bolts) this.g.scene.remove(b.mesh);
     this.bolts = [];
+    for (const h of this.hunters) this.g.scene.remove(h.mesh);
+    this.hunters = [];
+    for (const b of this.relBolts) this.g.scene.remove(b.mesh);
+    this.relBolts = [];
     this.hurt = 0;
   }
 
@@ -606,5 +887,7 @@ export class EnemyDirector {
     this.clear();
     for (const s of this.sentinels.values()) this.g.scene.remove(s.mesh.root);
     this.sentinels.clear();
+    if (this.guardian) this.g.scene.remove(this.guardian.mesh.root);
+    this.guardian = null;
   }
 }
