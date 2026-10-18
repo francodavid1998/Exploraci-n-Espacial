@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Game, type LightsMode } from './game/Game';
+import { Game, IS_TOUCH, type LightsMode } from './game/Game';
 import Hud, { SystemMap } from './components/Hud';
+import TouchControls from './components/TouchControls';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -18,6 +19,7 @@ export default function App() {
       try {
         g = new Game(containerRef.current!, markerRef.current!);
         g.onMenuToggle = (o) => setMenu(o);
+        g.touchMode = IS_TOUCH;
         g.onLightsModeChange = (m) => setLights(m); // L on the title screen must update its button
         if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) (window as unknown as { __game?: Game }).__game = g; // debug hook (dev only)
         setLights(g.lightsMode);
@@ -43,7 +45,14 @@ export default function App() {
       game.started = true;
       game.menuOpen = false;
       game.requestLock();
-      game.note('Órbita terrestre. Destino: la Luna. Pulsa J para saltar.');
+      game.note(IS_TOUCH ? 'Órbita terrestre. Destino: la Luna. Pulsa SALTO para saltar.' : 'Órbita terrestre. Destino: la Luna. Pulsa J para saltar.');
+      if (IS_TOUCH) {
+        // phones: full screen, landscape (both may be refused; the game works anyway)
+        document.documentElement.requestFullscreen?.().then(
+          () => (screen.orientation as ScreenOrientation & { lock?: (o: string) => Promise<void> }).lock?.('landscape').catch(() => {}),
+          () => {},
+        );
+      }
     }
   };
 
@@ -52,7 +61,8 @@ export default function App() {
       <div ref={containerRef} className="absolute inset-0" />
       <div ref={markerRef} className={`pointer-events-none absolute inset-0 overflow-hidden ${started ? '' : 'hidden'}`} />
 
-      {game && started && <Hud game={game} onOpenMap={() => game.toggleMenu(true)} />}
+      {game && started && !menu && IS_TOUCH && <TouchControls game={game} />}
+      {game && started && <Hud game={game} touch={IS_TOUCH} onOpenMap={() => game.toggleMenu(true)} />}
       {game && started && menu && <SystemMap game={game} onClose={() => { game.toggleMenu(false); }} />}
 
       {!started && (
@@ -82,12 +92,12 @@ export default function App() {
               >
                 {lights === 'comfort' ? 'cómodas' : 'brillantes'}
               </button>
-              <span className="ml-2 text-white/40">(cambiar con L durante el juego)</span>
+              {!IS_TOUCH && <span className="ml-2 text-white/40">(cambiar con L durante el juego)</span>}
             </div>
             <div className="mt-8 grid grid-cols-3 gap-4 text-[11px] text-white/50">
-              <div><b className="block text-white/80">Ratón + WASD</b>pilotar / caminar</div>
-              <div><b className="block text-white/80">J</b>salto a velocidad luz</div>
-              <div><b className="block text-white/80">E</b>aterrizar y bajar</div>
+              <div><b className="block text-white/80">{IS_TOUCH ? 'Mando + arrastrar' : 'Ratón + WASD'}</b>pilotar / caminar</div>
+              <div><b className="block text-white/80">{IS_TOUCH ? 'SALTO' : 'J'}</b>salto a velocidad luz</div>
+              <div><b className="block text-white/80">{IS_TOUCH ? 'ATERRIZAR' : 'E'}</b>aterrizar y bajar</div>
             </div>
             {error && <div className="mt-6 text-sm text-red-300">{error}</div>}
           </div>

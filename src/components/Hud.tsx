@@ -42,7 +42,7 @@ function fmtPressure(p: number) {
   return `${p.toFixed(p < 10 ? 2 : 0)} bar`;
 }
 
-export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => void }) {
+export default function Hud({ game, onOpenMap, touch = false }: { game: Game; onOpenMap: () => void; touch?: boolean }) {
   const [s, setS] = useState<HudState | null>(null);
   const [help, setHelp] = useState(true);
   useEffect(() => {
@@ -56,6 +56,10 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
   const altLabel = isGas ? (s.altitude < 0 ? 'Profundidad' : 'Sobre nubes') : 'Altitud';
   const altVal = isGas && s.altitude < 0 ? formatDist(-s.altitude) : formatDist(s.altitude);
   const c = s.speed / C_LIGHT;
+  // phones: smaller panels, room for the touch controls, no keyboard help
+  const small = touch ? ' origin-top-left scale-[0.7]' : '';
+  const smallR = touch ? ' origin-top-right scale-[0.7]' : '';
+  const smallB = touch ? ' origin-bottom scale-[0.7]' : '';
 
   return (
     <div className="pointer-events-none absolute inset-0 select-none font-mono text-white">
@@ -65,41 +69,49 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
       </div>
 
       {/* location panel */}
-      <div className="absolute left-5 top-5 w-72 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md">
+      <div className={`absolute left-5 top-5 w-72 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md${small}`}>
         <div className="text-[10px] tracking-[0.3em] text-cyan-300/80">{s.bodyKind.toUpperCase()}</div>
         <div className="mb-2 text-2xl font-light tracking-wider">{s.bodyName}</div>
         <Row k={altLabel} v={altVal} accent={isGas && s.altitude < 0} />
-        <Row k="Gravedad" v={`${s.gravity} m/s² · ${(s.gravity / 9.81).toFixed(2)} g`} />
-        <Row k="Presión" v={fmtPressure(s.pressure)} accent={s.pressure > 20} />
-        <Row k="Temperatura" v={(isGas && s.altitude < 0) || s.bodyKind === 'Estrella' ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
-        <Row k="Luz solar" v={`${(s.sunlight * 100).toFixed(s.sunlight < 0.1 ? 2 : 0)}% de la Tierra`} />
-        <div className="mt-2 border-t border-white/10 pt-2 text-[11px] leading-relaxed text-white/60">{s.composition}</div>
+        {!touch && (
+          <>
+            <Row k="Gravedad" v={`${s.gravity} m/s² · ${(s.gravity / 9.81).toFixed(2)} g`} />
+            <Row k="Presión" v={fmtPressure(s.pressure)} accent={s.pressure > 20} />
+            <Row k="Temperatura" v={(isGas && s.altitude < 0) || s.bodyKind === 'Estrella' ? `${s.tempValue.toFixed(0)} °C` : s.temperature} />
+            <Row k="Luz solar" v={`${(s.sunlight * 100).toFixed(s.sunlight < 0.1 ? 2 : 0)}% de la Tierra`} />
+            <div className="mt-2 border-t border-white/10 pt-2 text-[11px] leading-relaxed text-white/60">{s.composition}</div>
+          </>
+        )}
       </div>
 
       {/* target panel */}
-      <div className="absolute right-5 top-5 w-64 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md">
+      <div className={`absolute right-5 top-5 w-64 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md${smallR}`}>
         <div className="text-[10px] tracking-[0.3em] text-amber-300/80">DESTINO</div>
         {s.targetName ? (
           <>
             <div className="mb-2 text-xl font-light tracking-wider">{s.targetName}</div>
             <Row k="Distancia" v={formatDist(s.targetDist)} />
-            <Row k="Luz tarda" v={fmtTime(s.targetDist / C_LIGHT)} />
-            <Row k="Salto (pulso)" v={`≈ ${fmtTime(s.eta)}`} accent />
+            {!touch && <Row k="Luz tarda" v={fmtTime(s.targetDist / C_LIGHT)} />}
+            {!touch && <Row k="Salto (pulso)" v={`≈ ${fmtTime(s.eta)}`} accent />}
           </>
         ) : (
           <div className="py-2 text-sm text-white/50">Sin destino</div>
         )}
-        <div className="mt-3 flex gap-2 text-[10px] text-white/50">
-          <span className="rounded border border-white/20 px-1.5">T</span> siguiente
-          <span className="ml-2 rounded border border-white/20 px-1.5">M</span> mapa
-        </div>
+        {!touch && (
+          <div className="mt-3 flex gap-2 text-[10px] text-white/50">
+            <span className="rounded border border-white/20 px-1.5">T</span> siguiente
+            <span className="ml-2 rounded border border-white/20 px-1.5">M</span> mapa
+          </div>
+        )}
         <div className="mt-2 text-[10px] text-white/50">
           <span className="rounded border border-white/20 px-1.5">K</span> piloto automático:{' '}
           <span className={s.autopilot ? 'text-amber-200' : 'text-white/40'}>{s.autopilot ? 'ON' : 'OFF · salto libre'}</span>
         </div>
-        <button onClick={onOpenMap} className="pointer-events-auto mt-3 w-full rounded-md border border-amber-300/30 bg-amber-300/10 py-1.5 text-[11px] tracking-[0.2em] text-amber-200 hover:bg-amber-300/20">
-          MAPA DEL SISTEMA
-        </button>
+        {!touch && (
+          <button onClick={onOpenMap} className="pointer-events-auto mt-3 w-full rounded-md border border-amber-300/30 bg-amber-300/10 py-1.5 text-[11px] tracking-[0.2em] text-amber-200 hover:bg-amber-300/20">
+            MAPA DEL SISTEMA
+          </button>
+        )}
       </div>
 
       {/* warnings */}
@@ -121,13 +133,13 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
 
       {/* hint */}
       {s.hint && (
-        <div className="absolute bottom-40 left-1/2 -translate-x-1/2 rounded-lg border border-white/15 bg-black/40 px-4 py-2 text-sm tracking-wider text-white/90 backdrop-blur">
+        <div className={`absolute ${touch ? 'top-24 text-xs' : 'bottom-40 text-sm'} left-1/2 -translate-x-1/2 rounded-lg border border-white/15 bg-black/40 px-4 py-2 tracking-wider text-white/90 backdrop-blur`}>
           {s.hint}
         </div>
       )}
 
       {/* bottom center flight data */}
-      <div className="absolute bottom-6 left-1/2 flex -translate-x-1/2 items-end gap-8 rounded-2xl border border-white/10 bg-black/35 px-7 py-4 backdrop-blur-md">
+      <div className={`absolute bottom-6 left-1/2 flex -translate-x-1/2 items-end gap-8 rounded-2xl border border-white/10 bg-black/35 px-7 py-4 backdrop-blur-md${smallB}`}>
         <div className="text-center">
           <div className="text-[10px] tracking-[0.3em] text-white/50">VELOCIDAD</div>
           <div className="min-w-[150px] text-3xl font-extralight tracking-wider">{formatSpeed(s.speed)}</div>
@@ -155,14 +167,14 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
       </div>
 
       {/* notifications */}
-      <div className="absolute bottom-6 left-5 w-96 space-y-1.5">
+      <div className={touch ? 'absolute bottom-[164px] left-5 w-64 space-y-1' : 'absolute bottom-6 left-5 w-96 space-y-1.5'}>
         {s.notes.map((n) => (
-          <div key={n.id} className="rounded-md border-l-2 border-cyan-300/70 bg-black/45 px-3 py-1.5 text-[12px] text-white/90 backdrop-blur">{n.text}</div>
+          <div key={n.id} className={`rounded-md border-l-2 border-cyan-300/70 bg-black/45 px-3 ${touch ? 'py-1 text-[10px]' : 'py-1.5 text-[12px]'} text-white/90 backdrop-blur`}>{n.text}</div>
         ))}
       </div>
 
-      {/* help */}
-      <div className="absolute bottom-6 right-5 w-64 rounded-xl border border-white/10 bg-black/35 p-3 text-[11px] text-white/70 backdrop-blur-md">
+      {/* help (keyboard: not on touch screens) */}
+      {!touch && <div className="absolute bottom-6 right-5 w-64 rounded-xl border border-white/10 bg-black/35 p-3 text-[11px] text-white/70 backdrop-blur-md">
         <div className="mb-1 flex justify-between text-[10px] tracking-[0.25em] text-white/50"><span>CONTROLES</span><span>H</span></div>
         {help && (s.mode === 'ship' ? (
           <div className="space-y-0.5">
@@ -188,9 +200,9 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
           </div>
         ))}
-      </div>
+      </div>}
 
-      {!s.locked && !s.dead && (
+      {!s.locked && !s.dead && !touch && (
         <div className="absolute left-1/2 top-1/2 mt-10 -translate-x-1/2 rounded-full border border-white/20 bg-black/50 px-5 py-2 text-xs tracking-[0.25em] text-white/80 backdrop-blur">
           HAZ CLIC PARA TOMAR EL CONTROL
         </div>

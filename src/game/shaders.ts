@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import type { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import type { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import type { StarDef } from './bodies';
+import { mulberry32 } from './noise';
+import { STAR_COUNT, STAR_DATA } from './starCatalog';
 
 export const NOISE_GLSL = /* glsl */ `
 vec3 mod289(vec3 x){return x - floor(x*(1.0/289.0))*289.0;}
@@ -85,6 +87,26 @@ void main(){
 `;
 
 // ---------------------------------------------------------------------------
+/** optical-depth table size (sun angle x altitude) */
+const LUT_W = 128, LUT_H = 64;
+/**
+ * Sunlight reaching a point at radius lr (planet radii) with the Sun at cos(zenith) =
+ * musun: transmittance through the air above it, 0 once the planet hides the Sun. The
+ * table only covers rays above the local horizon (with more resolution near it), so the
+ * twilight glow lasts until the Sun really sets there. Needs uRa, uBetaR, uBetaM, uBetaO, uLut.
+ */
+const SUN_TRANSMITTANCE_GLSL = /* glsl */ `
+vec3 sunTransmittance(float lr, float musun){
+  float muHor = -sqrt(max(1.0 - 1.0 / (lr * lr), 0.0));
+  vec2 xy = vec2(sqrt(clamp((musun - muHor) / (1.0 - muHor), 0.0, 1.0)), clamp((lr - 1.0) / (uRa - 1.0), 0.0, 1.0));
+  vec2 uv = (xy * vec2(${LUT_W - 1}.0, ${LUT_H - 1}.0) + 0.5) / vec2(${LUT_W}.0, ${LUT_H}.0); // texel centres
+  vec2 odl = textureLod(uLut, uv, 0.0).rg;
+  vec3 tau = (uBetaR + uBetaO) * odl.x + uBetaM * 1.1 * odl.y;
+  // the Sun sinks behind the planet over its own apparent diameter (0.53 deg)
+  return exp(-tau) * smoothstep(muHor - 0.0047, muHor + 0.0047, musun);
+}
+`;
+
 export function makeAtmosphereMaterial() {
   return new THREE.ShaderMaterial({
     uniforms: {
@@ -99,20 +121,23 @@ export function makeAtmosphereMaterial() {
       uSun: { value: 20 },
       uMieTint: { value: new THREE.Vector3(1, 1, 1) },
       uFade: { value: 1 },
-      // optical depth towards the Sun, precomputed per body: x = altitude (0 = ground, 1 = top), y = cos(sun zenith angle)
+      /** ozone absorption (planet radii⁻¹, Rayleigh density profile): no scattering, it only takes red and green out of long twilight paths, which makes the "blue hour" */
+      uBetaO: { value: new THREE.Vector3() },
+      // optical depth towards the Sun, precomputed per body (see makeOpticalDepthLut)
       uLut: { value: null as THREE.Texture | null },
     },
     // View-ray sample count; raised by the graphics quality level (Game.applyQuality).
-    defines: { ATMO_NS: 16 },
+    defines: { ATMO_NS: 12 },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uCenter; uniform float uRa; uniform vec3 uSunDir; uniform vec3 uBetaR; uniform float uBetaM;
 uniform float uHR; uniform float uHM; uniform float uG; uniform float uSun; uniform vec3 uMieTint; uniform float uFade;
-uniform sampler2D uLut;
+uniform vec3 uBetaO; uniform sampler2D uLut;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
+${SUN_TRANSMITTANCE_GLSL}
 void main(){
   #include <logdepthbuf_fragment>
   vec3 rd = normalize(vWorld);
@@ -125,29 +150,26 @@ void main(){
   if (p.x < p.y && p.x > 0.0) t1 = min(t1, p.x);
   const int NS = ATMO_NS;
   float ds = (t1 - t0) / float(NS);
-  vec3 sumR = vec3(0.0), sumM = vec3(0.0);
-  float odR = 0.0, odM = 0.0;
+  vec3 L = vec3(0.0), Tv = vec3(1.0);
   float mu = dot(rd, uSunDir);
   float phR = 3.0 / (16.0 * PI) * (1.0 + mu*mu);
   float g = uG;
   float phM = 3.0 / (8.0 * PI) * ((1.0 - g*g) * (1.0 + mu*mu)) / ((2.0 + g*g) * pow(max(1.0 + g*g - 2.0*g*mu, 1e-4), 1.5));
+  // Energy-conserving integration: each segment's in-scattering is integrated exactly for
+  // its density, so long horizon paths (coarse steps) keep the right colour.
   for (int i = 0; i < NS; i++){
     vec3 pos = ro + rd * (t0 + ds * (float(i) + 0.5));
-    float h = max(length(pos) - 1.0, 0.0);
-    float hr = exp(-h / uHR) * ds;
-    float hm = exp(-h / uHM) * ds;
-    odR += hr; odM += hm;
-    // optical depth from this point to the Sun: one table lookup instead of a
-    // second ray march (the table encodes a planet-shadowed ray as opaque)
     float lr = length(pos);
-    float musun = dot(pos / lr, uSunDir);
-    vec2 odl = texture2D(uLut, vec2(musun * 0.5 + 0.5, clamp((lr - 1.0) / (uRa - 1.0), 0.0, 1.0))).rg;
-    vec3 tau = uBetaR * (odR + odl.x) + uBetaM * 1.1 * (odM + odl.y);
-    vec3 att = exp(-tau);
-    sumR += hr * att;
-    sumM += hm * att;
+    float h = max(lr - 1.0, 0.0);
+    float rR = exp(-h / uHR), rM = exp(-h / uHM);
+    vec3 ext = (uBetaR + uBetaO) * rR + uBetaM * 1.1 * rM;
+    // sunlight reaching this point: one table lookup instead of a second ray march
+    vec3 S = (uBetaR * (rR * phR) + uBetaM * (rM * phM) * uMieTint) * sunTransmittance(lr, dot(pos / lr, uSunDir));
+    vec3 segT = exp(-ext * ds);
+    L += S * Tv * mix((1.0 - segT) / max(ext, vec3(1e-20)), vec3(ds), step(ext * ds, vec3(1e-4)));
+    Tv *= segT;
   }
-  vec3 col = uSun * (sumR * uBetaR * phR + sumM * uBetaM * phM * uMieTint);
+  vec3 col = uSun * L;
   gl_FragColor = vec4(col * uFade, 0.0); // alpha 0: the atmosphere shell is part of the planet for the bloom mask
 }
 `,
@@ -161,37 +183,36 @@ void main(){
 
 /**
  * Optical depth table for an atmosphere: for a point at normalized altitude h
- * (0 = ground, 1 = top) and a Sun at cos(zenith) = mu, the Rayleigh and Mie
- * optical depths along the ray to the top of the atmosphere. Rays that hit the
- * planet are stored as opaque. All quantities in planet radii.
+ * (0 = ground, 1 = top) and a Sun above its horizon, the Rayleigh and Mie optical
+ * depths along the ray to the top of the atmosphere. Columns run from the local
+ * horizon (x = 0) to the zenith (x = 1) with x² spacing, so grazing sunset rays get
+ * most of the resolution; the shader handles the Sun below the horizon itself.
+ * (A first version stored hidden rays as an "opaque" 1e4 over the full angle range:
+ * filtering blended that into the last lit column and the sky went dark ~0.5° early.)
+ * All quantities in planet radii.
  */
 export function makeOpticalDepthLut(ra: number, hr: number, hm: number): THREE.DataTexture {
-  const W = 128, H = 64, NS = 40;
+  const W = LUT_W, H = LUT_H, NS = 48;
   const data = new Uint16Array(W * H * 4);
   const h2f = (v: number) => THREE.DataUtils.toHalfFloat(Math.min(v, 60000));
   for (let j = 0; j < H; j++) {
     const r = 1 + (ra - 1) * (j / (H - 1)) + 1e-6;
+    const muHor = -Math.sqrt(Math.max(0, 1 - 1 / (r * r)));
     for (let i = 0; i < W; i++) {
-      const mu = (i / (W - 1)) * 2 - 1;
-      // ray from (0, r, 0) towards direction with cos(zenith) = mu
+      const x = i / (W - 1);
+      const mu = muHor + (1 - muHor) * x * x;
+      // ray from (0, r, 0) towards direction with cos(zenith) = mu, to the top sphere
       const dx = Math.sqrt(Math.max(0, 1 - mu * mu)), dy = mu;
-      // intersection with the top sphere (always exits) and with the ground
       const b = r * dy;
       const tTop = -b + Math.sqrt(Math.max(0, b * b - (r * r - ra * ra)));
-      const dg = b * b - (r * r - 1);
-      let odR: number, odM: number;
-      if (dg > 0 && -b - Math.sqrt(dg) > 0) {
-        odR = odM = 1e4; // in the planet's shadow
-      } else {
-        odR = 0; odM = 0;
-        const ds = tTop / NS;
-        for (let k = 0; k < NS; k++) {
-          const t = ds * (k + 0.5);
-          const px = dx * t, py = r + dy * t;
-          const hgt = Math.max(Math.hypot(px, py) - 1, 0);
-          odR += Math.exp(-hgt / hr) * ds;
-          odM += Math.exp(-hgt / hm) * ds;
-        }
+      let odR = 0, odM = 0;
+      const ds = tTop / NS;
+      for (let k = 0; k < NS; k++) {
+        const t = ds * (k + 0.5);
+        const px = dx * t, py = r + dy * t;
+        const hgt = Math.max(Math.hypot(px, py) - 1, 0);
+        odR += Math.exp(-hgt / hr) * ds;
+        odM += Math.exp(-hgt / hm) * ds;
       }
       const o = (j * W + i) * 4;
       data[o] = h2f(odR); data[o + 1] = h2f(odM); data[o + 2] = 0; data[o + 3] = h2f(1);
@@ -206,44 +227,22 @@ export function makeOpticalDepthLut(ra: number, hr: number, hm: number): THREE.D
 }
 
 // ---------------------------------------------------------------------------
-export function makeGasMaterial(type: number) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uCenter: { value: new THREE.Vector3() },
-      uInvRot: { value: new THREE.Matrix3() },
-      uSunDir: { value: new THREE.Vector3(1, 0, 0) },
-      uSunI: { value: 1 },
-      uTime: { value: 0 },
-      uType: { value: type },
-      uRingIn: { value: 0 },
-      uRingOut: { value: 0 },
-    },
-    vertexShader: SHELL_VERT,
-    fragmentShader: /* glsl */ `
-#include <common>
-#include <logdepthbuf_pars_fragment>
-uniform vec3 uCenter; uniform mat3 uInvRot; uniform vec3 uSunDir; uniform float uSunI; uniform float uTime; uniform float uType;
-uniform float uRingIn; uniform float uRingOut;
-varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
-${NOISE_GLSL}
-float ringDensity(float r){
-  float d = 0.0;
-  d += smoothstep(1.24,1.25,r)*(1.0-smoothstep(1.52,1.527,r))*0.18;
-  d += smoothstep(1.525,1.53,r)*(1.0-smoothstep(1.945,1.951,r))*0.95;
-  d += smoothstep(2.025,2.03,r)*(1.0-smoothstep(2.265,2.27,r))*0.6;
-  return d;
-}
+/**
+ * Gas giant cloud patterns (type 0 Jupiter, 1 Saturn, 2 Uranus, 3 Neptune) for a unit
+ * direction in the planet's own frame. Static: the planet turns as a whole (uInvRot),
+ * so the pattern can be painted into a cubemap (GasBaker) and read back cheaply.
+ */
+const GAS_PATTERN_GLSL = /* glsl */ `
 vec3 jupiter(vec3 n, float lat, float lon){
-  float sh = uTime*0.0015*sin(lat*13.0);
-  vec3 p = vec3(cos(lat)*cos(lon+sh), n.y, cos(lat)*sin(lon+sh));
+  vec3 p = vec3(cos(lat)*cos(lon), n.y, cos(lat)*sin(lon));
   vec3 w = vec3(snoise(p*2.5), snoise(p*2.5+7.1), snoise(p*2.5+13.7));
   float t = fbm(p*vec3(5.,20.,5.) + w*0.9, 6);
   float y = n.y + 0.03*t + 0.01*snoise(p*vec3(2.,40.,2.));
   float b = sin(y*36.0)*0.5+0.5;
   float b2 = sin(y*15.0+1.7)*0.5+0.5;
-  vec3 cream = vec3(0.93,0.87,0.76), tanc = vec3(0.8,0.6,0.42), brown = vec3(0.5,0.32,0.2), white = vec3(0.98,0.96,0.92);
+  vec3 cream = vec3(0.95,0.88,0.74), tanc = vec3(0.82,0.57,0.37), brown = vec3(0.48,0.29,0.17), white = vec3(0.98,0.96,0.92);
   vec3 col = mix(cream, tanc, smoothstep(0.2,0.8,b));
-  col = mix(col, brown, smoothstep(0.6,0.95,b2)*0.65);
+  col = mix(col, brown, smoothstep(0.6,0.95,b2)*0.8);
   col = mix(col, vec3(0.62,0.6,0.6), smoothstep(0.72,0.95,abs(n.y)));
   float f = fbm(p*vec3(16.,60.,16.)+w*2.5, 5);
   col *= 0.86 + 0.26*f;
@@ -255,7 +254,7 @@ vec3 jupiter(vec3 n, float lat, float lon){
   vec2 e = vec2(dl/0.2, (lat+0.39)/0.08);
   float r = length(e);
   if (r < 1.8){
-    float ang = atan(e.y, e.x) + (1.8-r)*2.5 + uTime*0.01;
+    float ang = atan(e.y, e.x) + (1.8-r)*2.5;
     vec2 q = vec2(cos(ang), sin(ang))*r;
     float sw = fbm(vec3(q*2.5, 1.0), 4)*0.5+0.5;
     vec3 red = mix(vec3(0.72,0.32,0.18), vec3(0.9,0.58,0.42), sw);
@@ -265,8 +264,7 @@ vec3 jupiter(vec3 n, float lat, float lon){
   return col;
 }
 vec3 saturn(vec3 n, float lat, float lon){
-  float sh = uTime*0.001*sin(lat*10.0);
-  vec3 p = vec3(cos(lat)*cos(lon+sh), n.y, cos(lat)*sin(lon+sh));
+  vec3 p = vec3(cos(lat)*cos(lon), n.y, cos(lat)*sin(lon));
   vec3 w = vec3(snoise(p*2.0), snoise(p*2.0+4.1), 0.0);
   float y = n.y + 0.012*fbm(p*vec3(4.,25.,4.)+w, 5);
   float b = sin(y*30.0)*0.5+0.5;
@@ -276,7 +274,7 @@ vec3 saturn(vec3 n, float lat, float lon){
   col *= 0.94 + 0.1*fbm(p*vec3(12.,60.,12.)+w*2.0, 4);
   // north polar hexagon
   if (n.y > 0.85){
-    float a = atan(n.z, n.x) + uTime*0.0005;
+    float a = atan(n.z, n.x);
     float sector = PI/3.0;
     float hexr = cos(sector*0.5)/cos(mod(a, sector) - sector*0.5);
     float rr = length(n.xz)/0.42;
@@ -293,8 +291,7 @@ vec3 uranus(vec3 n, float lat){
   return col;
 }
 vec3 neptune(vec3 n, float lat, float lon){
-  float sh = uTime*0.003*sin(lat*6.0);
-  vec3 p = vec3(cos(lat)*cos(lon+sh), n.y, cos(lat)*sin(lon+sh));
+  vec3 p = vec3(cos(lat)*cos(lon), n.y, cos(lat)*sin(lon));
   float y = n.y + 0.02*fbm(p*vec3(3.,18.,3.), 4);
   vec3 col = mix(vec3(0.22,0.4,0.92), vec3(0.16,0.3,0.78), sin(y*14.0)*0.5+0.5);
   float streak = smoothstep(0.45, 0.8, fbm(p*vec3(5.,60.,5.)+3.0, 4)) * smoothstep(0.25,0.0,abs(abs(n.y)-0.45));
@@ -305,6 +302,117 @@ vec3 neptune(vec3 n, float lat, float lon){
   col = mix(col, vec3(0.08,0.14,0.45), smoothstep(1.0, 0.6, r));
   col = mix(col, vec3(0.9,0.95,1.0), smoothstep(1.4,1.1,r)*smoothstep(0.9,1.1,r)*0.5*step(0.0,e.y));
   return col;
+}
+vec3 gasPattern(vec3 n, float type){
+  float lat = asin(clamp(n.y, -1.0, 1.0));
+  float lon = atan(n.z, n.x);
+  vec3 col;
+  if (type < 0.5) col = jupiter(n, lat, lon);
+  else if (type < 1.5) col = saturn(n, lat, lon);
+  else if (type < 2.5) col = uranus(n, lat);
+  else col = neptune(n, lat, lon);
+  return col;
+}
+`;
+
+/**
+ * Paints the nearest gas giant into a cubemap a strip per frame (no hitch), so from
+ * medium range its ~20 noise evaluations per pixel become one texture read. Up close,
+ * where a texel would be bigger than a pixel, the planet shader blends back to the live
+ * pattern.
+ */
+export class GasBaker {
+  rt: THREE.WebGLCubeRenderTarget;
+  /** what is painted (or being painted) now; null = nothing */
+  target: unknown = null;
+  ready = false;
+  private step = 0;
+  private scene = new THREE.Scene();
+  private cams: THREE.CubeCamera;
+  private mat: THREE.ShaderMaterial;
+  constructor(public size: number, private strips = 8) {
+    this.rt = new THREE.WebGLCubeRenderTarget(size, { type: THREE.UnsignedByteType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: { uType: { value: 0 } },
+      vertexShader: /* glsl */ `
+varying vec3 vObj;
+void main(){ vObj = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: /* glsl */ `
+#include <common>
+uniform float uType;
+varying vec3 vObj;
+${NOISE_GLSL}
+${GAS_PATTERN_GLSL}
+void main(){ gl_FragColor = vec4(gasPattern(normalize(vObj), uType), 1.0); }`,
+      side: THREE.BackSide,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.scene.add(new THREE.Mesh(new THREE.SphereGeometry(5, 32, 16), this.mat));
+    this.cams = new THREE.CubeCamera(0.1, 100, this.rt);
+    this.cams.updateMatrixWorld();
+  }
+  /** start painting another planet */
+  start(target: unknown, type: number) {
+    this.target = target;
+    this.mat.uniforms.uType.value = type;
+    this.step = 0;
+    this.ready = false;
+  }
+  /** paint the next strip; true once the whole cubemap is ready */
+  advance(renderer: THREE.WebGLRenderer) {
+    if (this.ready || this.target === null) return this.ready;
+    const cams = this.cams as THREE.CubeCamera & { updateCoordinateSystem(): void };
+    if (cams.coordinateSystem !== renderer.coordinateSystem) {
+      cams.coordinateSystem = renderer.coordinateSystem;
+      cams.updateCoordinateSystem();
+    }
+    const face = Math.floor(this.step / this.strips), rows = Math.ceil(this.size / this.strips);
+    const prev = renderer.getRenderTarget(), prevFace = renderer.getActiveCubeFace(), prevMip = renderer.getActiveMipmapLevel();
+    this.rt.scissor.set(0, (this.step % this.strips) * rows, this.size, rows);
+    this.rt.scissorTest = true;
+    renderer.setRenderTarget(this.rt, face);
+    renderer.render(this.scene, this.cams.children[face] as THREE.Camera);
+    this.rt.scissorTest = false;
+    renderer.setRenderTarget(prev, prevFace, prevMip);
+    if (++this.step >= 6 * this.strips) this.ready = true;
+    return this.ready;
+  }
+}
+
+export function makeGasMaterial(type: number) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uCenter: { value: new THREE.Vector3() },
+      uInvRot: { value: new THREE.Matrix3() },
+      uSunDir: { value: new THREE.Vector3(1, 0, 0) },
+      uSunI: { value: 1 },
+      uType: { value: type },
+      ...eclipseUniforms(), // body-centred, planet radii
+      uRingIn: { value: 0 },
+      uRingOut: { value: 0 },
+      /** the painted pattern (GasBaker) when it holds this planet */
+      uBake: { value: null as THREE.CubeTexture | null },
+      uBaked: { value: 0 },
+      uBakeSize: { value: 1024 },
+    },
+    vertexShader: SHELL_VERT,
+    fragmentShader: /* glsl */ `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+uniform vec3 uCenter; uniform mat3 uInvRot; uniform vec3 uSunDir; uniform float uSunI; uniform float uType;
+uniform float uRingIn; uniform float uRingOut;
+uniform samplerCube uBake; uniform float uBaked; uniform float uBakeSize;
+varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
+${NOISE_GLSL}
+${ECLIPSE_GLSL}
+${GAS_PATTERN_GLSL}
+float ringDensity(float r){
+  float d = 0.0;
+  d += smoothstep(1.24,1.25,r)*(1.0-smoothstep(1.52,1.527,r))*0.18;
+  d += smoothstep(1.525,1.53,r)*(1.0-smoothstep(1.945,1.951,r))*0.95;
+  d += smoothstep(2.025,2.03,r)*(1.0-smoothstep(2.265,2.27,r))*0.6;
+  return d;
 }
 void main(){
   #include <logdepthbuf_fragment>
@@ -317,13 +425,11 @@ void main(){
   vec3 pW = ro + rd*tt;
   vec3 nW = normalize(pW);
   vec3 n = normalize(uInvRot * nW);
-  float lat = asin(clamp(n.y, -1.0, 1.0));
-  float lon = atan(n.z, n.x);
-  vec3 col;
-  if (uType < 0.5) col = jupiter(n, lat, lon);
-  else if (uType < 1.5) col = saturn(n, lat, lon);
-  else if (uType < 2.5) col = uranus(n, lat);
-  else col = neptune(n, lat, lon);
+  // the painted map where its texels are no bigger than a pixel, the live pattern up close
+  float useBake = uBaked * smoothstep(0.6, 1.2, length(fwidth(pW)) * uBakeSize * 0.5);
+  vec3 col = vec3(0.0);
+  if (useBake < 1.0) col = gasPattern(n, uType);
+  if (useBake > 0.0) col = mix(col, texture(uBake, n).rgb, useBake);
   float ndl = dot(nW, uSunDir);
   float diff = max(ndl, 0.0);
   diff = mix(diff, smoothstep(-0.08, 0.3, ndl), 0.35);
@@ -342,7 +448,7 @@ void main(){
       }
     }
   }
-  vec3 outc = col * diff * uSunI;
+  vec3 outc = col * diff * uSunI * heliosEclipse(pW); // moons' shadows (Io on Jupiter)
   // faint night-side
   outc += col * 0.002 * uSunI;
   gl_FragColor = vec4(outc, 0.0); // alpha 0 = bloom mask (lit planet surface)
@@ -531,55 +637,160 @@ void main(){
   });
 }
 
-export function makeCloudMaterial(type: number) {
+/**
+ * The cloud pattern by type (0 Earth, 1 Venus, 2 Titan) for a unit direction in the cloud
+ * shell's own frame: x = cover field, y = fine detail. It used to run per pixel and frame
+ * (15 noise evaluations, the most expensive thing on screen); now it is painted once
+ * into a cubemap (bakeClouds) and the clouds drift by turning the shell.
+ */
+const CLOUD_PATTERN_GLSL = /* glsl */ `
+vec2 cloudPattern(vec3 n, float type){
+  vec2 r = vec2(0.0);
+  if (type < 0.5){
+    vec3 q = n*2.2;
+    vec3 w = vec3(snoise(q), snoise(q + 5.2), snoise(q + 9.1));
+    float band = 0.12*cos(abs(n.y)*PI*3.0);
+    r = vec2(fbm(n*4.0 + w*0.6, 9) + band, fbm(n*40.0, 3));
+  } else if (type < 1.5){
+    r.x = fbm(vec3(n.x*2.5, n.y*7.0, n.z*2.5) + vec3(snoise(n*1.5))*0.9, 7);
+  } else {
+    r.x = fbm(vec3(n.x*2.0, n.y*6.0, n.z*2.0), 5);
+  }
+  return r;
+}
+`;
+/** cover field stored in 8 bits: value / 2.4 + 0.5 */
+export const CLOUD_DECODE = 2.4;
+
+/**
+ * A cubemap's first channel read back to the CPU, so the game can ask what the GPU
+ * draws (is there a cloud between the player and the Sun?) and get exactly the same
+ * answer as the shaders.
+ */
+export class CubeReadback {
+  faces: Uint8Array[] = [];
+  constructor(renderer: THREE.WebGLRenderer, rt: THREE.WebGLCubeRenderTarget, public size: number) {
+    const buf = new Uint8Array(size * size * 4);
+    for (let f = 0; f < 6; f++) {
+      renderer.readRenderTargetPixels(rt, 0, 0, size, size, buf, f);
+      const face = new Uint8Array(size * size);
+      for (let i = 0; i < face.length; i++) face[i] = buf[i * 4];
+      this.faces.push(face);
+    }
+  }
+  /** bilinear lookup in direction (x, y, z), 0..1, with OpenGL's cube face selection */
+  sample(x: number, y: number, z: number) {
+    const ax = Math.abs(x), ay = Math.abs(y), az = Math.abs(z);
+    let f: number, sc: number, tc: number, ma: number;
+    if (ax >= ay && ax >= az) { f = x > 0 ? 0 : 1; sc = x > 0 ? -z : z; tc = -y; ma = ax; }
+    else if (ay >= az) { f = y > 0 ? 2 : 3; sc = x; tc = y > 0 ? z : -z; ma = ay; }
+    else { f = z > 0 ? 4 : 5; sc = z > 0 ? x : -x; tc = -y; ma = az; }
+    const n = this.size;
+    const s = ((sc / ma + 1) / 2) * n - 0.5, t = ((tc / ma + 1) / 2) * n - 0.5;
+    const s0 = Math.max(0, Math.min(n - 1, Math.floor(s))), t0 = Math.max(0, Math.min(n - 1, Math.floor(t)));
+    const s1 = Math.min(n - 1, s0 + 1), t1 = Math.min(n - 1, t0 + 1);
+    const fs = Math.max(0, Math.min(1, s - s0)), ft = Math.max(0, Math.min(1, t - t0));
+    const p = this.faces[f];
+    const a = p[t0 * n + s0] + (p[t0 * n + s1] - p[t0 * n + s0]) * fs;
+    const b = p[t1 * n + s0] + (p[t1 * n + s1] - p[t1 * n + s0]) * fs;
+    return (a + (b - a) * ft) / 255;
+  }
+}
+
+/** Paint a cloud type's pattern into a cubemap (R = cover field, G = detail). */
+export function bakeClouds(renderer: THREE.WebGLRenderer, type: number, size: number): THREE.WebGLCubeRenderTarget {
+  const rt = new THREE.WebGLCubeRenderTarget(size, { type: THREE.UnsignedByteType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uType: { value: type } },
+    vertexShader: /* glsl */ `
+varying vec3 vObj;
+void main(){ vObj = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: /* glsl */ `
+#include <common>
+uniform float uType;
+varying vec3 vObj;
+${NOISE_GLSL}
+${CLOUD_PATTERN_GLSL}
+void main(){
+  vec2 cp = cloudPattern(normalize(vObj), uType);
+  gl_FragColor = vec4(cp.x / ${CLOUD_DECODE.toFixed(1)} + 0.5, cp.y * 0.5 + 0.5, 0.0, 1.0);
+}`,
+    side: THREE.BackSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const scene = new THREE.Scene();
+  const geo = new THREE.SphereGeometry(5, 32, 16);
+  scene.add(new THREE.Mesh(geo, mat));
+  new THREE.CubeCamera(0.1, 100, rt).update(renderer, scene);
+  mat.dispose();
+  geo.dispose();
+  return rt;
+}
+
+export function makeCloudMaterial(type: number, map: THREE.CubeTexture) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uSunDir: { value: new THREE.Vector3(1, 0, 0) },
       uSunI: { value: 1 },
-      uTime: { value: 0 },
       uColor: { value: new THREE.Vector3(1, 1, 1) },
       uCoverage: { value: 0 },
       uOpacity: { value: 1 },
       uType: { value: type },
       uBelow: { value: 0 },
       uFade: { value: 1 },
+      uCloudMap: { value: map },
+      /** moonlit ambient of the player's night sky (0 on other worlds) */
+      uNightAmb: { value: new THREE.Vector3() },
+      ...eclipseUniforms(), // body-centred, planet radii
+      /** cloud shell radius in planet radii */
+      uShellR: { value: 1 },
+      // the body's atmosphere (shared with its atmosphere material): sunlight reaching the deck
+      uRa: { value: 1.02 }, uBetaR: { value: new THREE.Vector3() }, uBetaM: { value: 0 }, uBetaO: { value: new THREE.Vector3() },
+      uLut: { value: null as THREE.Texture | null },
     },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform vec3 uSunDir; uniform float uSunI; uniform float uTime; uniform vec3 uColor; uniform float uCoverage;
-uniform float uOpacity; uniform float uType; uniform float uBelow; uniform float uFade;
+uniform vec3 uSunDir; uniform float uSunI; uniform vec3 uColor; uniform float uCoverage;
+uniform float uOpacity; uniform float uType; uniform float uBelow; uniform float uFade; uniform float uShellR;
+uniform samplerCube uCloudMap; uniform vec3 uNightAmb;
+uniform float uRa; uniform vec3 uBetaR; uniform float uBetaM; uniform vec3 uBetaO; uniform sampler2D uLut;
+${ECLIPSE_GLSL}
+${SUN_TRANSMITTANCE_GLSL}
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 void main(){
   #include <logdepthbuf_fragment>
-  vec3 n = normalize(vObj);
+  vec2 cp = texture(uCloudMap, normalize(vObj)).rg;
+  float c = (cp.x - 0.5) * ${CLOUD_DECODE.toFixed(1)};
   float d; float shade = 1.0;
   if (uType < 0.5){
-    vec3 q = n*2.2;
-    vec3 w = vec3(snoise(q + uTime*0.002), snoise(q + 5.2), snoise(q + 9.1));
-    float lat = abs(n.y);
-    float band = 0.12*cos(lat*PI*3.0);
-    float c = fbm(n*4.0 + w*0.6, 9) + band;
+    // The painted map resolves weather systems (~12 km a texel); up close (from below the
+    // deck, or cloud edges from low orbit) a few kilometres of live detail break it up.
+    // Faded out before it gets smaller than a pixel, so it never shimmers.
+    float df = 1.0 - smoothstep(0.25, 0.6, length(fwidth(vObj)) * 600.0);
+    if (df > 0.0) c += fbm(normalize(vObj) * 600.0, 3) * 0.14 * df;
     d = smoothstep(uCoverage, uCoverage + 0.32, c);
     shade = mix(1.0, 0.55, smoothstep(0.3, 1.0, d) * uBelow);
-    shade *= 0.9 + 0.1*fbm(n*40.0, 3);
+    shade *= 0.9 + 0.2 * (cp.y - 0.5);
   } else if (uType < 1.5){
-    float c = fbm(vec3(n.x*2.5, n.y*7.0, n.z*2.5) + vec3(snoise(n*1.5 + uTime*0.002))*0.9, 7);
     d = 1.0;
     shade = 0.82 + 0.25*c;
     if (uBelow > 0.5) shade *= 0.45;
   } else {
-    float c = fbm(vec3(n.x*2.0, n.y*6.0, n.z*2.0), 5);
     d = 1.0;
     shade = 0.9 + 0.12*c;
     if (uBelow > 0.5) shade *= 0.5;
   }
-  float ndl = dot(normalize(vNormalW), uSunDir);
-  if (uBelow > 0.5) ndl = dot(normalize(vObj), uSunDir);
-  float light = smoothstep(-0.25, 0.3, ndl);
-  vec3 col = uColor * shade * light * uSunI;
+  vec3 nw = normalize(vNormalW); // outward, world orientation
+  float musun = dot(nw, uSunDir);
+  // Sunlight at the deck: white by day, golden then pink and red as it grazes the air at
+  // sunset, and gone once the deck itself is in the planet's shadow (the old soft ramp
+  // kept clouds lit ~14° after sunset)
+  vec3 sun = sunTransmittance(uShellR, musun) * mix(0.35, 1.0, smoothstep(0.0, 0.5, musun));
+  vec3 col = uColor * shade * (sun * uSunI * heliosEclipse(nw * uShellR) + uNightAmb);
   gl_FragColor = vec4(col, d * uOpacity * uFade);
 }
 `,
@@ -593,21 +804,105 @@ void main(){
 }
 
 // ---------------------------------------------------------------------------
+/**
+ * Eclipses: up to four spheres (a world's moons, or its planet) that can hide its star.
+ * Positions are relative to the body's centre, in the material's own units and
+ * orientation; uEclOrigin is the body's centre in the space of the shaded positions.
+ */
+export function eclipseUniforms() {
+  return {
+    uEclOrigin: { value: new THREE.Vector3() },
+    /** xyz = occluder centre relative to the body centre, w = its radius (0 = unused) */
+    uOcc: { value: [new THREE.Vector4(), new THREE.Vector4(), new THREE.Vector4(), new THREE.Vector4()] },
+    /** direction to the star */
+    uEclSun: { value: new THREE.Vector3(1, 0, 0) },
+    /** angular radius of the star seen from the body (rad) */
+    uEclSunR: { value: 0.005 },
+  };
+}
+const ECLIPSE_GLSL = /* glsl */ `
+uniform vec3 uEclOrigin; uniform vec4 uOcc[4]; uniform vec3 uEclSun; uniform float uEclSunR;
+// Share of the star's disc still visible from p: black umbra, a penumbra that grades over
+// the star's apparent size, and an annular eclipse when the occluder looks smaller.
+float heliosEclipse(vec3 pos){
+  vec3 p = pos - uEclOrigin;
+  float vis = 1.0;
+  for (int i = 0; i < 4; i++){
+    if (uOcc[i].w <= 0.0) continue;
+    vec3 d = uOcc[i].xyz - p;
+    float dist = length(d);
+    if (dot(d, uEclSun) <= 0.0) continue; // the occluder is on the far side
+    float ro = asin(min(uOcc[i].w / dist, 1.0));
+    float sep = asin(min(length(cross(d, uEclSun)) / dist, 1.0)); // exact for tiny angles, unlike acos
+    float rs = uEclSunR;
+    float cover = clamp((ro + rs - sep) / (2.0 * min(ro, rs)), 0.0, 1.0);
+    vis *= 1.0 - cover * cover * (3.0 - 2.0 * cover) * min(1.0, (ro * ro) / (rs * rs));
+  }
+  return vis;
+}
+`;
+
+/**
+ * Aerial perspective (terrain and water of the world under the player). The haze gets
+ * thinner with altitude, so valleys fill with it while peaks stand clear, and it takes
+ * the colour of the horizon sky in its direction (computed on the CPU with the same
+ * scattering model as the sky), bright and warm towards the Sun, blue away from it.
+ * The vectors are given in whatever space the material's positions use.
+ */
+export function hazeUniforms() {
+  return {
+    /** extinction per metre at the ground (0 = no haze) */
+    uFogDensity: { value: 0 },
+    /** haze scale height (m) */
+    uFogH: { value: 1500 },
+    /** camera altitude above the reference sphere (m) */
+    uFogCamH: { value: 0 },
+    uPlanetR: { value: 1 },
+    /** planet centre, local vertical at the camera and the Sun's horizontal direction */
+    uHzCenter: { value: new THREE.Vector3() },
+    uHzUp: { value: new THREE.Vector3(0, 1, 0) },
+    uHzSunAz: { value: new THREE.Vector3(1, 0, 0) },
+    /** horizon sky colour by azimuth a from the Sun: exp(A + B cos(a) + C cos(2a)) */
+    uFogA: { value: new THREE.Vector3() },
+    uFogB: { value: new THREE.Vector3() },
+    uFogC: { value: new THREE.Vector3() },
+  };
+}
+const HAZE_GLSL = /* glsl */ `
+uniform float uFogDensity; uniform float uFogH; uniform float uFogCamH; uniform float uPlanetR;
+uniform vec3 uHzCenter; uniform vec3 uHzUp; uniform vec3 uHzSunAz; uniform vec3 uFogA; uniform vec3 uFogB; uniform vec3 uFogC;
+// colour and opacity of the haze between the camera (origin) and the point p
+vec4 heliosHaze(vec3 p){
+  float d = length(p);
+  if (uFogDensity <= 0.0 || d <= 0.0) return vec4(0.0);
+  float h0 = max(uFogCamH, -200.0);
+  float h1 = max(length(p - uHzCenter) - uPlanetR, -200.0);
+  float dh = h1 - h0;
+  float e0 = exp(-h0 / uFogH), e1 = exp(-h1 / uFogH);
+  float avg = abs(dh) > 1.0 ? uFogH * (e0 - e1) / dh : e0; // mean density along the ray
+  float f = 1.0 - exp(-uFogDensity * d * avg);
+  vec3 v = p / d;
+  vec3 vh = v - uHzUp * dot(v, uHzUp);
+  float c1 = dot(vh, uHzSunAz) * inversesqrt(max(dot(vh, vh), 1e-8));
+  return vec4(exp(uFogA + uFogB * c1 + uFogC * (2.0 * c1 * c1 - 1.0)), f);
+}
+`;
+
 export function makeWaterMaterial(deep: [number, number, number], shallow: [number, number, number]) {
   return new THREE.ShaderMaterial({
     uniforms: {
+      ...hazeUniforms(),
       uSunDir: { value: new THREE.Vector3(1, 0, 0) },
       uSunColor: { value: new THREE.Vector3(3, 3, 3) },
       /** daytime sky colour; the shader fades it with the water's OWN sun elevation, so a night-side ocean seen from space stays dark */
       uSky: { value: new THREE.Vector3(0.3, 0.5, 0.8) },
       /** moonlit-sky term added where the player's night floor is active */
       uSkyNight: { value: new THREE.Vector3() },
+      ...eclipseUniforms(), // camera-relative world space, metres
       uDeep: { value: new THREE.Vector3(...deep) },
       uShallow: { value: new THREE.Vector3(...shallow) },
       uTime: { value: 0 },
       uOffset: { value: new THREE.Vector3() },
-      uFogColor: { value: new THREE.Vector3() },
-      uFogDensity: { value: 0 },
     },
     vertexShader: /* glsl */ `
 #include <common>
@@ -627,8 +922,10 @@ void main(){
 #include <common>
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uSunDir; uniform vec3 uSunColor; uniform vec3 uSky; uniform vec3 uSkyNight; uniform vec3 uDeep; uniform vec3 uShallow;
-uniform float uTime; uniform vec3 uOffset; uniform vec3 uFogColor; uniform float uFogDensity;
+uniform float uTime; uniform vec3 uOffset;
 varying vec3 vWorld; varying vec3 vNormalW; varying float vDepth;
+${HAZE_GLSL}
+${ECLIPSE_GLSL}
 void main(){
   #include <logdepthbuf_fragment>
   vec3 N = normalize(vNormalW);
@@ -655,19 +952,20 @@ void main(){
   float sunUp = smoothstep(-0.05, 0.15, ndl);
   float dayL = smoothstep(-0.1, 0.3, ndl); // this patch of water's own daylight, not the camera's
   vec3 sky = uSky * dayL + uSkyNight;
-  vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 30.0, vDepth)) * (0.06 * dayL + max(ndl, 0.0)) * uSunColor * 0.32;
+  vec3 sunC = uSunColor * heliosEclipse(vWorld);
+  vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 30.0, vDepth)) * (0.06 * dayL + max(ndl, 0.0)) * sunC * 0.32;
   vec3 Hs = uSunDir + V;
   vec3 H = dot(Hs, Hs) > 1e-8 ? normalize(Hs) : N;
   float nh = max(dot(n, H), 0.0);
   float spec = pow(nh, 900.0) * 60.0 + pow(nh, 80.0) * 0.5;
-  vec3 col = mix(body, sky, fres) + uSunColor * spec * sunUp * 0.4;
+  vec3 col = mix(body, sky, fres) + sunC * spec * sunUp * 0.4;
   float foam = smoothstep(1.0, 0.0, vDepth) * (0.6 + 0.4 * sin(dot(p, vec3(0.7, 0.5, 0.4)) * 3.0 + uTime * 1.7));
-  col += uSunColor * 0.25 * foam * (0.1 * dayL + max(ndl, 0.0));
+  col += sunC * 0.25 * foam * (0.1 * dayL + max(ndl, 0.0));
   float alpha = mix(0.4, 0.97, smoothstep(0.0, 7.0, vDepth));
   alpha = max(alpha, fres);
-  float fog = 1.0 - exp(-dist * uFogDensity);
-  col = mix(col, uFogColor, fog);
-  alpha = mix(alpha, 1.0, fog);
+  vec4 hz = heliosHaze(vWorld);
+  col = mix(col, hz.rgb, hz.a);
+  alpha = mix(alpha, 1.0, hz.a);
   gl_FragColor = vec4(col, alpha);
 }
 `,
@@ -679,17 +977,44 @@ void main(){
   });
 }
 
+/** Text replacements on a three.js shader chunk; warns when an anchor is missing (three changed). */
+function patchChunk(src: string, edits: [string, string][]) {
+  for (const [from, to] of edits) {
+    if (!src.includes(from)) console.warn('[helios] shader anchor not found:', from);
+    src = src.replace(from, to);
+  }
+  return src;
+}
+
 // ---------------------------------------------------------------------------
 export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
   const uniforms = {
     uDetailOffset: { value: new THREE.Vector3() },
     uDetail: { value: 1 },
-    uFogColor: { value: new THREE.Vector3() },
-    uFogDensity: { value: 0 },
+    /** aerial perspective, vectors in view space */
+    ...hazeUniforms(),
     /** 0 by day; towards 1 at night on the ground: scotopic look (colourless, compressed contrast) */
     uNight: { value: 0 },
     /** scale of the (scene-global) hemisphere light for this body: 1 where the player is, less for other worlds */
     uHemiScale: { value: 1 },
+    // The scene's directional light belongs to the ground under the player: it fades out
+    // when the Sun sets there. A world seen from afar (the Moon in the night sky) is lit
+    // by its own sunlight instead: uDirScale 0 and uFarSun = its irradiance.
+    uDirScale: { value: 1 },
+    uFarSun: { value: new THREE.Vector3() },
+    /** direction towards the star, view space */
+    uFarSunDir: { value: new THREE.Vector3(0, 0, 1) },
+    /** eclipses of a world seen from afar (view space, metres) */
+    ...eclipseUniforms(),
+    // cloud shadows on the ground (Earth: define HELIOS_CLOUD_SHADOW): the cloud cubemap,
+    // view space -> cloud frame, deck radius (m), cover threshold and opacity, and the
+    // shadow at the camera (already in the scene light: the ground gets the ratio)
+    uCloudMap: { value: null as THREE.CubeTexture | null },
+    uCloudRotView: { value: new THREE.Matrix3() },
+    uCloudShellR: { value: 1 },
+    uCloudCov: { value: 0 },
+    uCloudOpac: { value: 0 },
+    uCloudCam: { value: 1 },
   };
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
@@ -700,7 +1025,22 @@ export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
       .replace(
         '#include <common>',
         `#include <common>
-uniform float uDetail; uniform vec3 uFogColor; uniform float uFogDensity; uniform float uNight; uniform float uHemiScale;
+uniform float uDetail; uniform float uNight; uniform float uHemiScale;
+uniform float uDirScale; uniform vec3 uFarSun; uniform vec3 uFarSunDir;
+${ECLIPSE_GLSL}
+#ifdef HELIOS_CLOUD_SHADOW
+uniform samplerCube uCloudMap; uniform mat3 uCloudRotView; uniform float uCloudShellR; uniform float uCloudCov; uniform float uCloudOpac; uniform float uCloudCam;
+// sunlight let through by the cloud deck above p (from the planet centre, view space)
+float heliosCloudShadow(vec3 p){
+  float r = length(p);
+  float mu = dot(p / r, uFarSunDir);
+  if (r >= uCloudShellR || mu <= 0.0) return 1.0;
+  vec3 q = uCloudRotView * (p + uFarSunDir * ((uCloudShellR - r) / max(mu, 0.05)));
+  float c = (texture(uCloudMap, normalize(q)).r - 0.5) * ${CLOUD_DECODE.toFixed(1)};
+  return 1.0 - 0.7 * smoothstep(uCloudCov, uCloudCov + 0.32, c) * uCloudOpac;
+}
+#endif
+${HAZE_GLSL}
 varying vec3 vDetailPos;
 float tHash(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
 float tNoise(vec3 x, float per){
@@ -754,18 +1094,31 @@ diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(0.3, 0.
       )
       // The hemisphere light is global to the scene, but its night floor belongs to the
       // ground the player stands on: other worlds in the sky must not pick it up.
-      .replace(
-        '#include <lights_fragment_begin>',
-        THREE.ShaderChunk.lights_fragment_begin.replace(
-          'irradiance += getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
-          'irradiance += uHemiScale * getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
-        ),
-      )
+      .replace('#include <lights_fragment_begin>', `float heliosCloudF = 1.0;
+#ifdef HELIOS_CLOUD_SHADOW
+heliosCloudF = heliosCloudShadow(-vViewPosition - uEclOrigin) / max(uCloudCam, 0.05);
+#endif
+` + patchChunk(THREE.ShaderChunk.lights_fragment_begin, [
+        ['irradiance += getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
+          'irradiance += uHemiScale * getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );'],
+        ['getDirectionalLightInfo( directionalLight, directLight );',
+          'getDirectionalLightInfo( directionalLight, directLight );\n\t\tdirectLight.color *= uDirScale * heliosCloudF;'],
+        ['#if ( NUM_RECT_AREA_LIGHTS > 0 ) && defined( RE_Direct_RectArea )',
+          `#if defined( RE_Direct )
+if ( uFarSun.r + uFarSun.g + uFarSun.b > 0.0 ) {
+	directLight.direction = uFarSunDir;
+	directLight.color = uFarSun * heliosEclipse(-vViewPosition);
+	directLight.visible = true;
+	RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
+}
+#endif
+#if ( NUM_RECT_AREA_LIGHTS > 0 ) && defined( RE_Direct_RectArea )`],
+      ]))
       .replace(
         '#include <dithering_fragment>',
         `{
-  float fogF = 1.0 - exp(-length(vViewPosition) * uFogDensity);
-  gl_FragColor.rgb = mix(gl_FragColor.rgb, uFogColor, fogF);
+  vec4 hz = heliosHaze(-vViewPosition);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, hz.rgb, hz.a);
   gl_FragColor.a = 0.0; // bloom mask: a lit planet surface never blooms, so a bright crescent cannot glow over the night side
 }
 #include <dithering_fragment>`,
@@ -776,44 +1129,90 @@ diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(0.3, 0.
 }
 
 // ---------------------------------------------------------------------------
-export function makeStars(count: number) {
-  const pos = new Float32Array(count * 3);
+/** 1 parsec in metres */
+export const PARSEC = 3.0856775814913673e16;
+/** Galactic north pole and centre in game coordinates (ecliptic J2000, +Y = north, right-handed). */
+const GAL_POLE = new THREE.Vector3(-0.86767, 0.49715, 0.00035);
+
+// Blackbody colours (sRGB 0-255, Mitchell Charity's CIE 1964 10° table) by temperature.
+const BB_T = [2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 6500, 7000, 8000, 9000, 10000, 12000, 15000, 20000, 30000, 40000];
+const BB_RGB = [
+  [255, 137, 18], [255, 161, 72], [255, 180, 107], [255, 196, 137], [255, 209, 163], [255, 219, 186], [255, 228, 206],
+  [255, 236, 224], [255, 243, 239], [255, 249, 253], [245, 243, 255], [227, 233, 255], [214, 225, 255], [204, 219, 255],
+  [191, 211, 255], [179, 204, 255], [168, 197, 255], [159, 190, 255], [155, 188, 255],
+];
+/** Star colour from its B-V index (temperature by Ballesteros' formula), scaled to unit luminance. */
+function starColor(bv: number, out: number[]) {
+  const T = clamp01((4600 * (1 / (0.92 * bv + 1.7) + 1 / (0.92 * bv + 0.62)) - 2000) / 38000) * 38000 + 2000;
+  let k = 0;
+  while (k < BB_T.length - 2 && BB_T[k + 1] < T) k++;
+  const f = clamp01(Math.log(T / BB_T[k]) / Math.log(BB_T[k + 1] / BB_T[k]));
+  // a little more saturated than the eye's pastel impression, so star colours read on screen
+  for (let c = 0; c < 3; c++) out[c] = Math.pow((BB_RGB[k][c] + (BB_RGB[k + 1][c] - BB_RGB[k][c]) * f) / 255, 1.6);
+  const l = 0.3 * out[0] + 0.59 * out[1] + 0.11 * out[2];
+  for (let c = 0; c < 3; c++) out[c] /= l;
+}
+const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+
+/**
+ * The real night sky: every naked-eye star of the Yale Bright Star Catalogue at its real
+ * position, brightness and colour, plus fainter field stars that crowd towards the
+ * Milky Way. Stars with a known parallax sit at their real distance (parsecs from the
+ * Sun) and the vertex shader looks at them from the player's position, so on the way to
+ * Proxima the nearby ones shift and brighten: Alpha Centauri A and B blaze at magnitude
+ * -6.7 in Proxima's sky, and the Sun becomes a star in Cassiopeia.
+ */
+export function makeStars() {
+  const raw = Uint8Array.from(atob(STAR_DATA), (ch) => ch.charCodeAt(0));
+  const dv = new DataView(raw.buffer);
+  const FAINT = 5000;
+  const count = STAR_COUNT + FAINT;
+  const pos = new Float32Array(count * 3); // parsecs from the Sun
   const col = new Float32Array(count * 3);
-  const size = new Float32Array(count);
-  const gn = new THREE.Vector3(0.2, 0.86, 0.47).normalize();
-  let i = 0;
+  const mag = new Float32Array(count); // V magnitude seen from the Sun
+  const c = [0, 0, 0];
+  for (let i = 0; i < STAR_COUNT; i++) {
+    const o = i * 8;
+    const lon = (dv.getUint16(o, true) / 65535) * 2 * Math.PI;
+    const lat = (dv.getUint16(o + 2, true) / 65535) * Math.PI - Math.PI / 2;
+    const plx = dv.getUint16(o + 4, true); // milliarcseconds
+    const d = plx > 0 ? 1000 / plx : 1000; // unknown distance: far enough never to shift
+    pos[i * 3] = Math.cos(lat) * Math.cos(lon) * d;
+    pos[i * 3 + 1] = Math.sin(lat) * d;
+    pos[i * 3 + 2] = -Math.cos(lat) * Math.sin(lon) * d;
+    mag[i] = dv.getUint8(o + 6) / 25 - 2;
+    starColor(dv.getUint8(o + 7) / 100 - 0.5, c);
+    col.set(c, i * 3);
+  }
+  // fainter field stars (V 6.5-8), the same on every start
+  const rnd = mulberry32(20261018);
+  let i = STAR_COUNT;
   while (i < count) {
-    const u = Math.random() * 2 - 1;
-    const th = Math.random() * Math.PI * 2;
-    const s = Math.sqrt(1 - u * u);
+    const u = rnd() * 2 - 1, th = rnd() * Math.PI * 2, s = Math.sqrt(1 - u * u);
     const x = s * Math.cos(th), y = u, z = s * Math.sin(th);
-    const b = Math.abs(x * gn.x + y * gn.y + z * gn.z);
-    // more stars near galactic plane
-    if (Math.random() > 0.35 + 0.65 * Math.exp(-(b * b) / 0.05)) continue;
-    pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
-    const m = Math.pow(Math.random(), 7);
-    const t = Math.random();
-    let c: [number, number, number];
-    if (t < 0.12) c = [0.65, 0.75, 1.0];
-    else if (t < 0.45) c = [0.9, 0.93, 1.0];
-    else if (t < 0.75) c = [1.0, 0.95, 0.85];
-    else if (t < 0.92) c = [1.0, 0.82, 0.6];
-    else c = [1.0, 0.65, 0.45];
-    const br = 0.25 + m * 3.5;
-    col[i * 3] = c[0] * br; col[i * 3 + 1] = c[1] * br; col[i * 3 + 2] = c[2] * br;
-    size[i] = 1.1 + m * 3.2;
+    const b = x * GAL_POLE.x + y * GAL_POLE.y + z * GAL_POLE.z;
+    if (rnd() > 0.25 + 0.75 * Math.exp(-(b * b) / 0.03)) continue;
+    pos[i * 3] = x * 1000; pos[i * 3 + 1] = y * 1000; pos[i * 3 + 2] = z * 1000;
+    mag[i] = 6.5 + 1.5 * Math.pow(rnd(), 0.6);
+    starColor(-0.2 + rnd() * 1.6, c);
+    col.set(c, i * 3);
     i++;
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
-  geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  geo.setAttribute('aMag', new THREE.BufferAttribute(mag, 1));
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 1 }, uPR: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 } },
+    uniforms: {
+      uAlpha: { value: 1 }, uPR: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 },
+      /** the player's position, parsecs from the Sun */
+      uViewer: { value: new THREE.Vector3() },
+    },
     vertexShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_vertex>
-attribute vec3 aColor; attribute float aSize; uniform float uAlpha; uniform float uPR; uniform vec3 uVel; uniform float uDop;
+attribute vec3 aColor; attribute float aMag; uniform float uAlpha; uniform float uPR; uniform vec3 uVel; uniform float uDop;
+uniform vec3 uViewer;
 varying vec3 vColor;
 // Pulse-engine Doppler tint: colour only, positions never change.
 // c = cosine of the angle between the star direction and the direction of travel.
@@ -823,10 +1222,17 @@ vec3 dopplerTint(float c, float k){
   return mix(vec3(1.0), t, k) * (1.0 + k * 0.55 * c);
 }
 void main(){
-  vColor = aColor * uAlpha * dopplerTint(dot(normalize(position), uVel), uDop);
-  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  // the star as seen from the player: direction and magnitude change with parallax
+  vec3 rel = position - uViewer;
+  float d = length(rel);
+  vec3 dir = rel / d;
+  float m = aMag + 1.50515 * log2(d / length(position)); // + 5 log10(d / d0)
+  float br = clamp(0.22 * exp2(-0.53151 * (m - 6.5)), 0.08, 16.0); // 10^(-0.16 (m - 6.5))
+  float sz = 1.1 + 3.2 * pow(clamp((6.5 - m) / 8.0, 0.0, 1.0), 1.3) + 2.0 * clamp((-1.5 - m) / 5.0, 0.0, 1.0);
+  vColor = aColor * br * uAlpha * dopplerTint(dot(dir, uVel), uDop);
+  vec4 mv = modelViewMatrix * vec4(dir, 1.0);
   gl_Position = projectionMatrix * mv;
-  gl_PointSize = aSize * uPR;
+  gl_PointSize = sz * uPR;
   #include <logdepthbuf_vertex>
 }`,
     fragmentShader: /* glsl */ `
@@ -857,8 +1263,8 @@ void main(){
  * 1024 px per face a texel spans 0.09°, close to a screen pixel, and the
  * nebula is soft, so the result is visually identical and ~50x cheaper.
  */
-export function bakeMilkyWay(renderer: THREE.WebGLRenderer): THREE.CubeTexture {
-  const rt = new THREE.WebGLCubeRenderTarget(1024, { type: THREE.UnsignedByteType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+export function bakeMilkyWay(renderer: THREE.WebGLRenderer, size = 1024): THREE.CubeTexture {
+  const rt = new THREE.WebGLCubeRenderTarget(size, { type: THREE.UnsignedByteType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
   const mat = new THREE.ShaderMaterial({
     vertexShader: /* glsl */ `
 varying vec3 vObj;
@@ -869,8 +1275,9 @@ varying vec3 vObj;
 ${NOISE_GLSL}
 void main(){
   vec3 d = normalize(vObj);
-  vec3 gn = normalize(vec3(0.2, 0.86, 0.47));
-  vec3 core = normalize(vec3(1.0, 0.0, 0.0) - gn * gn.x);
+  // real galactic north pole and centre (Sagittarius), game coordinates
+  vec3 gn = vec3(-0.86767, 0.49715, 0.00035);
+  vec3 core = vec3(-0.05488, -0.09648, 0.99382);
   float b = dot(d, gn);
   float band = exp(-b*b/0.01) + 0.35*exp(-b*b/0.07);
   float cb = pow(max(dot(d, core), 0.0), 3.0);

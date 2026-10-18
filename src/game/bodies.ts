@@ -57,6 +57,12 @@ export interface AtmoDef {
   fogDensity: number; // per meter at surface
   surfaceDensity: number; // relative to earth
   skyBrightness: number;
+  /**
+   * ozone absorption per metre (RGB). Real ozone sits at 15-35 km; here it follows the
+   * Rayleigh profile with the coefficient scaled to keep the real column (15 km / HR),
+   * which is enough for its visible effect: the deep blue sky after sunset.
+   */
+  ozone?: [number, number, number];
 }
 
 export interface CloudDef {
@@ -76,10 +82,14 @@ export interface BodyDef {
   parent?: string;
   /** distance to the parent (m); for a top-level body, distance to the Sun */
   orbit: number;
-  /** orbital angle (rad); for a top-level body, ecliptic longitude measured from +X towards +Z */
+  /**
+   * orbital angle (rad), measured from +X towards +Z. For a star (other than the Sun) it is
+   * the real ecliptic longitude instead, measured from +X towards -Z: with +Y = ecliptic
+   * north that is the right-handed sky, the same as the star catalogue (not mirrored)
+   */
   angle: number;
   incl?: number;
-  /** ecliptic latitude (rad) of a top-level body (+Y = ecliptic north); used to place other stars */
+  /** ecliptic latitude (rad) of a star (+Y = ecliptic north) */
   lat?: number;
   /** star appearance/physics (kind 'star' only; defaults to the Sun) */
   star?: StarDef;
@@ -96,6 +106,8 @@ export interface BodyDef {
   clouds?: CloudDef;
   gasType?: number;
   rings?: number; // 0 saturn 1 uranus 2 neptune
+  /** rotation of a gas giant's cloud tops (rad/s, negative = retrograde) */
+  spin?: number;
   hazard?: { suitDrain: number; text: string };
   markerColor: string;
   seed: number;
@@ -133,11 +145,12 @@ export const BODIES: BodyDef[] = [
     description: 'Nuestro hogar. El único mundo conocido con agua líquida en superficie y vida.',
     facts: ['71% de la superficie cubierta por océanos', 'Campo magnético que protege del viento solar', 'Edad: ~4 540 millones de años'],
     tilt: 0, scaleHeight: 8500, markerColor: '#6fb7ff', seed: 33,
-    atmo: { height: 100e3, betaR: [5.5e-6, 13.0e-6, 22.4e-6], betaM: 21e-6, HR: 8000, HM: 1200, g: 0.76, sun: 22, mieTint: [1, 1, 1], fogColor: [0.55, 0.68, 0.85], fogDensity: 1.6e-5, surfaceDensity: 1, skyBrightness: 1 },
+    atmo: { height: 100e3, betaR: [5.5e-6, 13.0e-6, 22.4e-6], betaM: 21e-6, HR: 8000, HM: 1200, g: 0.76, sun: 22, mieTint: [1, 1, 1], fogColor: [0.55, 0.68, 0.85], fogDensity: 1.6e-5, surfaceDensity: 1, skyBrightness: 1, ozone: [1.22e-6, 3.53e-6, 0.16e-6] },
     clouds: { alt: 6e3, color: [1, 1, 1], coverage: 0.05, opacity: 0.95, type: 0, thickness: 1500 },
   },
   {
-    id: 'moon', name: 'Luna', kind: 'rocky', radius: 1737.4e3, parent: 'earth', orbit: 384400e3, angle: 2.35, incl: 0.09, gravity: 1.62, tempC: -20,
+    // angle 0.55: waxing gibbous (~148° from the Sun, 93% lit), high in Earth's night sky
+    id: 'moon', name: 'Luna', kind: 'rocky', radius: 1737.4e3, parent: 'earth', orbit: 384400e3, angle: 0.55, incl: 0.09, gravity: 1.62, tempC: -20,
     tempText: '−173 °C (noche) a 127 °C (día)', pressure: 0, composition: 'Sin atmósfera (exosfera de He, Ar, Na)',
     description: 'El único satélite natural de la Tierra. Mares de basalto oscuro y tierras altas cubiertas de cráteres.',
     facts: ['12 humanos la han pisado (Apolo 1969-1972)', 'Siempre muestra la misma cara a la Tierra', 'Se aleja 3,8 cm por año'],
@@ -153,7 +166,8 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 0, text: '' },
   },
   {
-    id: 'phobos', name: 'Fobos', kind: 'rocky', radius: 11.27e3, parent: 'mars', orbit: 9376e3, angle: 1.2, gravity: 0.0057, tempC: -40,
+    // angle 2.4: sunlit (at 1.2 it sat inside Mars's shadow for good once eclipses existed)
+    id: 'phobos', name: 'Fobos', kind: 'rocky', radius: 11.27e3, parent: 'mars', orbit: 9376e3, angle: 2.4, gravity: 0.0057, tempC: -40,
     tempText: '−112 °C a −4 °C', pressure: 0, composition: 'Sin atmósfera',
     description: 'Luna irregular de Marte, probablemente un asteroide capturado. Dominada por el cráter Stickney.',
     facts: ['Orbita Marte 3 veces al día', 'Caerá sobre Marte en ~50 millones de años', 'Un salto puede casi escapar de su gravedad'],
@@ -171,11 +185,13 @@ export const BODIES: BodyDef[] = [
     tempText: '−110 °C en las nubes · aumenta con la profundidad', pressure: 1, composition: 'H₂ 90% · He 10% · CH₄, NH₃',
     description: 'El gigante gaseoso. No tiene superficie: la presión y la temperatura aumentan hasta aplastar cualquier nave.',
     facts: ['La Gran Mancha Roja es más grande que la Tierra', 'La sonda Galileo dejó de transmitir a ~23 bar', 'Hidrógeno metálico en su interior'],
-    tilt: 0.054, scaleHeight: 27000, markerColor: '#e0b98a', seed: 88, gasType: 0,
+    tilt: 0.054, scaleHeight: 27000, markerColor: '#e0b98a', seed: 88, gasType: 0, spin: 1.7585e-4,
     atmo: { height: 600e3, betaR: [3.0e-6, 3.6e-6, 4.8e-6], betaM: 2e-6, HR: 27000, HM: 20000, g: 0.7, sun: 14, mieTint: [1, 0.95, 0.85], fogColor: [0.7, 0.58, 0.44], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
-    id: 'io', name: 'Ío', kind: 'rocky', radius: 1821.6e3, parent: 'jupiter', orbit: 421700e3, angle: 0.3, gravity: 1.796, tempC: -143,
+    // angle 2.6164: Io is transiting Jupiter's day side, its shadow (a black disc ~3 000 km
+    // across with a soft edge) falls on the cloud bands as in the Juno and Hubble images
+    id: 'io', name: 'Ío', kind: 'rocky', radius: 1821.6e3, parent: 'jupiter', orbit: 421700e3, angle: 2.6164, gravity: 1.796, tempC: -143,
     tempText: '−143 °C (lagos de lava a 1 600 °C)', pressure: 0, composition: 'SO₂ muy tenue',
     description: 'El cuerpo con más actividad volcánica del sistema solar, calentado por las mareas de Júpiter.',
     facts: ['Más de 400 volcanes activos', 'Penachos de azufre de hasta 500 km', 'Radiación letal del cinturón de Júpiter'],
@@ -209,7 +225,7 @@ export const BODIES: BodyDef[] = [
     tempText: '−140 °C en las nubes', pressure: 1, composition: 'H₂ 96% · He 3% · CH₄',
     description: 'El señor de los anillos. Gigante gaseoso menos denso que el agua, sin superficie sólida.',
     facts: ['Anillos de hielo de 280 000 km y solo ~10 m de grosor', 'Vientos de 1 800 km/h', 'Hexágono permanente en el polo norte'],
-    tilt: 0.466, scaleHeight: 59500, markerColor: '#f0d9a0', seed: 144, gasType: 1, rings: 0,
+    tilt: 0.466, scaleHeight: 59500, markerColor: '#f0d9a0', seed: 144, gasType: 1, rings: 0, spin: 1.638e-4,
     atmo: { height: 700e3, betaR: [3.4e-6, 3.6e-6, 4.0e-6], betaM: 2e-6, HR: 59500, HM: 40000, g: 0.7, sun: 14, mieTint: [1, 0.95, 0.85], fogColor: [0.8, 0.7, 0.5], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
@@ -227,7 +243,7 @@ export const BODIES: BodyDef[] = [
     tempText: '−195 °C (mínimo del sistema solar: −224 °C)', pressure: 1, composition: 'H₂ 83% · He 15% · CH₄ 2,3%',
     description: 'Gigante de hielo que gira tumbado de lado (98°). El metano le da su color cian.',
     facts: ['Cada polo tiene 42 años de luz y 42 de oscuridad', '13 anillos tenues y oscuros', 'Solo visitado por la Voyager 2 (1986)'],
-    tilt: 1.707, scaleHeight: 27700, markerColor: '#9fe6ec', seed: 166, gasType: 2, rings: 1,
+    tilt: 1.707, scaleHeight: 27700, markerColor: '#9fe6ec', seed: 166, gasType: 2, rings: 1, spin: -1.012e-4,
     atmo: { height: 400e3, betaR: [2.0e-6, 5.0e-6, 6.0e-6], betaM: 1e-6, HR: 27700, HM: 20000, g: 0.7, sun: 14, mieTint: [0.8, 1, 1], fogColor: [0.5, 0.75, 0.8], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
@@ -235,7 +251,7 @@ export const BODIES: BodyDef[] = [
     tempText: '−201 °C en las nubes', pressure: 1, composition: 'H₂ 80% · He 19% · CH₄ 1,5%',
     description: 'El planeta más lejano. Azul intenso y los vientos más rápidos del sistema solar.',
     facts: ['Vientos de hasta 2 100 km/h', 'La luz del Sol tarda 4 horas en llegar', 'Descubierto por cálculo matemático en 1846'],
-    tilt: 0.494, scaleHeight: 19700, markerColor: '#5d7dff', seed: 177, gasType: 3, rings: 2,
+    tilt: 0.494, scaleHeight: 19700, markerColor: '#5d7dff', seed: 177, gasType: 3, rings: 2, spin: 1.083e-4,
     atmo: { height: 400e3, betaR: [1.2e-6, 3.6e-6, 9.0e-6], betaM: 1e-6, HR: 19700, HM: 15000, g: 0.7, sun: 14, mieTint: [0.8, 0.9, 1], fogColor: [0.3, 0.45, 0.9], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
@@ -279,7 +295,7 @@ export const BODIES: BodyDef[] = [
     tempText: '≈ −234 °C en las nubes', pressure: 1, composition: 'Hipotética: H₂, He y metano (minineptuno)',
     description: 'Candidato sin confirmar (2020, Damasso et al.): una supertierra o minineptuno de al menos 7 masas terrestres a 1,5 UA, con un año de 5,3 años terrestres. Análisis posteriores lo ponen en duda. Se representa como un minineptuno helado con un posible anillo de polvo.',
     facts: ['Masa mínima: ≈ 7 masas terrestres (sin confirmar)', 'Período orbital: 1 928 días', 'Recibe menos del 0,1% de la luz que recibe la Tierra', 'El Hubble detectó un posible exceso de luz: ¿anillos o polvo?'],
-    tilt: 0.3, scaleHeight: 18000, markerColor: '#8fa8ff', seed: 303, gasType: 3, rings: 2,
+    tilt: 0.3, scaleHeight: 18000, markerColor: '#8fa8ff', seed: 303, gasType: 3, rings: 2, spin: 1e-4,
     atmo: { height: 150e3, betaR: [1.2e-6, 3.6e-6, 9.0e-6], betaM: 1e-6, HR: 18000, HM: 14000, g: 0.7, sun: 14, mieTint: [0.8, 0.9, 1], fogColor: [0.3, 0.45, 0.9], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
 ];

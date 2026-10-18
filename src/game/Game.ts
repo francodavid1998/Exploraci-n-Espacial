@@ -8,8 +8,8 @@ import { BODIES, AU, LY, C_LIGHT, SUN_STAR, makeGenerator, type BodyDef } from '
 import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
-  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, bakeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture,
-  hardenBloomPass, hardenOutputPass, makeCoronaMaterial, makeOpticalDepthLut, patchShadowChunk,
+  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, bakeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture, bakeClouds, CubeReadback, CLOUD_DECODE, GasBaker,
+  hardenBloomPass, hardenOutputPass, makeCoronaMaterial, makeOpticalDepthLut, patchShadowChunk, PARSEC,
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
@@ -39,6 +39,10 @@ interface Body {
   marker: HTMLDivElement;
   label: HTMLDivElement;
   collapsed: boolean;
+  /** moons / planet that can eclipse this body's star (nearest first, at most 4) */
+  occluders: Body[];
+  /** Earth-type clouds read back from the GPU (cloud shadow over the player) */
+  cloudCPU?: CubeReadback;
   // stars only
   starMat?: THREE.ShaderMaterial;
   coronaMat?: THREE.ShaderMaterial;
@@ -95,11 +99,15 @@ const LIGHTS_KEY = 'helios-lights';
 
 const V = () => new THREE.Vector3();
 const ZERO = new THREE.Vector3();
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+/** cloud deck drift by cloud type (rad/s): Earth ~20 m/s winds, Venus' super-rotation, Titan's slow air */
+const CLOUD_DRIFT = [3e-6, 1.6e-5, 1e-6];
 /**
- * Graphics quality ladder (index 0 = best). The game starts at the top level and
- * steps down automatically while the frame rate stays under MIN_FPS; G cycles
- * the levels by hand (that choice is remembered and disables the automatic
- * fallback). The last level is the baseline that is known to run well.
+ * Graphics quality ladder (index 0 = best). The game starts at the top level (phones,
+ * and GPUs without the fast depth buffer, at 'Básica') and steps down automatically
+ * while the frame rate stays under MIN_FPS; G cycles the levels by hand (that choice
+ * is remembered and disables the automatic fallback). 'Básica' is the baseline known
+ * to run well on a desktop; 'Móvil' is the floor for phones.
  */
 export interface QualityLevel {
   name: string;
@@ -107,14 +115,22 @@ export interface QualityLevel {
   sceneScale: number;
   /** directional shadow map resolution */
   shadowMap: number;
-  /** atmosphere ray-march samples along the view ray (the Sun-ray depth comes from a table) */
+  /** atmosphere ray-march samples along the view ray (the Sun-ray depth comes from a table;
+   * the energy-conserving integration needs fewer steps than the old one for the same sky) */
   atmoSteps: number;
+  /** MSAA samples of the scene buffer */
+  msaa: number;
 }
 export const QUALITY_LEVELS: QualityLevel[] = [
-  { name: 'Alta', sceneScale: 1.5, shadowMap: 4096, atmoSteps: 24 },
-  { name: 'Media', sceneScale: 1.25, shadowMap: 4096, atmoSteps: 20 },
-  { name: 'Básica', sceneScale: 1, shadowMap: 2048, atmoSteps: 16 },
+  { name: 'Alta', sceneScale: 1.5, shadowMap: 4096, atmoSteps: 20, msaa: 4 },
+  { name: 'Media', sceneScale: 1.25, shadowMap: 4096, atmoSteps: 16, msaa: 4 },
+  { name: 'Básica', sceneScale: 1, shadowMap: 2048, atmoSteps: 12, msaa: 4 },
+  { name: 'Móvil', sceneScale: 0.85, shadowMap: 1024, atmoSteps: 8, msaa: 0 },
 ];
+/** level a phone (or a GPU on the slow logarithmic-depth path) starts at */
+const QUALITY_START_LOW = 2;
+/** true on touch-first devices (phones, tablets) */
+export const IS_TOUCH = typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches ?? false);
 const QUALITY_KEY = 'helios-quality';
 /** hemisphere-light intensity on the night side of rocky worlds: a "moonlit" grey (~30/255 on lunar soil) */
 const NIGHT_AMBIENT = 0.6;
@@ -160,6 +176,8 @@ export class Game {
   ship: ShipModel;
   astro: AstroModel;
   plasmaMat: THREE.ShaderMaterial;
+  /** paints the gas giant that fills the view (see GasBaker) */
+  private gasBaker: GasBaker;
 
   // state
   camWorld = V();
@@ -235,6 +253,10 @@ export class Game {
   mdy = 0;
   locked = false;
   menuOpen = false;
+  /** touch controls instead of mouse + pointer lock (phones, tablets) */
+  touchMode = false;
+  /** side of the painted cubemaps (clouds, gas giants, Milky Way) */
+  private bakeSize = 1024;
   /** false while the title screen is up: the simulation stays paused and M / Tab cannot open the map */
   started = false;
   onMenuToggle?: (open: boolean) => void;
@@ -289,6 +311,9 @@ export class Game {
     // Scene buffer at CSS resolution x sceneScale (integer sizes). The canvas
     // itself uses min(devicePixelRatio, 1.5) but only the cheap final pass runs
     // at that size. A remembered manual quality choice wins over the default.
+    // Phones and GPUs on the logarithmic-depth fallback (no EXT_clip_control: about a third
+    // of Android devices, Samsung Internet, Firefox) start lower; the watchdog adjusts.
+    if (IS_TOUCH || !reversedDepth) this.quality = QUALITY_START_LOW;
     try {
       const saved = localStorage.getItem(QUALITY_KEY);
       if (saved !== null && QUALITY_LEVELS[+saved]) { this.quality = +saved; this.qualityManual = true; }
@@ -296,7 +321,7 @@ export class Game {
     const q0 = QUALITY_LEVELS[this.quality];
     const bw = Math.max(1, Math.round(container.clientWidth * q0.sceneScale)), bh = Math.max(1, Math.round(container.clientHeight * q0.sceneScale));
     const rt = new THREE.WebGLRenderTarget(bw, bh, {
-      type: THREE.HalfFloatType, samples: 4,
+      type: THREE.HalfFloatType, samples: q0.msaa,
       // reversed depth only pays off with a float depth attachment (the key must be
       // absent, not undefined, on the logarithmic path: three rejects undefined)
       ...(reversedDepth ? { depthTexture: new THREE.DepthTexture(bw, bh, THREE.FloatType) } : {}),
@@ -319,8 +344,11 @@ export class Game {
     const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
     // sky (the Milky Way is baked once into a cubemap: static image, heavy shader)
-    this.stars = makeStars(14000);
-    this.milky = makeMilkyWay(bakeMilkyWay(r));
+    this.stars = makeStars();
+    // painted textures are smaller on phones (GPU memory): 512 px a face instead of 1024
+    const bakeSize = IS_TOUCH ? 512 : 1024;
+    this.bakeSize = bakeSize;
+    this.milky = makeMilkyWay(bakeMilkyWay(r, bakeSize));
     this.scene.add(this.stars, this.milky);
 
     // lights
@@ -342,6 +370,7 @@ export class Game {
     this.scene.add(this.hemi);
 
     this.plasmaMat = makePlasmaMaterial();
+    this.gasBaker = new GasBaker(this.bakeSize);
     this.createBodies();
     this.applyQuality(q0);
 
@@ -417,9 +446,10 @@ export class Game {
       const starAbs = V();
       let star: Body | null = null;
       if (def.kind === 'star') {
-        // angle = ecliptic longitude from +X, lat = ecliptic latitude (+Y = north), orbit = distance to the Sun
+        // angle = ecliptic longitude from +X towards -Z (right-handed sky, matches the star
+        // catalogue), lat = ecliptic latitude (+Y = north), orbit = distance to the Sun
         const lat = def.lat ?? 0;
-        starAbs.set(Math.cos(lat) * Math.cos(def.angle) * def.orbit, Math.sin(lat) * def.orbit, Math.cos(lat) * Math.sin(def.angle) * def.orbit);
+        starAbs.set(Math.cos(lat) * Math.cos(def.angle) * def.orbit, Math.sin(lat) * def.orbit, -Math.cos(lat) * Math.sin(def.angle) * def.orbit);
       } else if (def.parent) {
         const p = this.byId.get(def.parent)!;
         const inc = def.incl ?? 0;
@@ -441,7 +471,7 @@ export class Game {
       label.style.cssText = `position:absolute;left:10px;top:-7px;font-size:11px;color:${def.markerColor};text-shadow:0 0 4px #000;letter-spacing:.05em;`;
       marker.append(dot, label);
       this.markerLayer.appendChild(marker);
-      const b: Body = { def, pos: V(), local, star: null as unknown as Body, starAbs: star ? star.starAbs : starAbs, root, tiltQ, invRot, marker, label, collapsed: false };
+      const b: Body = { def, pos: V(), local, star: null as unknown as Body, starAbs: star ? star.starAbs : starAbs, root, tiltQ, invRot, marker, label, collapsed: false, occluders: [] };
       b.star = star ?? b;
 
       if (def.kind === 'star') {
@@ -511,6 +541,7 @@ export class Game {
         u.uG.value = a.g;
         u.uSun.value = a.sun;
         u.uMieTint.value.set(...a.mieTint);
+        if (a.ozone) u.uBetaO.value.set(a.ozone[0] * R, a.ozone[1] * R, a.ozone[2] * R);
         u.uLut.value = makeOpticalDepthLut(1 + a.height / R, a.HR / R, a.HM / R);
         b.atmo = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.atmoMat);
         b.atmo.scale.setScalar(R + a.height);
@@ -518,7 +549,24 @@ export class Game {
         root.add(b.atmo);
       }
       if (def.clouds) {
-        b.cloudMat = makeCloudMaterial(def.clouds.type);
+        // the pattern is painted once (Earth's fine weather needs 1024 px a face, Venus' and Titan's hazes 512)
+        const csize = def.clouds.type === 0 ? this.bakeSize : 512;
+        const crt = bakeClouds(this.renderer, def.clouds.type, csize);
+        const cmap = crt.texture;
+        b.cloudMat = makeCloudMaterial(def.clouds.type, cmap);
+        // sunlight reaching the deck comes from the body's own atmosphere model
+        const am = b.atmoMat?.uniforms;
+        if (am) for (const k of ['uRa', 'uBetaR', 'uBetaM', 'uBetaO', 'uLut']) b.cloudMat.uniforms[k] = am[k];
+        if (b.tUniforms && def.clouds.type === 0) {
+          // Earth: the clouds cast their shadows on the ground
+          b.terrain!.material.defines = { HELIOS_CLOUD_SHADOW: '' };
+          b.tUniforms.uCloudMap.value = cmap;
+          b.tUniforms.uCloudShellR.value = def.radius + def.clouds.alt;
+          b.tUniforms.uCloudCov.value = def.clouds.coverage;
+          b.tUniforms.uCloudOpac.value = def.clouds.opacity;
+          // the same clouds on the CPU, for the shadow over the player, ship and astronaut
+          b.cloudCPU = new CubeReadback(this.renderer, crt, csize);
+        }
         b.cloudMat.uniforms.uColor.value.set(...def.clouds.color);
         b.cloudMat.uniforms.uCoverage.value = def.clouds.coverage;
         b.cloudMat.uniforms.uOpacity.value = def.clouds.opacity;
@@ -532,6 +580,70 @@ export class Game {
     }
     this.refreshPositions();
     this.nearest = this.byId.get('earth')!;
+    // eclipse casters: a body's moons, its planet and sibling moons (orbits are static)
+    for (const b of this.bodies) {
+      if (b.def.kind === 'star') continue;
+      const reach = (o: Body) => o.def.radius / o.local.distanceTo(b.local); // apparent size
+      b.occluders = this.bodies
+        .filter((o) => o !== b && o.def.kind !== 'star' && o.star === b.star && o.local.distanceTo(b.local) < 5e9)
+        .sort((x, y) => reach(y) - reach(x))
+        .slice(0, 4);
+    }
+  }
+
+  /** Sunlight let through by body b's cloud deck at world point p (Earth-type weather only). */
+  private cloudShadowAt(b: Body, p: THREE.Vector3, sunDir: THREE.Vector3) {
+    const cl = b.def.clouds;
+    if (!cl || cl.type !== 0 || !b.clouds) return 1;
+    const rel = p.clone().sub(b.pos);
+    const r = rel.length(), Rc = b.def.radius + cl.alt;
+    const mu = rel.dot(sunDir) / r;
+    if (r >= Rc || mu <= 0) return 1;
+    if (!b.cloudCPU) return 1;
+    const q = rel.addScaledVector(sunDir, (Rc - r) / Math.max(mu, 0.05)).applyQuaternion(b.clouds.quaternion.clone().invert()).normalize();
+    const c = (b.cloudCPU.sample(q.x, q.y, q.z) - 0.5) * CLOUD_DECODE;
+    return 1 - 0.7 * smoothstep(cl.coverage, cl.coverage + 0.32, c) * cl.opacity;
+  }
+
+  /** Share of the star's disc visible from world point p, hidden by the occluders of body b. */
+  private eclipseAt(b: Body, p: THREE.Vector3) {
+    const toSun = this.sunBody.pos.clone().sub(p);
+    const dS = toSun.length();
+    toSun.divideScalar(dS);
+    const rs = Math.asin(Math.min(1, this.sunBody.def.radius / dS));
+    let vis = 1;
+    for (const o of b.occluders) {
+      const d = o.pos.clone().sub(p);
+      const dist = d.length();
+      if (d.dot(toSun) <= 0) continue;
+      const ro = Math.asin(Math.min(1, o.def.radius / dist));
+      const sep = Math.asin(Math.min(1, d.clone().cross(toSun).length() / dist));
+      const cover = clamp((ro + rs - sep) / (2 * Math.min(ro, rs)), 0, 1);
+      vis *= 1 - cover * cover * (3 - 2 * cover) * Math.min(1, (ro * ro) / (rs * rs));
+    }
+    return vis;
+  }
+
+  /**
+   * Eclipse uniforms of one material: occluders relative to the body centre, divided by
+   * `unit` (metres per material unit) and rotated by q into the material's space; origin
+   * is the body centre in that space. enabled = false clears them (the scene light of the
+   * player's own world already carries the eclipse).
+   */
+  private setEclipse(u: Record<string, THREE.IUniform>, body: Body, bSun: THREE.Vector3, unit: number, origin: THREE.Vector3, q: THREE.Quaternion | null, enabled = true) {
+    (u.uEclOrigin.value as THREE.Vector3).copy(origin);
+    const occ = u.uOcc.value as THREE.Vector4[];
+    const v = new THREE.Vector3();
+    for (let i = 0; i < 4; i++) {
+      const o = enabled ? body.occluders[i] : undefined;
+      if (!o) { occ[i].set(0, 0, 0, 0); continue; }
+      v.copy(o.pos).sub(body.pos);
+      if (q) v.applyQuaternion(q);
+      occ[i].set(v.x / unit, v.y / unit, v.z / unit, o.def.radius / unit);
+    }
+    (u.uEclSun.value as THREE.Vector3).copy(bSun);
+    if (q) (u.uEclSun.value as THREE.Vector3).applyQuaternion(q);
+    u.uEclSunR.value = Math.asin(Math.min(1, this.sunBody.def.radius / this.sunBody.pos.distanceTo(body.pos)));
   }
 
   /** Express every body position in the current frame (relative to the star lighting the scene). */
@@ -573,8 +685,14 @@ export class Game {
     this.renderer.domElement.addEventListener('click', this.requestLock);
     this.renderer.domElement.addEventListener('wheel', this.onWheel, { passive: true });
   }
+  /** camera / steering drag from the touch controls (pixels, like mouse movement) */
+  touchLook(dx: number, dy: number) {
+    this.mdx += dx;
+    this.mdy += dy;
+    if (Math.abs(dx) + Math.abs(dy) > 2) this.lastMouseMove = this.time;
+  }
   requestLock = () => {
-    if (this.menuOpen || this.dead) return;
+    if (this.menuOpen || this.dead || this.touchMode) return;
     const el = this.renderer.domElement as HTMLCanvasElement & { requestPointerLock: () => Promise<void> | void };
     try {
       const p = el.requestPointerLock();
@@ -621,6 +739,9 @@ export class Game {
   /** Apply a quality level: scene buffer scale, shadow map size, atmosphere ray-march steps. */
   private applyQuality(q: QualityLevel) {
     const w = this.container.clientWidth, h = this.container.clientHeight;
+    for (const t of [this.composer.renderTarget1, this.composer.renderTarget2]) {
+      if (t.samples !== q.msaa) { t.samples = q.msaa; t.dispose(); } // reallocated on next use
+    }
     this.composer.setSize(Math.max(1, Math.round(w * q.sceneScale)), Math.max(1, Math.round(h * q.sceneScale)));
     const sh = this.light.shadow;
     if (sh.mapSize.x !== q.shadowMap) {
@@ -788,7 +909,70 @@ export class Game {
       odM += Math.exp(-h / a.HM) * ds;
     }
     const m = a.betaM * 1.1 * odM;
-    return out.set(Math.exp(-(a.betaR[0] * odR + m)), Math.exp(-(a.betaR[1] * odR + m)), Math.exp(-(a.betaR[2] * odR + m)));
+    const oz = a.ozone ?? [0, 0, 0];
+    return out.set(
+      Math.exp(-((a.betaR[0] + oz[0]) * odR + m)),
+      Math.exp(-((a.betaR[1] + oz[1]) * odR + m)),
+      Math.exp(-((a.betaR[2] + oz[2]) * odR + m)),
+    );
+  }
+
+  /**
+   * Sky radiance seen from `ro` (relative to the centre of body `b`, metres) along `dir`:
+   * the same single-scattering model and units as the atmosphere shader, so the haze
+   * painted with it matches the sky behind it. A small CPU march, a few rays per frame.
+   */
+  private skyRadiance(b: Body, ro: THREE.Vector3, dir: THREE.Vector3, sunDir: THREE.Vector3, sun: number, out: THREE.Vector3) {
+    out.set(0, 0, 0);
+    const a = b.def.atmo;
+    if (!a) return out;
+    const R = b.def.radius, Ra = R + a.height;
+    const bq = ro.dot(dir), r2 = ro.lengthSq();
+    const disc = bq * bq - (r2 - Ra * Ra);
+    if (disc <= 0) return out;
+    const t0 = Math.max(-bq - Math.sqrt(disc), 0);
+    let t1 = -bq + Math.sqrt(disc);
+    const dg = bq * bq - (r2 - R * R);
+    if (dg > 0 && -bq - Math.sqrt(dg) > 0) t1 = Math.min(t1, -bq - Math.sqrt(dg));
+    if (t1 <= t0) return out;
+    const oz = a.ozone ?? [0, 0, 0];
+    const mu = dir.dot(sunDir), g = a.g;
+    const phR = (3 / (16 * Math.PI)) * (1 + mu * mu);
+    const phM = ((3 / (8 * Math.PI)) * ((1 - g * g) * (1 + mu * mu))) / ((2 + g * g) * Math.pow(Math.max(1 + g * g - 2 * g * mu, 1e-4), 1.5));
+    // energy-conserving integration (each segment's in-scatter integrated exactly for
+    // its density): long horizon paths get no colour bias from coarse steps
+    const NS = 16, NL = 6, ds = (t1 - t0) / NS;
+    const L = [0, 0, 0], Tv = [1, 1, 1];
+    const p = new THREE.Vector3(), q = new THREE.Vector3();
+    for (let i = 0; i < NS; i++) {
+      p.copy(ro).addScaledVector(dir, t0 + ds * (i + 0.5));
+      const r = p.length(), h = Math.max(r - R, 0);
+      const rR = Math.exp(-h / a.HR), rM = Math.exp(-h / a.HM);
+      // sunlight reaching this point, hidden by the planet over the Sun's own diameter
+      const muS = p.dot(sunDir) / r;
+      const muHor = -Math.sqrt(Math.max(0, 1 - (R * R) / (r * r)));
+      const vis = smoothstep(muHor - 0.0047, muHor + 0.0047, muS);
+      let lR = 0, lM = 0;
+      if (vis > 0) {
+        const bS = r * muS;
+        const dsl = (-bS + Math.sqrt(Math.max(0, bS * bS - (r * r - Ra * Ra)))) / NL;
+        for (let k = 0; k < NL; k++) {
+          q.copy(p).addScaledVector(sunDir, dsl * (k + 0.5));
+          const hq = Math.max(q.length() - R, 0);
+          lR += Math.exp(-hq / a.HR) * dsl;
+          lM += Math.exp(-hq / a.HM) * dsl;
+        }
+      }
+      for (let c = 0; c < 3; c++) {
+        const ext = (a.betaR[c] + oz[c]) * rR + a.betaM * 1.1 * rM;
+        const attS = vis > 0 ? Math.exp(-((a.betaR[c] + oz[c]) * lR + a.betaM * 1.1 * lM)) * vis : 0;
+        const S = (a.betaR[c] * rR * phR + a.betaM * rM * phM * a.mieTint[c]) * attS;
+        const segT = Math.exp(-ext * ds);
+        L[c] += S * Tv[c] * (ext * ds < 1e-4 ? ds : (1 - segT) / ext);
+        Tv[c] *= segT;
+      }
+    }
+    return out.set(sun * L[0], sun * L[1], sun * L[2]);
   }
 
   /** Distance from the current star expressed in "Sun-equivalent AU": the distance from the Sun that would give the same irradiance. */
@@ -1282,6 +1466,10 @@ export class Game {
     const dAU = this.starAU(sunDist);
     const sunI = 3.3 * Math.pow(1 / Math.max(dAU * dAU, 0.05), 0.3);
 
+    // world -> view rotation (the camera sits at the origin), for lights given in view space
+    const toView = this.camera.quaternion.clone().invert();
+    const lightTint = starDef.lightTint;
+
     // body placement & uniforms
     for (const body of this.bodies) {
       body.root.position.copy(body.pos).sub(cw);
@@ -1303,15 +1491,15 @@ export class Game {
       if (body.gasMat) {
         const u = body.gasMat.uniforms;
         u.uCenter.value.copy(rel).divideScalar(bR);
-        u.uInvRot.value.copy(body.invRot);
+        // the planet turns as a whole at its real rate (Jupiter: once every 9.9 h)
+        const spinQ = body.tiltQ.clone().multiply(new THREE.Quaternion().setFromAxisAngle(Y_AXIS, this.time * (body.def.spin ?? 0)));
+        u.uInvRot.value.setFromMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(spinQ.invert()));
         u.uSunDir.value.copy(bSun);
         u.uSunI.value = bSunI * 0.95;
-        u.uTime.value = this.time;
+        this.setEclipse(u, body, bSun, bR, ZERO, null);
         const inside = rel.length() < bR * 1.002;
-        const mesh = body.root.children[0] as THREE.Mesh;
         const side = inside ? THREE.BackSide : THREE.FrontSide;
         if (body.gasMat.side !== side) { body.gasMat.side = side; body.gasMat.needsUpdate = true; }
-        void mesh;
       }
       if (body.ringMat) {
         const u = body.ringMat.uniforms;
@@ -1325,14 +1513,25 @@ export class Game {
         const u = body.cloudMat.uniforms;
         u.uSunDir.value.copy(bSun);
         u.uSunI.value = bSunI * 0.9;
-        u.uTime.value = this.time;
         u.uBelow.value = rel.length() < bR + body.def.clouds!.alt ? 1 : 0;
+        u.uShellR.value = (bR + body.def.clouds!.alt) / bR;
+        u.uNightAmb.value.set(0, 0, 0); // the player's own sky sets it below
+        this.setEclipse(u, body, bSun, bR, ZERO, null);
+        // the weather drifts with the wind (Venus' cloud deck super-rotates at ~100 m/s)
+        const drift = CLOUD_DRIFT[body.def.clouds!.type] ?? 0;
+        body.clouds!.quaternion.copy(body.tiltQ).multiply(new THREE.Quaternion().setFromAxisAngle(Y_AXIS, this.time * drift));
       }
       if (body.tUniforms) {
         const u = body.tUniforms;
         u.uDetailOffset.value.set(posMod(cw.x - body.pos.x, 256), posMod(cw.y - body.pos.y, 256), posMod(cw.z - body.pos.z, 256));
         u.uFogDensity.value = 0;
         u.uNight.value = 0;
+        // seen from afar, a world is lit by its own sunlight, not by the scene light that
+        // fades out at the player's night (the Moon must shine in Earth's night sky)
+        u.uDirScale.value = 0;
+        u.uFarSun.value.set(lightTint[0] * bSunI, lightTint[1] * bSunI, lightTint[2] * bSunI);
+        u.uFarSunDir.value.copy(bSun).applyQuaternion(toView);
+        this.setEclipse(u as unknown as Record<string, THREE.IUniform>, body, bSun, 1, rel.clone().applyQuaternion(toView), toView);
       }
       if (body.waterMat) {
         const u = body.waterMat.uniforms;
@@ -1340,6 +1539,7 @@ export class Game {
         u.uTime.value = this.time;
         u.uSunDir.value.copy(bSun);
         u.uFogDensity.value = 0;
+        this.setEclipse(u, body, bSun, 1, rel, null);
         // its own sunlight and daytime sky (the shader fades the sky with the water's own sun elevation);
         // the nearest body overrides these below with the local values and the night floor
         const tint = starDef.lightTint;
@@ -1392,23 +1592,51 @@ export class Game {
     // horizon instead; the shadow map keeps handling daytime shadows.
     if (camAlt < 3000 && def.kind !== 'star') shadowF = smoothstep(-0.035, 0.005, sunEl);
     const lc = new THREE.Color(...starDef.lightTint);
-    let li = sunI;
+    // an eclipse over the player (a moon in front of the Sun, or the planet's shadow on a
+    // moon) dims the sunlight, the sky and the haze together
+    const ecl = def.kind === 'star' ? 1 : this.eclipseAt(b, cw);
+    if (b.atmoMat) b.atmoMat.uniforms.uSun.value *= ecl;
+    // a cloud between the player and the Sun shades everything around them (the ground
+    // further away gets its own cloud shadows in the terrain shader)
+    const cloudCam = this.cloudShadowAt(b, cw, sunDir);
+    let li = sunI * ecl * cloudCam;
     let fogDensity = 0;
     const fogC = new THREE.Color(0, 0, 0);
+    // horizon sky towards the Sun, across and away from it (linear radiance), and the
+    // Sun's azimuth; turned into the haze colour law below
+    const l0 = new THREE.Vector3(), l90 = new THREE.Vector3(), l180 = new THREE.Vector3();
+    const sunAz = sunDir.clone().addScaledVector(up, -sunEl);
+    if (sunAz.lengthSq() < 1e-10) sunAz.set(up.y, -up.x, 0).add(new THREE.Vector3(0, up.z, -up.y));
+    sunAz.normalize();
     let hemiI = 0;
     let starAlpha = 1;
     const a = def.atmo;
     if (a && def.kind === 'rocky') {
       const dens = Math.exp(-Math.max(0, camAlt) / a.HR);
       const day = smoothstep(-0.12, 0.25, sunEl);
-      const lowSun = smoothstep(0.35, -0.02, sunEl) * dens;
-      if (def.id === 'earth') lc.setRGB(1, 1 - 0.45 * lowSun, 1 - 0.75 * lowSun);
-      if (def.id === 'mars') lc.setRGB(1, 1 - 0.15 * lowSun, 1 - 0.25 * lowSun);
-      fogDensity = a.fogDensity * dens;
+      // Sunlight crossing the air above the player: golden, then deep red and dim at sunset
+      // (blue on Mars, whose dust scatters red). Normalised by the zenith path, so the
+      // daylight colour at noon stays exactly as before.
+      const tS = this.atmoTransmittance(b, sunDir, new THREE.Vector3());
+      const tZ = this.atmoTransmittance(b, up, new THREE.Vector3());
+      lc.setRGB(lc.r * Math.min(1, tS.x / tZ.x), lc.g * Math.min(1, tS.y / tZ.y), lc.b * Math.min(1, tS.z / tZ.z));
+      // Aerial perspective: the haze is the horizon sky itself, sampled towards the Sun,
+      // across and away from it (as seen from the top of the air when in orbit)
+      fogDensity = a.fogDensity;
       fogC.setRGB(a.fogColor[0], a.fogColor[1], a.fogColor[2]).multiplyScalar((day * 0.42 + 0.004) * sunI * Math.min(1, a.skyBrightness + 0.2));
-      if (def.id === 'earth') fogC.lerp(new THREE.Color(0.9, 0.5, 0.3).multiplyScalar(sunI * 0.25), lowSun * day * 0.6);
+      const ro = cw.clone().sub(b.pos);
+      if (ro.length() > def.radius + a.height) ro.setLength(def.radius + a.height - 1);
+      const skySun = a.sun * Math.pow(1 / Math.max(dAU * dAU, 0.05), 0.3) * ecl;
+      this.skyRadiance(b, ro, sunAz, sunDir, skySun, l0);
+      this.skyRadiance(b, ro, sunAz.clone().negate(), sunDir, skySun, l180);
+      this.skyRadiance(b, ro, new THREE.Vector3().crossVectors(up, sunAz), sunDir, skySun, l90);
       hemiI = day * dens * 0.9 * a.skyBrightness;
-      starAlpha = 1 - day * Math.min(1, dens * 1.2) * a.skyBrightness;
+      // stars come out as the sky overhead really darkens (twilight), never in daylight,
+      // even on a mountain top
+      // (zenith luminance: ~0.14 by day, 0.005 with the Sun 3° below the horizon, 2e-4 at -6°)
+      const lz = this.skyRadiance(b, ro, up, sunDir, skySun, new THREE.Vector3());
+      const zenY = Math.max(0.2126 * lz.x + 0.7152 * lz.y + 0.0722 * lz.z, 1e-9);
+      starAlpha = 1 - smoothstep(Math.log(1e-4), Math.log(0.01), Math.log(zenY));
       if (def.clouds && (def.id === 'venus' || def.id === 'titan')) {
         const below = camAlt < def.clouds.alt - def.clouds.thickness;
         if (below) {
@@ -1417,6 +1645,8 @@ export class Game {
           hemiI = (def.id === 'venus' ? 1.2 : 0.8) * day;
           starAlpha = 0;
           fogC.setRGB(a.fogColor[0], a.fogColor[1], a.fogColor[2]).multiplyScalar(sunI * 0.12 * (0.15 + day));
+          // under the cloud deck the sky is a dim, even orange glow
+          l0.set(fogC.r, fogC.g, fogC.b); l90.copy(l0); l180.copy(l0);
         }
         const mid = def.clouds.alt - def.clouds.thickness / 2;
         const f = 1 - Math.abs(camAlt - mid) / (def.clouds.thickness / 2);
@@ -1488,16 +1718,51 @@ export class Game {
     this.hemi.position.copy(up);
     this.stars.material instanceof THREE.ShaderMaterial && (this.stars.material.uniforms.uAlpha.value = starAlpha);
     (this.stars.material as THREE.ShaderMaterial).uniforms.uPR.value = this.renderer.getPixelRatio();
+    // the catalogue stars are seen from where the player really is (parallax towards Proxima)
+    (this.stars.material as THREE.ShaderMaterial).uniforms.uViewer.value.copy(this.sunBody.starAbs).add(cw).divideScalar(PARSEC);
     (this.milky.material as THREE.ShaderMaterial).uniforms.uAlpha.value = starAlpha;
+    // Haze colour by azimuth a from the Sun: exp(A + B cos a + C cos 2a) through the three
+    // samples. Fitting the logarithm keeps it positive and follows the sharp glow around a
+    // low Sun (a linear fit went negative in between and left black or pure blue patches).
+    const lg = (v: THREE.Vector3) => new THREE.Vector3(Math.log(Math.max(v.x, 1e-7)), Math.log(Math.max(v.y, 1e-7)), Math.log(Math.max(v.z, 1e-7)));
+    const g0 = lg(l0), g90 = lg(l90), g180 = lg(l180);
+    const gfb = g0.clone().add(g180).multiplyScalar(0.5);
+    const hzA = gfb.clone().add(g90).multiplyScalar(0.5);
+    const hzB = g0.clone().sub(g180).multiplyScalar(0.5);
+    const hzC = gfb.clone().sub(g90).multiplyScalar(0.5);
+    // aerial perspective of the ground under the player (terrain: view space, water: world space)
+    const setHaze = (u: Record<string, THREE.IUniform>, q: THREE.Quaternion | null) => {
+      u.uFogDensity.value = fogDensity;
+      u.uFogH.value = a ? Math.max(a.HM * 1.5, 1500) : 1500;
+      u.uFogCamH.value = camAlt;
+      u.uPlanetR.value = def.radius;
+      u.uHzCenter.value.copy(b.pos).sub(cw);
+      u.uHzUp.value.copy(up);
+      u.uHzSunAz.value.copy(sunAz);
+      if (q) for (const k of ['uHzCenter', 'uHzUp', 'uHzSunAz']) (u[k].value as THREE.Vector3).applyQuaternion(q);
+      u.uFogA.value.copy(hzA); u.uFogB.value.copy(hzB); u.uFogC.value.copy(hzC);
+    };
     if (b.tUniforms) {
-      b.tUniforms.uFogDensity.value = fogDensity;
-      b.tUniforms.uFogColor.value.set(fogC.r, fogC.g, fogC.b);
+      setHaze(b.tUniforms as unknown as Record<string, THREE.IUniform>, toView);
       b.tUniforms.uNight.value = nightFloor / NIGHT_AMBIENT;
+      // the ground under the player uses the scene light (its horizon fade and shadow map)
+      b.tUniforms.uDirScale.value = 1;
+      b.tUniforms.uFarSun.value.set(0, 0, 0);
+      if (b.clouds && b.def.clouds?.type === 0) {
+        const q = b.clouds.quaternion.clone().invert().multiply(this.camera.quaternion); // view -> cloud frame
+        b.tUniforms.uCloudRotView.value.setFromMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(q));
+        b.tUniforms.uCloudCam.value = cloudCam;
+      }
+    }
+    // clouds of the player's world catch the same moonlit glow as the ground at night
+    if (b.cloudMat) {
+      const nf = nightFloor * 0.06;
+      b.cloudMat.uniforms.uNightAmb.value.set(0.55 * nf, 0.62 * nf, 0.8 * nf);
     }
     if (b.waterMat) {
       const u = b.waterMat.uniforms;
-      u.uFogDensity.value = fogDensity;
-      u.uFogColor.value.set(fogC.r, fogC.g, fogC.b);
+      setHaze(u, null);
+      this.setEclipse(u, b, sunDir, 1, ZERO, null, false); // carried by the scene light
       u.uSunColor.value.set(lc.r * li, lc.g * li, lc.b * li);
       const sky = a ? new THREE.Color(...a.fogColor).multiplyScalar(sunI * 0.3 + 0.005) : new THREE.Color(0, 0, 0);
       u.uSky.value.set(sky.r, sky.g, sky.b); // daytime sky; faded per fragment by the water's own sun elevation
@@ -1638,6 +1903,29 @@ export class Game {
     this.overlay.visible = a > 0.001;
   }
 
+  /** Paint the gas giant that looks biggest, a strip per frame, once it is big on screen. */
+  private updateGasBake() {
+    let best: Body | null = null, bestAng = 0.05; // ~6° across: below that the live shader costs little
+    for (const b of this.bodies) {
+      if (!b.gasMat) continue;
+      const ang = b.def.radius / Math.max(b.pos.distanceTo(this.camWorld), b.def.radius);
+      if (ang > bestAng) { bestAng = ang; best = b; }
+    }
+    const gb = this.gasBaker;
+    if (!best) return;
+    if (gb.target !== best) {
+      const prev = gb.target as Body | null;
+      if (prev?.gasMat) prev.gasMat.uniforms.uBaked.value = 0;
+      gb.start(best, best.def.gasType ?? 0);
+    }
+    if (!gb.ready && gb.advance(this.renderer)) {
+      const u = best.gasMat!.uniforms;
+      u.uBake.value = gb.rt.texture;
+      u.uBakeSize.value = gb.size;
+      u.uBaked.value = 1;
+    }
+  }
+
   private updateTerrain() {
     const cw = this.camWorld;
     const sorted = this.bodies
@@ -1709,7 +1997,7 @@ export class Game {
     this.lastT = t;
     this.time += dt;
     this.frame++;
-    if (!this.locked) { this.mdx = 0; this.mdy = 0; }
+    if (!this.locked && !this.touchMode) { this.mdx = 0; this.mdy = 0; }
 
     if (this.pressed.has('KeyF')) { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
     if (this.pressed.has('KeyL')) {
@@ -1740,6 +2028,7 @@ export class Game {
     this.updateCamera(dt);
     this.updateTerrain();
     this.updateScene(dt);
+    this.updateGasBake();
     this.updateMarkers();
     this.composer.render();
     this.mdx = 0;
