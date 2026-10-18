@@ -41,6 +41,16 @@ export const PROXIMA_STAR: StarDef = {
   surface: { gran: 0.55, spots: 0.9, spotsAll: 0.85, flare: 1.0, rot: 0.015 },
   corona: [1.0, 0.3, 0.12], coronaIntensity: 1.8, // violent flare star
 };
+/** TRAPPIST-1: M8V ultracool dwarf, barely larger than Jupiter (Teff 2 566 K, L 0.055 % L☉, Agol et al. 2021). */
+export const TRAPPIST_STAR: StarDef = {
+  luminosity: 0.000553, teff: 2566,
+  colorLimb: [0.5, 0.06, 0.015], colorCenter: [1.0, 0.27, 0.07],
+  glowStops: [[255, 105, 55], [230, 60, 24], [185, 34, 10], [130, 20, 6]],
+  glowTint: [1, 0.26, 0.09], lightTint: [1, 0.62, 0.38], intensity: 3, glowIntensity: 1.0,
+  // fully convective, spotted, flares every few hours (gentler than Proxima's)
+  surface: { gran: 0.6, spots: 0.75, spotsAll: 0.8, flare: 0.6, rot: 0.02 },
+  corona: [1.0, 0.28, 0.1], coronaIntensity: 1.4,
+};
 
 export type BodyKind = 'star' | 'rocky' | 'gas';
 
@@ -106,6 +116,8 @@ export interface BodyDef {
   clouds?: CloudDef;
   gasType?: number;
   rings?: number; // 0 saturn 1 uranus 2 neptune
+  /** geometric albedo: how bright the body looks as a point of light in the sky */
+  albedo?: number;
   /** rotation of a gas giant's cloud tops (rad/s, negative = retrograde) */
   spin?: number;
   hazard?: { suitDrain: number; text: string };
@@ -122,7 +134,7 @@ export const BODIES: BodyDef[] = [
     tilt: 0.126, scaleHeight: 1, markerColor: '#ffd36b', seed: 1, star: SUN_STAR,
   },
   {
-    id: 'mercury', name: 'Mercurio', kind: 'rocky', radius: 2439.7e3, orbit: 0.387 * AU, angle: 0.55, gravity: 3.7, tempC: 167,
+    id: 'mercury', albedo: 0.14, name: 'Mercurio', kind: 'rocky', radius: 2439.7e3, orbit: 0.387 * AU, angle: 0.55, gravity: 3.7, tempC: 167,
     tempText: '−173 °C (noche) a 427 °C (día)', pressure: 0, composition: 'Exosfera casi nula (O, Na, H, He, K)',
     description: 'El planeta más pequeño y cercano al Sol. Superficie antigua saturada de cráteres, sin atmósfera real.',
     facts: ['Un día solar dura 176 días terrestres', 'Núcleo de hierro enorme (~85% del radio)', 'Escarpes lobulados por contracción del planeta'],
@@ -130,7 +142,7 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 0.6, text: 'Radiación solar y temperatura extremas' },
   },
   {
-    id: 'venus', name: 'Venus', kind: 'rocky', radius: 6051.8e3, orbit: 0.723 * AU, angle: 2.25, gravity: 8.87, tempC: 464,
+    id: 'venus', albedo: 0.69, name: 'Venus', kind: 'rocky', radius: 6051.8e3, orbit: 0.723 * AU, angle: 2.25, gravity: 8.87, tempC: 464,
     tempText: '464 °C en superficie', pressure: 92, composition: 'CO₂ 96,5% · N₂ 3,5% · nubes de ácido sulfúrico',
     description: 'Efecto invernadero desbocado. Presión 92 veces la terrestre, nubes de ácido sulfúrico entre 48 y 70 km.',
     facts: ['El planeta más caliente del sistema solar', 'Rota al revés y muy lento (243 días)', 'Las sondas Venera sobrevivieron solo minutos en la superficie'],
@@ -140,7 +152,7 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 6, text: '92 bar y 464 °C: el traje no resistirá' },
   },
   {
-    id: 'earth', name: 'Tierra', kind: 'rocky', radius: 6371e3, orbit: 1.0 * AU, angle: 0, gravity: 9.81, tempC: 15,
+    id: 'earth', albedo: 0.37, name: 'Tierra', kind: 'rocky', radius: 6371e3, orbit: 1.0 * AU, angle: 0, gravity: 9.81, tempC: 15,
     tempText: '−89 °C a 57 °C (media 15 °C)', pressure: 1, composition: 'N₂ 78% · O₂ 21% · Ar 0,9%',
     description: 'Nuestro hogar. El único mundo conocido con agua líquida en superficie y vida.',
     facts: ['71% de la superficie cubierta por océanos', 'Campo magnético que protege del viento solar', 'Edad: ~4 540 millones de años'],
@@ -150,14 +162,14 @@ export const BODIES: BodyDef[] = [
   },
   {
     // angle 0.55: waxing gibbous (~148° from the Sun, 93% lit), high in Earth's night sky
-    id: 'moon', name: 'Luna', kind: 'rocky', radius: 1737.4e3, parent: 'earth', orbit: 384400e3, angle: 0.55, incl: 0.09, gravity: 1.62, tempC: -20,
+    id: 'moon', albedo: 0.12, name: 'Luna', kind: 'rocky', radius: 1737.4e3, parent: 'earth', orbit: 384400e3, angle: 0.55, incl: 0.09, gravity: 1.62, tempC: -20,
     tempText: '−173 °C (noche) a 127 °C (día)', pressure: 0, composition: 'Sin atmósfera (exosfera de He, Ar, Na)',
     description: 'El único satélite natural de la Tierra. Mares de basalto oscuro y tierras altas cubiertas de cráteres.',
     facts: ['12 humanos la han pisado (Apolo 1969-1972)', 'Siempre muestra la misma cara a la Tierra', 'Se aleja 3,8 cm por año'],
     tilt: 0, scaleHeight: 1, markerColor: '#d9d9d9', seed: 44,
   },
   {
-    id: 'mars', name: 'Marte', kind: 'rocky', radius: 3389.5e3, orbit: 1.524 * AU, angle: 0.95, gravity: 3.71, tempC: -63,
+    id: 'mars', albedo: 0.17, name: 'Marte', kind: 'rocky', radius: 3389.5e3, orbit: 1.524 * AU, angle: 0.95, gravity: 3.71, tempC: -63,
     tempText: '−125 °C a 20 °C (media −63 °C)', pressure: 0.006, composition: 'CO₂ 95% · N₂ 2,8% · Ar 2%',
     description: 'El planeta rojo. Óxido de hierro, el volcán más alto del sistema solar y casquetes polares de hielo.',
     facts: ['Monte Olimpo: 21,9 km de altura', 'Valles Marineris: 4 000 km de largo', 'Los atardeceres marcianos son azules'],
@@ -167,21 +179,21 @@ export const BODIES: BodyDef[] = [
   },
   {
     // angle 2.4: sunlit (at 1.2 it sat inside Mars's shadow for good once eclipses existed)
-    id: 'phobos', name: 'Fobos', kind: 'rocky', radius: 11.27e3, parent: 'mars', orbit: 9376e3, angle: 2.4, gravity: 0.0057, tempC: -40,
+    id: 'phobos', albedo: 0.07, name: 'Fobos', kind: 'rocky', radius: 11.27e3, parent: 'mars', orbit: 9376e3, angle: 2.4, gravity: 0.0057, tempC: -40,
     tempText: '−112 °C a −4 °C', pressure: 0, composition: 'Sin atmósfera',
     description: 'Luna irregular de Marte, probablemente un asteroide capturado. Dominada por el cráter Stickney.',
     facts: ['Orbita Marte 3 veces al día', 'Caerá sobre Marte en ~50 millones de años', 'Un salto puede casi escapar de su gravedad'],
     tilt: 0, scaleHeight: 1, markerColor: '#a59a8f', seed: 66,
   },
   {
-    id: 'deimos', name: 'Deimos', kind: 'rocky', radius: 6.2e3, parent: 'mars', orbit: 23463e3, angle: 4.0, gravity: 0.003, tempC: -40,
+    id: 'deimos', albedo: 0.07, name: 'Deimos', kind: 'rocky', radius: 6.2e3, parent: 'mars', orbit: 23463e3, angle: 4.0, gravity: 0.003, tempC: -40,
     tempText: '≈ −40 °C', pressure: 0, composition: 'Sin atmósfera',
     description: 'La luna más pequeña de Marte, cubierta de regolito suave.',
     facts: ['Período orbital: 30,3 horas', 'Velocidad de escape: 5,6 m/s', 'Descubierta en 1877'],
     tilt: 0, scaleHeight: 1, markerColor: '#b5a99c', seed: 77,
   },
   {
-    id: 'jupiter', name: 'Júpiter', kind: 'gas', radius: 69911e3, orbit: 5.203 * AU, angle: -0.6, gravity: 24.79, tempC: -110,
+    id: 'jupiter', albedo: 0.52, name: 'Júpiter', kind: 'gas', radius: 69911e3, orbit: 5.203 * AU, angle: -0.6, gravity: 24.79, tempC: -110,
     tempText: '−110 °C en las nubes · aumenta con la profundidad', pressure: 1, composition: 'H₂ 90% · He 10% · CH₄, NH₃',
     description: 'El gigante gaseoso. No tiene superficie: la presión y la temperatura aumentan hasta aplastar cualquier nave.',
     facts: ['La Gran Mancha Roja es más grande que la Tierra', 'La sonda Galileo dejó de transmitir a ~23 bar', 'Hidrógeno metálico en su interior'],
@@ -191,7 +203,7 @@ export const BODIES: BodyDef[] = [
   {
     // angle 2.6164: Io is transiting Jupiter's day side, its shadow (a black disc ~3 000 km
     // across with a soft edge) falls on the cloud bands as in the Juno and Hubble images
-    id: 'io', name: 'Ío', kind: 'rocky', radius: 1821.6e3, parent: 'jupiter', orbit: 421700e3, angle: 2.6164, gravity: 1.796, tempC: -143,
+    id: 'io', albedo: 0.63, name: 'Ío', kind: 'rocky', radius: 1821.6e3, parent: 'jupiter', orbit: 421700e3, angle: 2.6164, gravity: 1.796, tempC: -143,
     tempText: '−143 °C (lagos de lava a 1 600 °C)', pressure: 0, composition: 'SO₂ muy tenue',
     description: 'El cuerpo con más actividad volcánica del sistema solar, calentado por las mareas de Júpiter.',
     facts: ['Más de 400 volcanes activos', 'Penachos de azufre de hasta 500 km', 'Radiación letal del cinturón de Júpiter'],
@@ -199,7 +211,7 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 1.2, text: 'Radiación intensa de Júpiter (36 Sv/día)' },
   },
   {
-    id: 'europa', name: 'Europa', kind: 'rocky', radius: 1560.8e3, parent: 'jupiter', orbit: 671034e3, angle: 2.1, gravity: 1.315, tempC: -160,
+    id: 'europa', albedo: 0.67, name: 'Europa', kind: 'rocky', radius: 1560.8e3, parent: 'jupiter', orbit: 671034e3, angle: 2.1, gravity: 1.315, tempC: -160,
     tempText: '−220 °C a −160 °C', pressure: 0, composition: 'O₂ extremadamente tenue',
     description: 'Corteza de hielo surcada de grietas sobre un océano global de agua salada.',
     facts: ['Superficie más lisa del sistema solar', 'Océano con el doble de agua que la Tierra', 'Las líneas rojizas son sales y azufre'],
@@ -207,21 +219,21 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 0.5, text: 'Radiación de Júpiter (5,4 Sv/día)' },
   },
   {
-    id: 'ganymede', name: 'Ganímedes', kind: 'rocky', radius: 2634.1e3, parent: 'jupiter', orbit: 1070412e3, angle: 3.6, gravity: 1.428, tempC: -160,
+    id: 'ganymede', albedo: 0.43, name: 'Ganímedes', kind: 'rocky', radius: 2634.1e3, parent: 'jupiter', orbit: 1070412e3, angle: 3.6, gravity: 1.428, tempC: -160,
     tempText: '−203 °C a −121 °C', pressure: 0, composition: 'O₂ extremadamente tenue',
     description: 'La luna más grande del sistema solar, mayor que Mercurio. Terrenos oscuros antiguos y surcos brillantes.',
     facts: ['Única luna con campo magnético propio', 'Probable océano subterráneo', 'Diámetro: 5 268 km'],
     tilt: 0, scaleHeight: 1, markerColor: '#bdb2a3', seed: 122,
   },
   {
-    id: 'callisto', name: 'Calisto', kind: 'rocky', radius: 2410.3e3, parent: 'jupiter', orbit: 1882709e3, angle: 5.1, gravity: 1.235, tempC: -139,
+    id: 'callisto', albedo: 0.22, name: 'Calisto', kind: 'rocky', radius: 2410.3e3, parent: 'jupiter', orbit: 1882709e3, angle: 5.1, gravity: 1.235, tempC: -139,
     tempText: '−193 °C a −108 °C', pressure: 0, composition: 'CO₂ muy tenue',
     description: 'La superficie más craterizada del sistema solar. Oscura, antigua y geológicamente muerta.',
     facts: ['Cuenca de impacto Valhalla: 3 800 km', 'Fuera del cinturón de radiación intenso', 'Superficie de ~4 000 millones de años'],
     tilt: 0, scaleHeight: 1, markerColor: '#8f8273', seed: 133,
   },
   {
-    id: 'saturn', name: 'Saturno', kind: 'gas', radius: 58232e3, orbit: 9.537 * AU, angle: 2.55, gravity: 10.44, tempC: -140,
+    id: 'saturn', albedo: 0.47, name: 'Saturno', kind: 'gas', radius: 58232e3, orbit: 9.537 * AU, angle: 2.55, gravity: 10.44, tempC: -140,
     tempText: '−140 °C en las nubes', pressure: 1, composition: 'H₂ 96% · He 3% · CH₄',
     description: 'El señor de los anillos. Gigante gaseoso menos denso que el agua, sin superficie sólida.',
     facts: ['Anillos de hielo de 280 000 km y solo ~10 m de grosor', 'Vientos de 1 800 km/h', 'Hexágono permanente en el polo norte'],
@@ -229,7 +241,7 @@ export const BODIES: BodyDef[] = [
     atmo: { height: 700e3, betaR: [3.4e-6, 3.6e-6, 4.0e-6], betaM: 2e-6, HR: 59500, HM: 40000, g: 0.7, sun: 14, mieTint: [1, 0.95, 0.85], fogColor: [0.8, 0.7, 0.5], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
-    id: 'titan', name: 'Titán', kind: 'rocky', radius: 2574.7e3, parent: 'saturn', orbit: 1221870e3, angle: 1.0, gravity: 1.352, tempC: -179,
+    id: 'titan', albedo: 0.22, name: 'Titán', kind: 'rocky', radius: 2574.7e3, parent: 'saturn', orbit: 1221870e3, angle: 1.0, gravity: 1.352, tempC: -179,
     tempText: '−179 °C', pressure: 1.45, composition: 'N₂ 95% · CH₄ 5%',
     description: 'Atmósfera densa y anaranjada, dunas de hidrocarburos y lagos de metano líquido.',
     facts: ['Único lugar además de la Tierra con líquidos estables en superficie', 'La sonda Huygens aterrizó en 2005', 'Llueve metano'],
@@ -239,7 +251,7 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 0.15, text: 'Frío extremo: −179 °C' },
   },
   {
-    id: 'uranus', name: 'Urano', kind: 'gas', radius: 25362e3, orbit: 19.19 * AU, angle: -2.0, gravity: 8.69, tempC: -195,
+    id: 'uranus', albedo: 0.51, name: 'Urano', kind: 'gas', radius: 25362e3, orbit: 19.19 * AU, angle: -2.0, gravity: 8.69, tempC: -195,
     tempText: '−195 °C (mínimo del sistema solar: −224 °C)', pressure: 1, composition: 'H₂ 83% · He 15% · CH₄ 2,3%',
     description: 'Gigante de hielo que gira tumbado de lado (98°). El metano le da su color cian.',
     facts: ['Cada polo tiene 42 años de luz y 42 de oscuridad', '13 anillos tenues y oscuros', 'Solo visitado por la Voyager 2 (1986)'],
@@ -247,7 +259,7 @@ export const BODIES: BodyDef[] = [
     atmo: { height: 400e3, betaR: [2.0e-6, 5.0e-6, 6.0e-6], betaM: 1e-6, HR: 27700, HM: 20000, g: 0.7, sun: 14, mieTint: [0.8, 1, 1], fogColor: [0.5, 0.75, 0.8], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
-    id: 'neptune', name: 'Neptuno', kind: 'gas', radius: 24622e3, orbit: 30.07 * AU, angle: 1.6, gravity: 11.15, tempC: -201,
+    id: 'neptune', albedo: 0.41, name: 'Neptuno', kind: 'gas', radius: 24622e3, orbit: 30.07 * AU, angle: 1.6, gravity: 11.15, tempC: -201,
     tempText: '−201 °C en las nubes', pressure: 1, composition: 'H₂ 80% · He 19% · CH₄ 1,5%',
     description: 'El planeta más lejano. Azul intenso y los vientos más rápidos del sistema solar.',
     facts: ['Vientos de hasta 2 100 km/h', 'La luz del Sol tarda 4 horas en llegar', 'Descubierto por cálculo matemático en 1846'],
@@ -255,7 +267,7 @@ export const BODIES: BodyDef[] = [
     atmo: { height: 400e3, betaR: [1.2e-6, 3.6e-6, 9.0e-6], betaM: 1e-6, HR: 19700, HM: 15000, g: 0.7, sun: 14, mieTint: [0.8, 0.9, 1], fogColor: [0.3, 0.45, 0.9], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
   },
   {
-    id: 'triton', name: 'Tritón', kind: 'rocky', radius: 1353.4e3, parent: 'neptune', orbit: 354759e3, angle: 2.7, incl: 0.4, gravity: 0.779, tempC: -235,
+    id: 'triton', albedo: 0.72, name: 'Tritón', kind: 'rocky', radius: 1353.4e3, parent: 'neptune', orbit: 354759e3, angle: 2.7, incl: 0.4, gravity: 0.779, tempC: -235,
     tempText: '−235 °C', pressure: 0.000014, composition: 'N₂ extremadamente tenue',
     description: 'Luna con órbita retrógrada, probablemente capturada del cinturón de Kuiper. Géiseres de nitrógeno.',
     facts: ['Una de las superficies más frías conocidas', 'Terreno "piel de melón" único', 'Géiseres de nitrógeno de 8 km de altura'],
@@ -274,7 +286,7 @@ export const BODIES: BodyDef[] = [
     tilt: 0, scaleHeight: 1, markerColor: '#ff7a55', seed: 300, star: PROXIMA_STAR,
   },
   {
-    id: 'proxima-d', name: 'Próxima Centauri d', kind: 'rocky', radius: 0.7 * 6371e3, parent: 'proxima', orbit: 0.02885 * AU, angle: 0.8, gravity: 5.3, tempC: 87,
+    id: 'proxima-d', albedo: 0.1, name: 'Próxima Centauri d', kind: 'rocky', radius: 0.7 * 6371e3, parent: 'proxima', orbit: 0.02885 * AU, angle: 0.8, gravity: 5.3, tempC: 87,
     tempText: '≈ 87 °C de equilibrio · lado diurno mucho más caliente', pressure: 0, composition: 'Sin atmósfera conocida (probablemente arrasada por las fulguraciones)',
     description: 'Subtierra confirmada en 2022 con el espectrógrafo ESPRESSO del VLT: al menos un cuarto de la masa terrestre, orbitando a solo 0,029 UA cada 5,1 días. Su radio y composición se desconocen; se representa como un mundo rocoso árido y abrasado.',
     facts: ['Masa mínima: 0,26 masas terrestres', 'Período orbital: 5,12 días', 'Recibe casi el doble de luz que la Tierra', 'Uno de los planetas más ligeros detectados por velocidad radial', 'Probablemente en rotación síncrona'],
@@ -282,7 +294,7 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 1.0, text: 'Calor y radiación de las fulguraciones de Próxima' },
   },
   {
-    id: 'proxima-b', name: 'Próxima Centauri b', kind: 'rocky', radius: 1.02 * 6371e3, parent: 'proxima', orbit: 0.04856 * AU, angle: 2.9, gravity: 10.1, tempC: -39,
+    id: 'proxima-b', albedo: 0.3, name: 'Próxima Centauri b', kind: 'rocky', radius: 1.02 * 6371e3, parent: 'proxima', orbit: 0.04856 * AU, angle: 2.9, gravity: 10.1, tempC: -39,
     tempText: '≈ −39 °C de equilibrio (sin efecto invernadero)', pressure: 0.3, composition: 'Desconocida · aquí: N₂ y CO₂ tenues (hipotética)',
     description: 'El exoplaneta confirmado más cercano a la Tierra (2016, HARPS/ESO): masa mínima de 1,07 Tierras en la zona habitable de Próxima. Casi con seguridad en rotación síncrona, con un hemisferio en día perpetuo y otro en noche eterna. Si conserva atmósfera y agua sería un "mundo ojo": océano templado frente a la estrella y hielo en la cara oculta. Así se representa aquí.',
     facts: ['Masa mínima: 1,07 masas terrestres', 'Período orbital: 11,19 días a 0,0486 UA', 'Recibe el 65% de la luz que la Tierra recibe del Sol', 'Las fulguraciones de Próxima bañan su superficie en rayos X y ultravioleta', 'Objetivo del proyecto Breakthrough Starshot'],
@@ -291,12 +303,83 @@ export const BODIES: BodyDef[] = [
     hazard: { suitDrain: 0.3, text: 'Radiación de las fulguraciones de Próxima' },
   },
   {
-    id: 'proxima-c', name: 'Próxima Centauri c', kind: 'gas', radius: 2.4 * 6371e3, parent: 'proxima', orbit: 1.489 * AU, angle: 4.4, gravity: 11.9, tempC: -234,
+    id: 'proxima-c', albedo: 0.4, name: 'Próxima Centauri c', kind: 'gas', radius: 2.4 * 6371e3, parent: 'proxima', orbit: 1.489 * AU, angle: 4.4, gravity: 11.9, tempC: -234,
     tempText: '≈ −234 °C en las nubes', pressure: 1, composition: 'Hipotética: H₂, He y metano (minineptuno)',
     description: 'Candidato sin confirmar (2020, Damasso et al.): una supertierra o minineptuno de al menos 7 masas terrestres a 1,5 UA, con un año de 5,3 años terrestres. Análisis posteriores lo ponen en duda. Se representa como un minineptuno helado con un posible anillo de polvo.',
     facts: ['Masa mínima: ≈ 7 masas terrestres (sin confirmar)', 'Período orbital: 1 928 días', 'Recibe menos del 0,1% de la luz que recibe la Tierra', 'El Hubble detectó un posible exceso de luz: ¿anillos o polvo?'],
     tilt: 0.3, scaleHeight: 18000, markerColor: '#8fa8ff', seed: 303, gasType: 3, rings: 2, spin: 1e-4,
     atmo: { height: 150e3, betaR: [1.2e-6, 3.6e-6, 9.0e-6], betaM: 1e-6, HR: 18000, HM: 14000, g: 0.7, sun: 14, mieTint: [0.8, 0.9, 1], fogColor: [0.3, 0.45, 0.9], fogDensity: 0, surfaceDensity: 1, skyBrightness: 0.6 },
+  },
+  // -------------------------------------------------------------------------
+  // TRAPPIST-1 (2MASS J23062928−0502285), RA 23h06m29.4s, Dec −05°02′29″ (J2000):
+  // ecliptic longitude 345.73°, latitude +0.63° (it lies on the ecliptic, in Aquarius,
+  // which is why K2 could watch it). Distance 12.47 pc (Gaia DR3). Planet radii,
+  // masses and orbits from Agol et al. 2021; all seven are very likely tidally locked.
+  // The angles put f and g high in the night sky of e, as large as our Moon.
+  // -------------------------------------------------------------------------
+  {
+    id: 'trappist-1', name: 'TRAPPIST-1', kind: 'star', radius: 0.1192 * 696340e3, orbit: 40.66 * LY, angle: 345.73 * DEG, lat: 0.63 * DEG,
+    gravity: 1700, tempC: 2293, tempText: '≈ 2 300 °C (fotosfera) · enana roja ultrafría M8V', pressure: 0, composition: 'Hidrógeno y helio · moléculas en su atmósfera fría (agua, óxido de titanio)',
+    description: 'Una estrella diminuta, apenas más grande que Júpiter y con el 9% de la masa del Sol, que brilla con solo el 0,055% de su luz. Tiene siete planetas rocosos del tamaño de la Tierra, descubiertos entre 2016 y 2017 con el telescopio TRAPPIST y el Spitzer: todas sus órbitas cabrían dentro de la de Mercurio.',
+    facts: ['Distancia: 40,7 años luz (12,47 pc), en Acuario', 'Temperatura 2 566 K · radio 12% del Sol', 'Edad estimada: unos 7 600 millones de años', 'Sus siete planetas están en resonancia: sus años forman una cadena casi perfecta (8:5:3:2…)', 'Desde sus planetas la estrella se ve de 1 a 5,5 grados: hasta 11 veces el Sol visto desde la Tierra'],
+    tilt: 0, scaleHeight: 1, markerColor: '#ff6a45', seed: 400, star: TRAPPIST_STAR,
+  },
+  {
+    id: 'trappist-1b', albedo: 0.1, name: 'TRAPPIST-1 b', kind: 'rocky', radius: 1.116 * 6371e3, parent: 'trappist-1', orbit: 0.01154 * AU, angle: 3.6, gravity: 10.8, tempC: 225,
+    tempText: '≈ 230 °C en el lado diurno (medido por el Webb) · noche helada', pressure: 0, composition: 'Sin atmósfera gruesa (Webb, 2023)',
+    description: 'El planeta más interior: da una vuelta a su estrella en 36 horas y recibe cuatro veces la luz que recibe la Tierra. El telescopio Webb midió en 2023 su lado diurno a unos 500 K y no encontró una atmósfera que reparta el calor: una roca desnuda y abrasada, con la estrella fija en su cielo.',
+    facts: ['Radio 1,12 Tierras · masa 1,37 Tierras', 'Año: 1,51 días', 'Recibe 4,2 veces la luz que recibe la Tierra', 'Primer planeta rocoso fuera del sistema solar cuya temperatura midió el Webb'],
+    tilt: 0, scaleHeight: 1, markerColor: '#b98a6a', seed: 401,
+    hazard: { suitDrain: 2.0, text: 'Lado diurno a 230 °C y radiación de las fulguraciones' },
+  },
+  {
+    id: 'trappist-1c', albedo: 0.15, name: 'TRAPPIST-1 c', kind: 'rocky', radius: 1.097 * 6371e3, parent: 'trappist-1', orbit: 0.01580 * AU, angle: 4.7, gravity: 10.7, tempC: 107,
+    tempText: '≈ 107 °C en el lado diurno (Webb) · 67 °C de equilibrio', pressure: 0, composition: 'Sin atmósfera gruesa de CO₂ (Webb, 2023)',
+    description: 'Casi tan grande como la Tierra y recibe tanta luz como Venus. El Webb descartó en 2023 una atmósfera densa de dióxido de carbono como la de Venus: probablemente una roca seca, quizá con una atmósfera muy tenue.',
+    facts: ['Radio 1,10 Tierras · masa 1,31 Tierras', 'Año: 2,42 días', 'Recibe 2,2 veces la luz que recibe la Tierra', 'Lado diurno medido: unos 380 K'],
+    tilt: 0, scaleHeight: 1, markerColor: '#c9a27e', seed: 402,
+    hazard: { suitDrain: 0.8, text: 'Calor y radiación de la estrella' },
+  },
+  {
+    id: 'trappist-1d', albedo: 0.2, name: 'TRAPPIST-1 d', kind: 'rocky', radius: 0.788 * 6371e3, parent: 'trappist-1', orbit: 0.02227 * AU, angle: 5.7, gravity: 6.1, tempC: 13,
+    tempText: '≈ 13 °C de equilibrio (sin atmósfera que lo caliente)', pressure: 0, composition: 'Sin una atmósfera como la terrestre (Webb, 2025)',
+    description: 'En el borde interior de la zona habitable y más pequeño que la Tierra. Las observaciones del Webb de 2025 no encontraron una atmósfera como la nuestra: se representa como un desierto de roca, abrasado frente a la estrella y helado en la cara oculta.',
+    facts: ['Radio 0,79 Tierras · masa 0,39 Tierras', 'Año: 4,05 días', 'Recibe 1,1 veces la luz que recibe la Tierra', 'Gravedad: 62% de la terrestre'],
+    tilt: 0, scaleHeight: 1, markerColor: '#d6a87a', seed: 403,
+    hazard: { suitDrain: 0.3, text: 'Sin aire y con radiación de las fulguraciones' },
+  },
+  {
+    id: 'trappist-1e', albedo: 0.3, name: 'TRAPPIST-1 e', kind: 'rocky', radius: 0.920 * 6371e3, parent: 'trappist-1', orbit: 0.02925 * AU, angle: 1.0, gravity: 8.0, tempC: -23,
+    tempText: '≈ −23 °C de equilibrio · templado frente a la estrella si tiene aire', pressure: 0.5, composition: 'Desconocida · aquí: N₂ fino (hipotético; el Webb descartó una atmósfera de hidrógeno)',
+    description: 'El candidato más prometedor a tener agua líquida: en plena zona habitable y con una densidad como la de la Tierra. El Webb (2025) descartó una atmósfera gruesa de hidrógeno, pero aún es posible una fina de nitrógeno. Aquí se representa como un "mundo ojo": un océano frente a la estrella rodeado de hielo, con TRAPPIST-1 f en su cielo nocturno, tan grande como nuestra Luna, y g un poco más pequeño.',
+    facts: ['Radio 0,92 Tierras · masa 0,69 Tierras', 'Año: 6,1 días', 'Recibe el 65% de la luz que recibe la Tierra', 'Objetivo principal del Webb: se planean más de 15 observaciones'],
+    tilt: 0, scaleHeight: 9000, markerColor: '#7fb8c8', seed: 404,
+    atmo: { height: 60e3, betaR: [2.8e-6, 6.5e-6, 11.2e-6], betaM: 6e-6, HR: 9000, HM: 1400, g: 0.76, sun: 20, mieTint: [1, 0.9, 0.8], fogColor: [0.62, 0.55, 0.52], fogDensity: 6e-6, surfaceDensity: 0.5, skyBrightness: 0.6 },
+    hazard: { suitDrain: 0.15, text: 'Frío y radiación de las fulguraciones' },
+  },
+  {
+    id: 'trappist-1f', albedo: 0.5, name: 'TRAPPIST-1 f', kind: 'rocky', radius: 1.045 * 6371e3, parent: 'trappist-1', orbit: 0.03849 * AU, angle: 1.1, gravity: 9.3, tempC: -55,
+    tempText: '≈ −55 °C de equilibrio', pressure: 0, composition: 'Desconocida · aquí: corteza de hielo sin aire',
+    description: 'En el borde exterior de la zona habitable. Con su densidad podría ser rico en agua: aquí se representa helado de polo a polo, con una corteza agrietada como la de Europa, quizá con un océano escondido debajo.',
+    facts: ['Radio 1,05 Tierras · masa 1,04 Tierras', 'Año: 9,2 días', 'Recibe el 37% de la luz que recibe la Tierra', 'Desde TRAPPIST-1 e se ve tan grande como nuestra Luna'],
+    tilt: 0, scaleHeight: 1, markerColor: '#cfe3ee', seed: 405,
+    hazard: { suitDrain: 0.3, text: 'Frío extremo: −55 °C' },
+  },
+  {
+    id: 'trappist-1g', albedo: 0.6, name: 'TRAPPIST-1 g', kind: 'rocky', radius: 1.129 * 6371e3, parent: 'trappist-1', orbit: 0.04683 * AU, angle: 1.25, gravity: 10.2, tempC: -76,
+    tempText: '≈ −76 °C de equilibrio', pressure: 0, composition: 'Desconocida · aquí: hielo y escarcha de nitrógeno',
+    description: 'El mayor de los siete, algo más grande que la Tierra. Demasiado frío para el agua líquida en superficie: se representa como un mundo de hielo con terrenos rugosos y casquetes de escarcha.',
+    facts: ['Radio 1,13 Tierras · masa 1,32 Tierras', 'Año: 12,4 días', 'Recibe el 25% de la luz que recibe la Tierra'],
+    tilt: 0, scaleHeight: 1, markerColor: '#e2d6cc', seed: 406,
+    hazard: { suitDrain: 0.4, text: 'Frío extremo: −76 °C' },
+  },
+  {
+    id: 'trappist-1h', albedo: 0.6, name: 'TRAPPIST-1 h', kind: 'rocky', radius: 0.755 * 6371e3, parent: 'trappist-1', orbit: 0.06189 * AU, angle: 0.7, gravity: 5.6, tempC: -101,
+    tempText: '≈ −101 °C de equilibrio', pressure: 0, composition: 'Sin atmósfera conocida · aquí: hielo y roca',
+    description: 'El más pequeño y lejano de los siete, poco mayor que Marte: una bola helada y craterizada donde la estrella se ve roja y del doble del tamaño del Sol en nuestro cielo.',
+    facts: ['Radio 0,76 Tierras · masa 0,33 Tierras', 'Año: 18,8 días', 'Recibe el 14% de la luz que recibe la Tierra', 'Descubierto por K2 en 2017'],
+    tilt: 0, scaleHeight: 1, markerColor: '#bfc4cc', seed: 407,
+    hazard: { suitDrain: 0.5, text: 'Frío extremo: −101 °C' },
   },
 ];
 
@@ -696,11 +779,12 @@ function tritonGen(R: number, seed: number): TerrainGen {
  * day side, a permanent ice sheet on the night side. `sub` is the unit vector
  * towards the star in planet-local coordinates (the substellar point).
  */
-function eyeballGen(R: number, seed: number, sub: [number, number, number]): TerrainGen {
+function eyeballGen(R: number, seed: number, sub: [number, number, number], iceAt = 0): TerrainGen {
   const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2), n4 = new Noise3(seed + 3);
   const day = (x: number, y: number, z: number) => x * sub[0] + y * sub[1] + z * sub[2];
+  // ice where cos(angle from the substellar point) < iceAt: 0 = half the planet, 0.4 = a smaller "eye"
   const iceMask = (x: number, y: number, z: number, px: number, py: number, pz: number) =>
-    smoothstep(0.15, -0.15, day(x, y, z) + n4.fbm(px, py, pz, R * 0.2, 3, 20e3) * 0.12);
+    smoothstep(iceAt + 0.15, iceAt - 0.15, day(x, y, z) + n4.fbm(px, py, pz, R * 0.2, 3, 20e3) * 0.12);
   return {
     seaLevel: 0,
     rockScale: 1,
@@ -744,16 +828,30 @@ function eyeballGen(R: number, seed: number, sub: [number, number, number]): Ter
   };
 }
 
+/** direction towards the star in a planet's own frame (it orbits at -this from the star) */
+function substellar(def: BodyDef): [number, number, number] {
+  const a = def.angle, inc = def.incl ?? 0;
+  return [-Math.cos(a), -Math.sin(a) * Math.sin(inc), -Math.sin(a) * Math.cos(inc)];
+}
+
 export function makeGenerator(def: BodyDef): TerrainGen | null {
   const R = def.radius, s = def.seed;
   switch (def.id) {
+    // TRAPPIST-1: scorched dark rock (b, c), a dry desert (d), an ocean "eye" (e), ice (f, g, h)
+    case 'trappist-1b':
+      return cratered(R, s, { maria: 0.15, craterDensity: 0.5, craterDepth: 0.9, hill: 1500, high: [0.3, 0.27, 0.25], mare: [0.17, 0.15, 0.14], rough: 2 });
+    case 'trappist-1c':
+      return cratered(R, s, { maria: 0.1, craterDensity: 0.55, craterDepth: 0.9, hill: 1400, high: [0.44, 0.38, 0.32], mare: [0.3, 0.26, 0.22], rough: 2 });
+    case 'trappist-1d':
+      return cratered(R, s, { maria: 0.2, craterDensity: 0.45, craterDepth: 0.7, hill: 1300, high: [0.62, 0.48, 0.34], mare: [0.42, 0.32, 0.24], rough: 2.5 });
+    case 'trappist-1e': return eyeballGen(R, s, substellar(def), 0.3);
+    case 'trappist-1f': return europaGen(R, s);
+    case 'trappist-1g': return tritonGen(R, s);
+    case 'trappist-1h':
+      return cratered(R, s, { maria: 0.1, craterDensity: 0.6, craterDepth: 0.8, hill: 1000, high: [0.72, 0.72, 0.75], mare: [0.5, 0.5, 0.55], rough: 1.5 });
     case 'proxima-d':
       return cratered(R, s, { maria: 0.08, craterDensity: 0.55, craterDepth: 0.9, hill: 1200, high: [0.42, 0.36, 0.3], mare: [0.3, 0.25, 0.2], rough: 2 });
-    case 'proxima-b': {
-      // substellar direction in planet-local coordinates (the star sits at -orbit direction)
-      const a = def.angle, inc = def.incl ?? 0;
-      return eyeballGen(R, s, [-Math.cos(a), -Math.sin(a) * Math.sin(inc), -Math.sin(a) * Math.cos(inc)]);
-    }
+    case 'proxima-b': return eyeballGen(R, s, substellar(def));
     case 'mercury':
       return cratered(R, s, { maria: 0.12, craterDensity: 0.62, craterDepth: 1, hill: 1500, high: [0.5, 0.47, 0.44], mare: [0.58, 0.55, 0.5], rough: 2 });
     case 'venus': return venusGen(R, s);

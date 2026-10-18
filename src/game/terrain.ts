@@ -191,14 +191,29 @@ export class PlanetTerrain {
     public waterMaterial: THREE.Material | null,
     public rockMaterial: THREE.Material,
     public treeMaterial: THREE.Material,
+    /** build the six root chunks on the worker threads (a world created while travelling) */
+    asyncRoots = false,
   ) {
     gridIndex();
     this.maxLevel = Math.max(2, Math.ceil(Math.log2((R * 1.6) / 22)));
-    // the six root chunks are needed right away: build them here, synchronously
+    // the six root chunks: right away for the starting system, off-thread otherwise
     for (let f = 0; f < 6; f++) {
       const n = new TerrainNode(f, 0, -1, -1, 2, R);
-      this.applyChunk(n, buildChunkData(this.gen, this.R, this.request(n)));
       this.roots.push(n);
+      if (!asyncRoots) this.applyChunk(n, buildChunkData(this.gen, this.R, this.request(n)));
+    }
+    if (asyncRoots) this.requestRoots();
+  }
+
+  private requestRoots() {
+    const p = getPool();
+    for (const n of this.roots) {
+      if (n.built || n.pending) continue;
+      if (!p) { this.applyChunk(n, buildChunkData(this.gen, this.R, this.request(n))); continue; }
+      n.pending = p.request(this.request(n), (data) => {
+        n.pending = 0;
+        if (!n.built) this.applyChunk(n, data);
+      });
     }
   }
 
@@ -231,7 +246,9 @@ export class PlanetTerrain {
     mesh.castShadow = false;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
-    mesh.visible = false;
+    // a root chunk shows as soon as it exists (a far world that is never updated must
+    // still be seen); updateNode sets everything else
+    mesh.visible = node.level === 0;
     this.group.add(mesh);
     node.mesh = mesh;
 
@@ -246,7 +263,7 @@ export class PlanetTerrain {
       wm.position.copy(mesh.position);
       wm.matrixAutoUpdate = false;
       wm.updateMatrix();
-      wm.visible = false;
+      wm.visible = node.level === 0;
       wm.renderOrder = 2;
       this.group.add(wm);
       node.water = wm;

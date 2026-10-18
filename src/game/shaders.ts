@@ -123,6 +123,8 @@ export function makeAtmosphereMaterial() {
       uFade: { value: 1 },
       /** ozone absorption (planet radii⁻¹, Rayleigh density profile): no scattering, it only takes red and green out of long twilight paths, which makes the "blue hour" */
       uBetaO: { value: new THREE.Vector3() },
+      /** colour of the star's light (a red dwarf's sky is not Earth blue) */
+      uSunTint: { value: new THREE.Vector3(1, 1, 1) },
       // optical depth towards the Sun, precomputed per body (see makeOpticalDepthLut)
       uLut: { value: null as THREE.Texture | null },
     },
@@ -134,7 +136,7 @@ export function makeAtmosphereMaterial() {
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uCenter; uniform float uRa; uniform vec3 uSunDir; uniform vec3 uBetaR; uniform float uBetaM;
 uniform float uHR; uniform float uHM; uniform float uG; uniform float uSun; uniform vec3 uMieTint; uniform float uFade;
-uniform vec3 uBetaO; uniform sampler2D uLut;
+uniform vec3 uBetaO; uniform sampler2D uLut; uniform vec3 uSunTint;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 ${SUN_TRANSMITTANCE_GLSL}
@@ -169,7 +171,7 @@ void main(){
     L += S * Tv * mix((1.0 - segT) / max(ext, vec3(1e-20)), vec3(ds), step(ext * ds, vec3(1e-4)));
     Tv *= segT;
   }
-  vec3 col = uSun * L;
+  vec3 col = uSun * L * uSunTint;
   gl_FragColor = vec4(col * uFade, 0.0); // alpha 0: the atmosphere shell is part of the planet for the bloom mask
 }
 `,
@@ -742,6 +744,8 @@ export function makeCloudMaterial(type: number, map: THREE.CubeTexture) {
       uCloudMap: { value: map },
       /** moonlit ambient of the player's night sky (0 on other worlds) */
       uNightAmb: { value: new THREE.Vector3() },
+      /** colour of the star's light */
+      uSunTint: { value: new THREE.Vector3(1, 1, 1) },
       ...eclipseUniforms(), // body-centred, planet radii
       /** cloud shell radius in planet radii */
       uShellR: { value: 1 },
@@ -755,7 +759,7 @@ export function makeCloudMaterial(type: number, map: THREE.CubeTexture) {
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uSunDir; uniform float uSunI; uniform vec3 uColor; uniform float uCoverage;
 uniform float uOpacity; uniform float uType; uniform float uBelow; uniform float uFade; uniform float uShellR;
-uniform samplerCube uCloudMap; uniform vec3 uNightAmb;
+uniform samplerCube uCloudMap; uniform vec3 uNightAmb; uniform vec3 uSunTint;
 uniform float uRa; uniform vec3 uBetaR; uniform float uBetaM; uniform vec3 uBetaO; uniform sampler2D uLut;
 ${ECLIPSE_GLSL}
 ${SUN_TRANSMITTANCE_GLSL}
@@ -790,7 +794,7 @@ void main(){
   // sunset, and gone once the deck itself is in the planet's shadow (the old soft ramp
   // kept clouds lit ~14° after sunset)
   vec3 sun = sunTransmittance(uShellR, musun) * mix(0.35, 1.0, smoothstep(0.0, 0.5, musun));
-  vec3 col = uColor * shade * (sun * uSunI * heliosEclipse(nw * uShellR) + uNightAmb);
+  vec3 col = uColor * shade * (sun * uSunTint * uSunI * heliosEclipse(nw * uShellR) + uNightAmb);
   gl_FragColor = vec4(col, d * uOpacity * uFade);
 }
 `,
@@ -1254,6 +1258,56 @@ void main(){
   pts.scale.setScalar(5e13);
   pts.frustumCulled = false;
   pts.renderOrder = -10;
+  return pts;
+}
+
+/**
+ * Planets and moons as points of light: far away a world is smaller than a pixel and
+ * would vanish, while Venus, Jupiter or Mars are among the brightest things in the
+ * night sky. One point per body, placed and sized every frame by the game (Game.
+ * updateGlints): a star-like point with the body's real magnitude when it is too small
+ * to see, or, for a resolved disc seen through an atmosphere (the Moon from Earth), a
+ * soft aureole around it. Drawn behind everything at sky distance, so the body's own
+ * disc and the ground hide it where they are.
+ */
+export function makeGlints(count: number) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+  geo.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(new Float32Array(count), 1));
+  geo.setAttribute('aHalo', new THREE.BufferAttribute(new Float32Array(count), 1));
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: /* glsl */ `
+#include <common>
+#include <logdepthbuf_pars_vertex>
+attribute vec3 aColor; attribute float aSize; attribute float aHalo;
+varying vec3 vColor; varying float vHalo;
+void main(){
+  vColor = aColor; vHalo = aHalo;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  gl_PointSize = aSize;
+  #include <logdepthbuf_vertex>
+}`,
+    fragmentShader: /* glsl */ `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+varying vec3 vColor; varying float vHalo;
+void main(){
+  #include <logdepthbuf_fragment>
+  float r = length(gl_PointCoord - 0.5) * 2.0;
+  if (r >= 1.0) discard;
+  // a star-like point, or a smooth aureole that dies out before the sprite's edge
+  float a = mix(pow(1.0 - r, 2.0) * (1.0 - r), exp(-r * r * 7.0) * (1.0 - r * r), vHalo);
+  gl_FragColor = vec4(vColor * a, 1.0);
+}`,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.scale.setScalar(5e13); // sky distance, like the stars
+  pts.frustumCulled = false;
+  pts.renderOrder = -9;
   return pts;
 }
 

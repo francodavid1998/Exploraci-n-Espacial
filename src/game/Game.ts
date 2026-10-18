@@ -8,7 +8,7 @@ import { BODIES, AU, LY, C_LIGHT, SUN_STAR, makeGenerator, type BodyDef } from '
 import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
-  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, bakeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture, bakeClouds, CubeReadback, CLOUD_DECODE, GasBaker,
+  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, bakeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture, bakeClouds, CubeReadback, CLOUD_DECODE, GasBaker, makeGlints,
   hardenBloomPass, hardenOutputPass, makeCoronaMaterial, makeOpticalDepthLut, patchShadowChunk, PARSEC,
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
@@ -41,6 +41,8 @@ interface Body {
   collapsed: boolean;
   /** moons / planet that can eclipse this body's star (nearest first, at most 4) */
   occluders: Body[];
+  /** meshes and materials exist (worlds of other systems are built when the player heads there) */
+  built: boolean;
   /** Earth-type clouds read back from the GPU (cloud shadow over the player) */
   cloudCPU?: CubeReadback;
   // stars only
@@ -87,6 +89,9 @@ export interface HudState {
   autopilot: boolean;
   lightsMode: LightsMode;
   fastStart: boolean;
+  vision: boolean;
+  /** vision mode magnification (1 = no zoom) */
+  zoom: number;
 }
 
 /**
@@ -100,6 +105,8 @@ const LIGHTS_KEY = 'helios-lights';
 const V = () => new THREE.Vector3();
 const ZERO = new THREE.Vector3();
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
+/** vision mode field of view range (degrees): 65 = normal view, 1 = Moon craters */
+const VISION_FOV_MAX = 65, VISION_FOV_MIN = 1;
 /** cloud deck drift by cloud type (rad/s): Earth ~20 m/s winds, Venus' super-rotation, Titan's slow air */
 const CLOUD_DRIFT = [3e-6, 1.6e-5, 1e-6];
 /**
@@ -169,6 +176,8 @@ export class Game {
   light: THREE.DirectionalLight;
   hemi: THREE.HemisphereLight;
   stars: THREE.Points;
+  /** planets and moons as points of light / the Moon's aureole (see updateGlints) */
+  glints: THREE.Points;
   milky: THREE.Mesh;
   overlay: THREE.Mesh;
   cloudPts: THREE.Points;
@@ -178,6 +187,9 @@ export class Game {
   plasmaMat: THREE.ShaderMaterial;
   /** paints the gas giant that fills the view (see GasBaker) */
   private gasBaker: GasBaker;
+  /** star systems whose worlds are built or queued, and the worlds still to build */
+  private preparedStars = new Set<Body>();
+  private buildQueue: Body[] = [];
 
   // state
   camWorld = V();
@@ -255,6 +267,10 @@ export class Game {
   menuOpen = false;
   /** touch controls instead of mouse + pointer lock (phones, tablets) */
   touchMode = false;
+  /** vision mode: clean view of the sky, first person, zoom (see toggleVision) */
+  vision = false;
+  private visionFov = 65;
+  onVisionToggle?: (on: boolean) => void;
   /** side of the painted cubemaps (clouds, gas giants, Milky Way) */
   private bakeSize = 1024;
   /** false while the title screen is up: the simulation stays paused and M / Tab cannot open the map */
@@ -304,7 +320,7 @@ export class Game {
     r.domElement.style.display = 'block';
     this.renderer = r;
 
-    this.camera = new THREE.PerspectiveCamera(65, container.clientWidth / container.clientHeight, 0.25, 1e17);
+    this.camera = new THREE.PerspectiveCamera(65, container.clientWidth / container.clientHeight, 0.25, 5e17);
     this.scene.add(this.camera);
     this.scene.background = new THREE.Color(0x000000);
 
@@ -372,6 +388,8 @@ export class Game {
     this.plasmaMat = makePlasmaMaterial();
     this.gasBaker = new GasBaker(this.bakeSize);
     this.createBodies();
+    this.glints = makeGlints(this.bodies.length);
+    this.scene.add(this.glints);
     this.applyQuality(q0);
 
     // ship & astronaut
@@ -466,12 +484,13 @@ export class Game {
       const marker = document.createElement('div');
       marker.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;display:none;white-space:nowrap;font-family:ui-monospace,monospace;';
       const dot = document.createElement('div');
-      dot.style.cssText = `width:9px;height:9px;border:1.5px solid ${def.markerColor};transform:translate(-50%,-50%) rotate(45deg);position:absolute;left:0;top:0;`;
+      // a hollow ring around the body (sized each frame): it must never cover the body itself
+      dot.style.cssText = `width:14px;height:14px;border:1.5px solid ${def.markerColor};border-radius:50%;transform:translate(-50%,-50%);position:absolute;left:0;top:0;box-sizing:border-box;`;
       const label = document.createElement('div');
       label.style.cssText = `position:absolute;left:10px;top:-7px;font-size:11px;color:${def.markerColor};text-shadow:0 0 4px #000;letter-spacing:.05em;`;
       marker.append(dot, label);
       this.markerLayer.appendChild(marker);
-      const b: Body = { def, pos: V(), local, star: null as unknown as Body, starAbs: star ? star.starAbs : starAbs, root, tiltQ, invRot, marker, label, collapsed: false, occluders: [] };
+      const b: Body = { def, pos: V(), local, star: null as unknown as Body, starAbs: star ? star.starAbs : starAbs, root, tiltQ, invRot, marker, label, collapsed: false, occluders: [], built: def.kind === 'star' };
       b.star = star ?? b;
 
       if (def.kind === 'star') {
@@ -498,82 +517,6 @@ export class Game {
         root.add(m, b.glow, b.glow2);
         this.starBodies.push(b);
         if (!this.sunBody) this.sunBody = b;
-      } else if (def.kind === 'gas') {
-        b.gasMat = makeGasMaterial(def.gasType ?? 0);
-        const m = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.gasMat);
-        m.scale.setScalar(def.radius * 1.002);
-        root.add(m);
-        if (def.rings !== undefined) {
-          const inner = def.rings === 0 ? 1.1 : 1.6;
-          const outer = def.rings === 0 ? 2.29 : def.rings === 1 ? 2.05 : 2.6;
-          b.ringMat = makeRingMaterial(def.rings);
-          const rg = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 512, 4), b.ringMat);
-          rg.rotation.x = -Math.PI / 2;
-          rg.scale.setScalar(def.radius);
-          rg.renderOrder = 3;
-          const tg = new THREE.Group();
-          tg.quaternion.copy(tiltQ);
-          tg.add(rg);
-          root.add(tg);
-          b.gasMat.uniforms.uRingIn.value = def.rings === 0 ? 1.11 : 0;
-          b.gasMat.uniforms.uRingOut.value = def.rings === 0 ? 2.27 : 0;
-        }
-      } else {
-        const gen = makeGenerator(def)!;
-        const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.93, metalness: 0 });
-        b.tUniforms = patchTerrainMaterial(mat);
-        if (gen.seaLevel !== null) b.waterMat = makeWaterMaterial(gen.waterDeep ?? [0.02, 0.08, 0.15], gen.waterShallow ?? [0.05, 0.3, 0.35]);
-        const rockMat = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, flatShading: true });
-        const treeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 });
-        b.terrain = new PlanetTerrain(def.id, def.radius, gen, mat, b.waterMat ?? null, rockMat, treeMat);
-        root.add(b.terrain.group);
-      }
-      if (def.atmo) {
-        b.atmoMat = makeAtmosphereMaterial();
-        const a = def.atmo;
-        const R = def.radius;
-        const u = b.atmoMat.uniforms;
-        u.uRa.value = 1 + a.height / R;
-        u.uBetaR.value.set(a.betaR[0] * R, a.betaR[1] * R, a.betaR[2] * R);
-        u.uBetaM.value = a.betaM * R;
-        u.uHR.value = a.HR / R;
-        u.uHM.value = a.HM / R;
-        u.uG.value = a.g;
-        u.uSun.value = a.sun;
-        u.uMieTint.value.set(...a.mieTint);
-        if (a.ozone) u.uBetaO.value.set(a.ozone[0] * R, a.ozone[1] * R, a.ozone[2] * R);
-        u.uLut.value = makeOpticalDepthLut(1 + a.height / R, a.HR / R, a.HM / R);
-        b.atmo = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.atmoMat);
-        b.atmo.scale.setScalar(R + a.height);
-        b.atmo.renderOrder = 4;
-        root.add(b.atmo);
-      }
-      if (def.clouds) {
-        // the pattern is painted once (Earth's fine weather needs 1024 px a face, Venus' and Titan's hazes 512)
-        const csize = def.clouds.type === 0 ? this.bakeSize : 512;
-        const crt = bakeClouds(this.renderer, def.clouds.type, csize);
-        const cmap = crt.texture;
-        b.cloudMat = makeCloudMaterial(def.clouds.type, cmap);
-        // sunlight reaching the deck comes from the body's own atmosphere model
-        const am = b.atmoMat?.uniforms;
-        if (am) for (const k of ['uRa', 'uBetaR', 'uBetaM', 'uBetaO', 'uLut']) b.cloudMat.uniforms[k] = am[k];
-        if (b.tUniforms && def.clouds.type === 0) {
-          // Earth: the clouds cast their shadows on the ground
-          b.terrain!.material.defines = { HELIOS_CLOUD_SHADOW: '' };
-          b.tUniforms.uCloudMap.value = cmap;
-          b.tUniforms.uCloudShellR.value = def.radius + def.clouds.alt;
-          b.tUniforms.uCloudCov.value = def.clouds.coverage;
-          b.tUniforms.uCloudOpac.value = def.clouds.opacity;
-          // the same clouds on the CPU, for the shadow over the player, ship and astronaut
-          b.cloudCPU = new CubeReadback(this.renderer, crt, csize);
-        }
-        b.cloudMat.uniforms.uColor.value.set(...def.clouds.color);
-        b.cloudMat.uniforms.uCoverage.value = def.clouds.coverage;
-        b.cloudMat.uniforms.uOpacity.value = def.clouds.opacity;
-        b.clouds = new THREE.Mesh(new THREE.SphereGeometry(1, 256, 128), b.cloudMat);
-        b.clouds.scale.setScalar(def.radius + def.clouds.alt);
-        b.clouds.renderOrder = 3;
-        root.add(b.clouds);
       }
       this.bodies.push(b);
       this.byId.set(def.id, b);
@@ -589,6 +532,126 @@ export class Game {
         .sort((x, y) => reach(y) - reach(x))
         .slice(0, 4);
     }
+    // The worlds of the system you start in are built now; the others while you travel
+    // to them (prepareSystem / updateSystemPrep), so the load time stays the same however
+    // many systems there are.
+    this.prepareSystem(this.sunBody, true);
+  }
+
+  /**
+   * Builds a world's meshes and materials (terrain, gas, rings, atmosphere, clouds). Worlds
+   * of other systems are built when the player heads there; their first terrain chunks
+   * then come from the worker threads (asyncTerrain) so the flight does not stutter.
+   */
+  private buildWorld(b: Body, asyncTerrain = true) {
+    if (b.built) return;
+    b.built = true;
+    const def = b.def, root = b.root, tiltQ = b.tiltQ;
+    if (def.kind === 'gas') {
+      b.gasMat = makeGasMaterial(def.gasType ?? 0);
+      const m = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.gasMat);
+      m.scale.setScalar(def.radius * 1.002);
+      root.add(m);
+      if (def.rings !== undefined) {
+        const inner = def.rings === 0 ? 1.1 : 1.6;
+        const outer = def.rings === 0 ? 2.29 : def.rings === 1 ? 2.05 : 2.6;
+        b.ringMat = makeRingMaterial(def.rings);
+        const rg = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 512, 4), b.ringMat);
+        rg.rotation.x = -Math.PI / 2;
+        rg.scale.setScalar(def.radius);
+        rg.renderOrder = 3;
+        const tg = new THREE.Group();
+        tg.quaternion.copy(tiltQ);
+        tg.add(rg);
+        root.add(tg);
+        b.gasMat.uniforms.uRingIn.value = def.rings === 0 ? 1.11 : 0;
+        b.gasMat.uniforms.uRingOut.value = def.rings === 0 ? 2.27 : 0;
+      }
+    } else {
+      const gen = makeGenerator(def)!;
+      const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.93, metalness: 0 });
+      b.tUniforms = patchTerrainMaterial(mat);
+      if (gen.seaLevel !== null) b.waterMat = makeWaterMaterial(gen.waterDeep ?? [0.02, 0.08, 0.15], gen.waterShallow ?? [0.05, 0.3, 0.35]);
+      const rockMat = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, flatShading: true });
+      const treeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 });
+      b.terrain = new PlanetTerrain(def.id, def.radius, gen, mat, b.waterMat ?? null, rockMat, treeMat, asyncTerrain);
+      root.add(b.terrain.group);
+    }
+    if (def.atmo) {
+      b.atmoMat = makeAtmosphereMaterial();
+      const a = def.atmo;
+      const R = def.radius;
+      const u = b.atmoMat.uniforms;
+      u.uRa.value = 1 + a.height / R;
+      u.uBetaR.value.set(a.betaR[0] * R, a.betaR[1] * R, a.betaR[2] * R);
+      u.uBetaM.value = a.betaM * R;
+      u.uHR.value = a.HR / R;
+      u.uHM.value = a.HM / R;
+      u.uG.value = a.g;
+      u.uSun.value = a.sun;
+      u.uMieTint.value.set(...a.mieTint);
+      if (a.ozone) u.uBetaO.value.set(a.ozone[0] * R, a.ozone[1] * R, a.ozone[2] * R);
+      u.uLut.value = makeOpticalDepthLut(1 + a.height / R, a.HR / R, a.HM / R);
+      b.atmo = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.atmoMat);
+      b.atmo.scale.setScalar(R + a.height);
+      b.atmo.renderOrder = 4;
+      root.add(b.atmo);
+    }
+    if (def.clouds) {
+      // the pattern is painted once (Earth's fine weather needs 1024 px a face, Venus' and Titan's hazes 512)
+      const csize = def.clouds.type === 0 ? this.bakeSize : 512;
+      const crt = bakeClouds(this.renderer, def.clouds.type, csize);
+      const cmap = crt.texture;
+      b.cloudMat = makeCloudMaterial(def.clouds.type, cmap);
+      // sunlight reaching the deck comes from the body's own atmosphere model
+      const am = b.atmoMat?.uniforms;
+      if (am) for (const k of ['uRa', 'uBetaR', 'uBetaM', 'uBetaO', 'uLut']) b.cloudMat.uniforms[k] = am[k];
+      if (b.tUniforms && def.clouds.type === 0) {
+        // Earth: the clouds cast their shadows on the ground
+        b.terrain!.material.defines = { HELIOS_CLOUD_SHADOW: '' };
+        b.tUniforms.uCloudMap.value = cmap;
+        b.tUniforms.uCloudShellR.value = def.radius + def.clouds.alt;
+        b.tUniforms.uCloudCov.value = def.clouds.coverage;
+        b.tUniforms.uCloudOpac.value = def.clouds.opacity;
+        // the same clouds on the CPU, for the shadow over the player, ship and astronaut
+        b.cloudCPU = new CubeReadback(this.renderer, crt, csize);
+      }
+      b.cloudMat.uniforms.uColor.value.set(...def.clouds.color);
+      b.cloudMat.uniforms.uCoverage.value = def.clouds.coverage;
+      b.cloudMat.uniforms.uOpacity.value = def.clouds.opacity;
+      b.clouds = new THREE.Mesh(new THREE.SphereGeometry(1, 256, 128), b.cloudMat);
+      b.clouds.scale.setScalar(def.radius + def.clouds.alt);
+      b.clouds.renderOrder = 3;
+      root.add(b.clouds);
+    }
+  }
+
+  /** Queue the worlds of a star's system to be built; `now` builds them all at once. */
+  private prepareSystem(star: Body, now = false) {
+    if (!this.preparedStars.has(star)) {
+      this.preparedStars.add(star);
+      for (const b of this.bodies) if (b.star === star && !b.built && !this.buildQueue.includes(b)) this.buildQueue.push(b);
+    }
+    if (now) {
+      for (const b of this.buildQueue) if (b.star === star) this.buildWorld(b, star !== this.byId.get('sun'));
+      this.buildQueue = this.buildQueue.filter((q) => !q.built);
+    }
+  }
+
+  /**
+   * Starts preparing a system as soon as the player heads for it (one of its worlds is
+   * the destination, or the ship is a good part of the way there, well before the frame
+   * switches to its star) and builds the queued worlds a few milliseconds per frame.
+   */
+  private updateSystemPrep() {
+    const cw = this.camWorld;
+    const dHere = cw.distanceTo(this.sunBody.pos);
+    for (const s of this.starBodies) {
+      if (this.preparedStars.has(s)) continue;
+      if (this.target?.star === s || cw.distanceTo(s.pos) < dHere * 1.5) this.prepareSystem(s);
+    }
+    const t0 = performance.now();
+    while (this.buildQueue.length && performance.now() - t0 < 8) this.buildWorld(this.buildQueue.shift()!);
   }
 
   /** Sunlight let through by body b's cloud deck at world point p (Earth-type weather only). */
@@ -654,6 +717,7 @@ export class Game {
 
   /** Move the reference frame to another star: shift every dynamic position by the interstellar offset. */
   private switchFrame(star: Body) {
+    this.prepareSystem(star, true); // normally built long before, during the flight
     const delta = star.starAbs.clone().sub(this.sunBody.starAbs);
     for (const v of [this.shipPos, this.playerPos, this.camWorld, this.lastCamWorld]) v.sub(delta);
     this.sunBody = star;
@@ -724,9 +788,25 @@ export class Game {
   };
   private onWheel = (e: WheelEvent) => {
     const f = e.deltaY > 0 ? 1.12 : 1 / 1.12;
-    if (this.mode === 'ship') this.camDistShip = clamp(this.camDistShip * f, 16, 120);
+    if (this.vision) this.zoomVision(e.deltaY > 0 ? 1.2 : 1 / 1.2);
+    else if (this.mode === 'ship') this.camDistShip = clamp(this.camDistShip * f, 16, 120);
     else this.camDistFoot = clamp(this.camDistFoot * f, 2.2, 25);
   };
+
+  /**
+   * Vision mode (O): nothing drawn over the sky (no HUD, labels or markers), the view
+   * from the astronaut's eyes or the cockpit, and a zoom down to 1° to look at the Moon,
+   * the planets and the stars like through binoculars or a small telescope.
+   */
+  toggleVision(on = !this.vision) {
+    this.vision = on;
+    this.visionFov = VISION_FOV_MAX;
+    this.onVisionToggle?.(on);
+  }
+  /** zoom factor < 1 zooms in */
+  zoomVision(f: number) {
+    if (this.vision) this.visionFov = clamp(this.visionFov * f, VISION_FOV_MIN, VISION_FOV_MAX);
+  }
   private onResize = () => {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.renderer.setSize(w, h);
@@ -1404,17 +1484,22 @@ export class Game {
       this.camQ.slerp(this.shipQ, 1 - Math.exp(-dt * (this.warp ? 4 : 7)));
       const oq = new THREE.Quaternion().setFromEuler(new THREE.Euler(this.orbitPitch, this.orbitYaw, 0, 'YXZ'));
       const q = this.camQ.clone().multiply(oq);
-      const off = new THREE.Vector3(0, this.camDistShip * 0.2, this.camDistShip).applyQuaternion(q);
+      // vision mode: from the cockpit (the ship itself is hidden)
+      const off = this.vision
+        ? new THREE.Vector3(0, 1.1, -2.6).applyQuaternion(q)
+        : new THREE.Vector3(0, this.camDistShip * 0.2, this.camDistShip).applyQuaternion(q);
       eye = this.shipPos.clone().add(off);
       this.camOff.copy(off);
-      lookQ = q.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.1, 0, 0)));
+      lookQ = this.vision ? q.clone() : q.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.1, 0, 0)));
     } else {
       const up = this.playerPos.clone().sub(b.pos).normalize();
       const right = new THREE.Vector3().crossVectors(this.camFwd, up).normalize();
       const look = this.camFwd.clone().multiplyScalar(Math.cos(this.camPitch)).addScaledVector(up, Math.sin(this.camPitch));
-      const tgt = this.playerPos.clone().addScaledVector(up, 1.55).addScaledVector(right, 0.45);
-      eye = tgt.clone().addScaledVector(look, -this.camDistFoot);
-      this.camOff.set(0, 0, 0).addScaledVector(up, 1.55).addScaledVector(right, 0.45).addScaledVector(look, -this.camDistFoot);
+      // vision mode: through the astronaut's own eyes (the astronaut is hidden)
+      const side = this.vision ? 0 : 0.45, back = this.vision ? 0 : this.camDistFoot, eyeH = this.vision ? 1.62 : 1.55;
+      const tgt = this.playerPos.clone().addScaledVector(up, eyeH).addScaledVector(right, side);
+      eye = tgt.clone().addScaledVector(look, -back);
+      this.camOff.set(0, 0, 0).addScaledVector(up, eyeH).addScaledVector(right, side).addScaledVector(look, -back);
       const m = new THREE.Matrix4().lookAt(ZERO, look, up);
       lookQ = new THREE.Quaternion().setFromRotationMatrix(m);
     }
@@ -1433,9 +1518,11 @@ export class Game {
     this.camWorld.copy(eye);
     this.camera.position.set(0, 0, 0);
     this.camera.quaternion.copy(lookQ);
-    const fov = this.warp ? 65 + 8 * Math.min(1, this.warpSpeed / (C_LIGHT * 20)) : 65;
-    if (Math.abs(this.camera.fov - fov) > 0.05) {
-      this.camera.fov += (fov - this.camera.fov) * Math.min(1, dt * 3);
+    const fov = this.vision ? this.visionFov : this.warp ? 65 + 8 * Math.min(1, this.warpSpeed / (C_LIGHT * 20)) : 65;
+    if (Math.abs(this.camera.fov - fov) > 0.002 * fov) {
+      // eased in log space, so a 50x zoom feels as smooth as a small one
+      const lf = Math.log(this.camera.fov);
+      this.camera.fov = Math.exp(lf + (Math.log(fov) - lf) * Math.min(1, dt * (this.vision ? 6 : 3)));
       this.camera.updateProjectionMatrix();
     }
     this.camera.updateMatrixWorld();
@@ -1468,10 +1555,16 @@ export class Game {
 
     // world -> view rotation (the camera sits at the origin), for lights given in view space
     const toView = this.camera.quaternion.clone().invert();
+    // inside an atmosphere, other worlds are seen through it (a red moonrise)
+    const inAir = !!(b.def.atmo && b.def.kind === 'rocky' && camAlt < b.def.atmo.height);
+    // night adaptation of the eye (the same twilight ramp as the night floor)
+    const darkEyes = 1 - smoothstep(-0.035, 0.005, sunEl);
     const lightTint = starDef.lightTint;
 
     // body placement & uniforms
     for (const body of this.bodies) {
+      // only this system's worlds are drawn: the others are far below a pixel (shown as points of light)
+      body.root.visible = body.def.kind === 'star' || body.star === this.sunBody;
       body.root.position.copy(body.pos).sub(cw);
       const bR = body.def.radius;
       const bSun = sunPos.clone().sub(body.pos).normalize();
@@ -1483,6 +1576,7 @@ export class Game {
         u.uCenter.value.copy(rel).divideScalar(bR);
         u.uSunDir.value.copy(bSun);
         u.uSun.value = body.def.atmo!.sun * Math.pow(1 / Math.max(bAU * bAU, 0.05), 0.3);
+        u.uSunTint.value.set(...(body.star.def.star ?? SUN_STAR).lightTint);
         const inside = rel.length() < bR + body.def.atmo!.height;
         const side = inside ? THREE.BackSide : THREE.FrontSide;
         if (body.atmoMat.side !== side) { body.atmoMat.side = side; body.atmoMat.needsUpdate = true; }
@@ -1513,6 +1607,7 @@ export class Game {
         const u = body.cloudMat.uniforms;
         u.uSunDir.value.copy(bSun);
         u.uSunI.value = bSunI * 0.9;
+        u.uSunTint.value.set(...(body.star.def.star ?? SUN_STAR).lightTint);
         u.uBelow.value = rel.length() < bR + body.def.clouds!.alt ? 1 : 0;
         u.uShellR.value = (bR + body.def.clouds!.alt) / bR;
         u.uNightAmb.value.set(0, 0, 0); // the player's own sky sets it below
@@ -1531,6 +1626,11 @@ export class Game {
         u.uDirScale.value = 0;
         u.uFarSun.value.set(lightTint[0] * bSunI, lightTint[1] * bSunI, lightTint[2] * bSunI);
         u.uFarSunDir.value.copy(bSun).applyQuaternion(toView);
+        if (inAir && body !== b) {
+          u.uFarSun.value.multiply(this.atmoTransmittance(b, rel.clone().normalize(), new THREE.Vector3()));
+          // eyes used to the dark: next to a moonlit landscape the Moon looks dazzling white
+          u.uFarSun.value.multiplyScalar(1 + 1.2 * darkEyes);
+        }
         this.setEclipse(u as unknown as Record<string, THREE.IUniform>, body, bSun, 1, rel.clone().applyQuaternion(toView), toView);
       }
       if (body.waterMat) {
@@ -1630,6 +1730,9 @@ export class Game {
       this.skyRadiance(b, ro, sunAz, sunDir, skySun, l0);
       this.skyRadiance(b, ro, sunAz.clone().negate(), sunDir, skySun, l180);
       this.skyRadiance(b, ro, new THREE.Vector3().crossVectors(up, sunAz), sunDir, skySun, l90);
+      // the haze takes the colour of the star's light like the sky does
+      const tintV = new THREE.Vector3(...starDef.lightTint);
+      l0.multiply(tintV); l180.multiply(tintV); l90.multiply(tintV);
       hemiI = day * dens * 0.9 * a.skyBrightness;
       // stars come out as the sky overhead really darkens (twilight), never in daylight,
       // even on a mountain top
@@ -1721,6 +1824,7 @@ export class Game {
     // the catalogue stars are seen from where the player really is (parallax towards Proxima)
     (this.stars.material as THREE.ShaderMaterial).uniforms.uViewer.value.copy(this.sunBody.starAbs).add(cw).divideScalar(PARSEC);
     (this.milky.material as THREE.ShaderMaterial).uniforms.uAlpha.value = starAlpha;
+    this.updateGlints(starAlpha, inAir);
     // Haze colour by azimuth a from the Sun: exp(A + B cos a + C cos 2a) through the three
     // samples. Fitting the logarithm keeps it positive and follows the sharp glow around a
     // low Sun (a linear fit went negative in between and left black or pure blue patches).
@@ -1800,6 +1904,7 @@ export class Game {
 
     // ship & astronaut
     const sm = this.ship;
+    sm.root.visible = !(this.vision && this.mode === 'ship'); // vision mode: seen from the cockpit
     if (this.mode === 'ship') sm.root.position.copy(this.camOff).negate();
     else sm.root.position.copy(this.shipPos).sub(cw);
     sm.root.quaternion.copy(this.shipQ);
@@ -1826,7 +1931,7 @@ export class Game {
       this.plasmaMat.uniforms.uTime.value = this.time;
     }
     const as = this.astro;
-    as.root.visible = this.mode === 'foot';
+    as.root.visible = this.mode === 'foot' && !this.vision; // vision mode: through the astronaut's eyes
     if (this.mode === 'foot') {
       const upP = this.playerPos.clone().sub(b.pos).normalize();
       as.root.position.copy(this.camOff).negate();
@@ -1903,6 +2008,62 @@ export class Game {
     this.overlay.visible = a > 0.001;
   }
 
+  /**
+   * Planets and moons as points of light (see makeGlints). Brightness from the real
+   * photometry: albedo x Lambert phase x (R / distance)² / (distance to the star)²,
+   * expressed as a magnitude against the full Moon (-12.7), then drawn with the same
+   * magnitude -> brightness/size law as the catalogue stars. A disc big enough to see
+   * gets an aureole instead when seen through an atmosphere (the Moon from Earth at
+   * night); everything is dimmed and reddened by the air towards it and fades by day.
+   */
+  private updateGlints(starAlpha: number, inAir: boolean) {
+    const g = this.glints.geometry;
+    const pos = g.attributes.position as THREE.BufferAttribute, col = g.attributes.aColor as THREE.BufferAttribute;
+    const size = g.attributes.aSize as THREE.BufferAttribute, halo = g.attributes.aHalo as THREE.BufferAttribute;
+    const cw = this.camWorld, b = this.nearest;
+    const rtH = this.composer.renderTarget1.height;
+    const pxPerRad = rtH / 2 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const pr = this.renderer.getPixelRatio();
+    const F_MOON = 0.12 * (1737.4e3 / 384400e3) ** 2; // full Moon seen from Earth, magnitude -12.7
+    const rel = new THREE.Vector3(), toStar = new THREE.Vector3(), tr = new THREE.Vector3(), c = new THREE.Color();
+    this.bodies.forEach((body, i) => {
+      size.setX(i, 0);
+      if (body.def.kind === 'star' || body === b || !body.def.albedo || starAlpha <= 0.01) return;
+      rel.copy(body.pos).sub(cw);
+      const dist = rel.length();
+      rel.divideScalar(dist);
+      const pxR = (body.def.radius / dist) * pxPerRad;
+      if (pxR > 40) return; // big on screen: the body itself is all there is to see
+      toStar.copy(body.star.pos).sub(body.pos);
+      const dStar = toStar.length();
+      const alpha = Math.acos(clamp(-rel.dot(toStar) / dStar, -1, 1)); // phase angle
+      const phase = (Math.sin(alpha) + (Math.PI - alpha) * Math.cos(alpha)) / Math.PI; // Lambert sphere
+      const sAU = this.starAU(dStar);
+      const F = (body.def.albedo * phase * (body.def.radius / dist) ** 2) / (sAU * sAU);
+      if (F <= 0) return;
+      const m = -12.74 - 2.5 * Math.log10(F / F_MOON);
+      if (inAir) this.atmoTransmittance(b, rel, tr); else tr.set(1, 1, 1);
+      c.set(body.def.markerColor);
+      const lum = 0.3 * c.r + 0.59 * c.g + 0.11 * c.b || 1;
+      pos.setXYZ(i, rel.x, rel.y, rel.z);
+      if (pxR < 1.2) {
+        if (m > 7) return; // too faint for the naked eye
+        const br = clamp(0.22 * Math.pow(10, -0.16 * (m - 6.5)), 0.08, 16) * starAlpha;
+        const sz = 1.1 + 3.2 * Math.pow(clamp((6.5 - m) / 8, 0, 1), 1.3) + 2 * clamp((-1.5 - m) / 5, 0, 1);
+        col.setXYZ(i, (c.r / lum) * br * tr.x, (c.g / lum) * br * tr.y, (c.b / lum) * br * tr.z);
+        size.setX(i, sz * pr);
+        halo.setX(i, 0);
+      } else if (inAir) {
+        // aureole: moonlight scattered forward by the air, a soft glow ~2° around the disc
+        const k = Math.min(0.2, 0.12 * Math.sqrt(F / F_MOON)) * starAlpha * (0.6 + 0.4 * this.glowFactor);
+        col.setXYZ(i, (c.r / lum) * k * tr.x, (c.g / lum) * k * tr.y, (c.b / lum) * k * tr.z);
+        size.setX(i, Math.min(256, pxR * 36));
+        halo.setX(i, 1);
+      }
+    });
+    pos.needsUpdate = col.needsUpdate = size.needsUpdate = halo.needsUpdate = true;
+  }
+
   /** Paint the gas giant that looks biggest, a strip per frame, once it is big on screen. */
   private updateGasBake() {
     let best: Body | null = null, bestAng = 0.05; // ~6° across: below that the live shader costs little
@@ -1928,15 +2089,22 @@ export class Game {
 
   private updateTerrain() {
     const cw = this.camWorld;
+    // Zooming in (vision mode) counts as coming closer for other worlds: their terrain
+    // detail loads as if the camera were nearer (a bit more than the zoom alone asks for,
+    // so the Moon seen from Earth shows its craters and not just the seas).
+    const zoomIn = this.vision ? Math.pow(this.camera.fov / VISION_FOV_MAX, 1.35) : 1;
     const sorted = this.bodies
       .filter((b) => b.terrain)
-      .map((b) => ({ b, d: cw.distanceTo(b.pos) / b.def.radius }))
+      .map((b) => {
+        const z = b === this.nearest ? 1 : zoomIn;
+        return { b, z, d: (cw.distanceTo(b.pos) / b.def.radius) * z };
+      })
       .sort((x, y) => x.d - y.d);
     let first = true;
-    for (const { b, d } of sorted) {
+    for (const { b, d, z } of sorted) {
       const t = b.terrain!;
       if (d < 60) {
-        const local = cw.clone().sub(b.pos);
+        const local = cw.clone().sub(b.pos).multiplyScalar(z);
         t.update(local, first ? 7 : 1.5);
         b.collapsed = false;
         first = false;
@@ -1962,7 +2130,11 @@ export class Game {
     const camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
     const rank = (b: Body) => (b === this.target ? 2 : 0) + (b.def.kind === 'star' ? 1 : 0);
     const order = [...this.bodies].sort((a, b) => rank(b) - rank(a) || b.def.radius - a.def.radius);
+    // pixels per radian at the centre of the view (to size the rings around bodies)
+    const pxPerRad = h / 2 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
     for (const b of order) {
+      // vision mode: nothing drawn over the sky
+      if (this.vision) { b.marker.style.display = 'none'; continue; }
       v.copy(b.pos).sub(cw);
       const dist = v.length();
       const ang = b.def.radius / dist;
@@ -1984,7 +2156,13 @@ export class Game {
       b.marker.style.display = 'block';
       b.marker.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
       b.marker.style.opacity = isT ? '1' : '0.7';
-      (b.marker.firstChild as HTMLDivElement).style.background = isT ? b.def.markerColor : 'transparent';
+      // ring a little wider than the body's disc, so the body shows through it (the old
+      // target marker was a filled diamond drawn right on top of the Moon)
+      const ring = Math.round(clamp(2 * ang * pxPerRad + 12, 14, 90));
+      const dot = b.marker.firstChild as HTMLDivElement;
+      dot.style.width = dot.style.height = `${ring}px`;
+      dot.style.borderWidth = isT ? '2px' : '1.5px';
+      b.label.style.left = `${ring / 2 + 5}px`;
       if (upd) b.label.textContent = `${isT ? '◆ ' : ''}${b.def.name.toUpperCase()}  ${formatDist(dist - b.def.radius)}`;
     }
   }
@@ -1998,6 +2176,9 @@ export class Game {
     this.time += dt;
     this.frame++;
     if (!this.locked && !this.touchMode) { this.mdx = 0; this.mdy = 0; }
+    // zoomed in, the mouse turns the view proportionally slower (aiming at a crater, not a hill)
+    if (this.vision) { const z = this.camera.fov / VISION_FOV_MAX; this.mdx *= z; this.mdy *= z; }
+    if (this.pressed.has('KeyO')) this.toggleVision();
 
     if (this.pressed.has('KeyF')) { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
     if (this.pressed.has('KeyL')) {
@@ -2018,7 +2199,9 @@ export class Game {
     const focus = this.mode === 'ship' ? this.shipPos : this.playerPos;
     const star = this.nearestStar(focus);
     if (star !== this.sunBody) this.switchFrame(star);
+    this.updateSystemPrep();
     this.nearest = this.findNearest(focus).body;
+    if (!this.nearest.built) this.prepareSystem(this.nearest.star, true);
     if (!this.dead && !this.menuOpen) {
       if (this.mode === 'ship') this.updateShip(dt);
       else this.updateFoot(dt);
@@ -2089,6 +2272,8 @@ export class Game {
       autopilot: this.autopilot,
       lightsMode: this.lightsMode,
       fastStart: this.fastStart,
+      vision: this.vision,
+      zoom: VISION_FOV_MAX / this.camera.fov,
     };
   }
 

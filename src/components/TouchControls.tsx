@@ -38,14 +38,15 @@ function TapButton({ game, code, label, wide }: { game: Game; code: string; labe
  */
 export default function TouchControls({ game }: { game: Game }) {
   const [mode, setMode] = useState(game.mode);
+  const [vision, setVision] = useState(game.vision);
   const stick = useRef<{ id: number; x: number; y: number } | null>(null);
   const look = useRef<{ id: number; x: number; y: number } | null>(null);
   const [knob, setKnob] = useState({ x: 0, y: 0 });
   const R = 56; // stick radius, CSS px
 
-  // ship or on foot decides which buttons make sense
+  // ship or on foot (and vision mode) decide which buttons make sense
   useEffect(() => {
-    const id = setInterval(() => setMode(game.mode), 250);
+    const id = setInterval(() => { setMode(game.mode); setVision(game.vision); }, 250);
     return () => clearInterval(id);
   }, [game]);
 
@@ -117,32 +118,49 @@ export default function TouchControls({ game }: { game: Game }) {
         </div>
       </div>
 
-      {/* right, bottom row: held controls */}
-      <div className="absolute bottom-5 right-5 flex items-end gap-3">
-        <HoldButton game={game} code="ShiftLeft" label={ship ? 'TURBO' : 'CORRER'} />
-        {ship && <HoldButton game={game} code="KeyC" label="▼" />}
-        <HoldButton game={game} code="Space" label="▲" />
-      </div>
+      {vision ? (
+        // vision mode: just the zoom and the way out, faint, so the sky stays clean
+        <div className="absolute bottom-5 right-5 flex items-end gap-3 opacity-60">
+          <button className="h-12 w-12 rounded-full border border-white/25 bg-black/30 text-lg text-white/80 active:bg-white/25" onPointerDown={() => game.zoomVision(1 / 1.6)}>+</button>
+          <button className="h-12 w-12 rounded-full border border-white/25 bg-black/30 text-lg text-white/80 active:bg-white/25" onPointerDown={() => game.zoomVision(1.6)}>−</button>
+          <button className="h-12 rounded-full border border-white/25 bg-black/30 px-4 text-xs tracking-wider text-white/80 active:bg-white/25" onPointerDown={() => game.toggleVision(false)}>VER</button>
+        </div>
+      ) : (
+        <>
+          {/* right, bottom row: held controls */}
+          <div className="absolute bottom-5 right-5 flex items-end gap-3">
+            <HoldButton game={game} code="ShiftLeft" label={ship ? 'TURBO' : 'CORRER'} />
+            {ship && <HoldButton game={game} code="KeyC" label="▼" />}
+            <HoldButton game={game} code="Space" label="▲" />
+          </div>
 
-      {/* right, above them: actions in short rows (fits a landscape phone, 360 px tall) */}
-      <div className="absolute bottom-[92px] right-5 flex flex-col items-end gap-2">
-        <div className="flex gap-2">
-          {ship && <TapButton game={game} code="KeyJ" label="SALTO" wide />}
-          <TapButton game={game} code="KeyE" label={ship ? 'ATERRIZAR' : 'NAVE'} wide />
-        </div>
-        <div className="flex gap-2">
-          {ship && <TapButton game={game} code="KeyX" label="PARAR" wide />}
-          <TapButton game={game} code="KeyF" label="F" />
-          <TapButton game={game} code="KeyT" label="T" />
-          {ship && <TapButton game={game} code="KeyK" label="K" />}
-          <button
-            className="h-11 rounded-lg border border-amber-300/40 bg-black/35 px-3 text-xs tracking-wider text-amber-100 active:bg-amber-300/20"
-            onPointerDown={() => game.toggleMenu(true)}
-          >
-            MAPA
-          </button>
-        </div>
-      </div>
+          {/* right, above them: actions in short rows (fits a landscape phone, 360 px tall) */}
+          <div className="absolute bottom-[92px] right-5 flex flex-col items-end gap-2">
+            <div className="flex gap-2">
+              {ship && <TapButton game={game} code="KeyJ" label="SALTO" wide />}
+              <TapButton game={game} code="KeyE" label={ship ? 'ATERRIZAR' : 'NAVE'} wide />
+              <button
+                className="h-11 rounded-lg border border-white/25 bg-black/35 px-3 text-xs tracking-wider text-white/85 active:bg-white/25"
+                onPointerDown={() => game.toggleVision(true)}
+              >
+                VER
+              </button>
+            </div>
+            <div className="flex gap-2">
+              {ship && <TapButton game={game} code="KeyX" label="PARAR" wide />}
+              <TapButton game={game} code="KeyF" label="F" />
+              <TapButton game={game} code="KeyT" label="T" />
+              {ship && <TapButton game={game} code="KeyK" label="K" />}
+              <button
+                className="h-11 rounded-lg border border-amber-300/40 bg-black/35 px-3 text-xs tracking-wider text-amber-100 active:bg-amber-300/20"
+                onPointerDown={() => game.toggleMenu(true)}
+              >
+                MAPA
+              </button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

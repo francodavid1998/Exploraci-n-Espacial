@@ -51,7 +51,27 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
     window.addEventListener('keydown', k);
     return () => { clearInterval(id); window.removeEventListener('keydown', k); };
   }, [game]);
+  // vision mode: its hint shows for a few seconds after entering, then fades away
+  const vision = !!s?.vision;
+  const [visionHint, setVisionHint] = useState(false);
+  useEffect(() => {
+    if (!vision) return;
+    setVisionHint(true);
+    const id = setTimeout(() => setVisionHint(false), 3500);
+    return () => clearTimeout(id);
+  }, [vision]);
   if (!s) return null;
+  // vision mode: nothing over the sky but that hint and the zoom factor
+  if (s.vision && !s.dead) {
+    return (
+      <div className="pointer-events-none absolute inset-0 select-none font-mono text-white">
+        <div className={`absolute bottom-5 left-1/2 -translate-x-1/2 text-center text-[11px] tracking-[0.3em] text-white/45 transition-opacity duration-1000 ${visionHint ? 'opacity-100' : 'opacity-0'}`}>
+          MODO VISIÓN · {touch ? 'VER para salir · + / − zoom' : 'O para salir · rueda del ratón: zoom'}
+        </div>
+        {s.zoom > 1.05 && <div className="absolute right-5 top-5 text-xs tracking-[0.2em] text-white/45">×{s.zoom.toFixed(s.zoom < 10 ? 1 : 0)}</div>}
+      </div>
+    );
+  }
   const isGas = s.bodyKind === 'Gigante gaseoso';
   const altLabel = isGas ? (s.altitude < 0 ? 'Profundidad' : 'Sobre nubes') : 'Altitud';
   const altVal = isGas && s.altitude < 0 ? formatDist(-s.altitude) : formatDist(s.altitude);
@@ -187,6 +207,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">T / M</b> destino · mapa</div>
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
             <div><b className="text-white">Rueda</b> distancia cámara</div>
+            <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
           </div>
@@ -196,6 +217,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Espacio</b> saltar (mantener: jetpack)</div>
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
+            <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
           </div>
