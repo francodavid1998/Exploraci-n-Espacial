@@ -53,7 +53,8 @@ export interface ChunkData {
   col: Float32Array;
   water: { pos: Float32Array; nor: Float32Array; depth: Float32Array } | null;
   rocks: InstanceData | null;
-  trees: (InstanceData & { conifer: boolean }) | null;
+  /** kind: 0 conifer, 1 broadleaf, 2 dead */
+  trees: (InstanceData & { kind: number }) | null;
 }
 
 /** Buffers to hand over with postMessage (zero-copy). */
@@ -260,7 +261,7 @@ function scatterRocks(gen: TerrainGen, face: number, level: number, u0: number, 
 }
 
 function scatterTrees(gen: TerrainGen, face: number, level: number, u0: number, v0: number, worldSize: number, cx: number, cy: number, cz: number,
-  pos: Float32Array, nor: Float32Array): (InstanceData & { conifer: boolean }) | null {
+  pos: Float32Array, nor: Float32Array): (InstanceData & { kind: number }) | null {
   if (!gen.trees) return null;
   const area = worldSize * worldSize;
   const maxCount = Math.min(1400, Math.floor(area * 0.006));
@@ -268,7 +269,7 @@ function scatterTrees(gen: TerrainGen, face: number, level: number, u0: number, 
   const rnd = mulberry32((face * 19349663) ^ Math.floor(u0 * 7e6) ^ Math.floor(v0 * 9e6) ^ (level * 7));
   const kc = ((SEG >> 1) + 1) * GN + (SEG >> 1) + 1;
   const cyD = D[kc * 3 + 1];
-  const conifer = Math.abs(cyD) > 0.62 || H[kc] > 1800;
+  const kind = gen.treeKind ? gen.treeKind(D[kc * 3], cyD, D[kc * 3 + 2], H[kc]) : Math.abs(cyD) > 0.62 || H[kc] > 1800 ? 0 : 1;
   const matrices = new Float32Array(maxCount * 16);
   const colors = new Float32Array(maxCount * 3);
   const p = [0, 0, 0], n = [0, 0, 0];
@@ -288,9 +289,10 @@ function scatterTrees(gen: TerrainGen, face: number, level: number, u0: number, 
     const sy = sc * (0.85 + rnd() * 0.4);
     compose(matrices, placed * 16, p[0] - dx * 0.3, p[1] - dy * 0.3, p[2] - dz * 0.3, q, sc, sy, sc);
     const b = 0.75 + rnd() * 0.45;
-    colors[placed * 3] = b; colors[placed * 3 + 1] = b * (0.95 + rnd() * 0.1); colors[placed * 3 + 2] = b;
+    const tn = gen.treeTint ? gen.treeTint(dx, dy, dz) : null;
+    colors[placed * 3] = b * (tn ? tn[0] : 1); colors[placed * 3 + 1] = b * (0.95 + rnd() * 0.1) * (tn ? tn[1] : 1); colors[placed * 3 + 2] = b * (tn ? tn[2] : 1);
     placed++;
   }
   if (placed === 0) return null;
-  return { conifer, count: placed, matrices, colors };
+  return { kind, count: placed, matrices, colors };
 }

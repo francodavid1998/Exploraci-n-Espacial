@@ -59,12 +59,11 @@ export default function App() {
       game.requestLock();
       const jump = IS_TOUCH ? 'SALTO' : 'J';
       if (mode === 'explore') game.note(`Órbita terrestre. Destino: la Luna. Pulsa ${jump} para saltar.`);
-      else if (game.startSurvival(continueSave)) game.note('Partida cargada. Estás a bordo de tu nave');
-      else {
-        game.note('SUPERVIVENCIA · Combustible al 60%. Cada salto lo gasta: más cuanto más lejos');
-        game.note(`Aterriza en la Luna y extrae hielo (combustible) y metal (reparaciones) con ${IS_TOUCH ? 'MINAR' : 'R'}`);
-        game.note('El oxígeno del traje dura 6 minutos. La nave lo recarga');
+      else if (game.startSurvival(continueSave)) {
+        game.note('Partida cargada. Estás a bordo de tu nave');
+        game.note(`Objetivo: ${game.surv!.objective().text}`);
       }
+      // a new game opens with the wake-up sequence (Hud), which gives the first instructions
       if (IS_TOUCH) {
         // phones: full screen, landscape (both may be refused; the game works anyway)
         document.documentElement.requestFullscreen?.().then(

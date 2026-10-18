@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Game, HudState } from '../game/Game';
 import { formatDist, formatSpeed } from '../game/Game';
 import { BODIES, C_LIGHT } from '../game/bodies';
+import { LOGS, WAKE_LINES, type LogEntry } from '../game/story';
 
 const barColor = (v: number, ok: string) => (v > 50 ? ok : v > 25 ? '#fbbf24' : '#ef4444');
 
@@ -44,6 +45,55 @@ function fmtPressure(p: number) {
   return `${p.toFixed(p < 10 ? 2 : 0)} bar`;
 }
 
+/** A survivor's recording on screen (the game is paused). */
+function LogReader({ log, onClose, touch }: { log: LogEntry; onClose: () => void; touch: boolean }) {
+  return (
+    <div className="pointer-events-auto absolute inset-0 z-10 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className={`max-h-[90vh] w-[min(92vw,40rem)] overflow-y-auto rounded-2xl border border-amber-300/25 bg-black/80 ${touch ? 'p-4' : 'p-7'}`}>
+        <div className="text-[10px] tracking-[0.45em] text-amber-300/80">REGISTRO RECUPERADO</div>
+        <div className="mt-1 text-xl font-light tracking-[0.15em] text-white/95">{log.title}</div>
+        <div className="mb-4 text-[11px] tracking-wider text-white/45">{log.from}</div>
+        <div className={`space-y-3 ${touch ? 'text-[12px]' : 'text-sm'} leading-relaxed text-white/80`}>
+          {log.text.map((t) => <p key={t}>{t}</p>)}
+        </div>
+        <button onClick={onClose} className="mt-6 rounded-lg border border-amber-300/40 bg-amber-300/10 px-6 py-2 text-xs tracking-[0.3em] text-amber-100 hover:bg-amber-300/20">
+          CERRAR{touch ? '' : ' (R)'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** New survival game: the ship's computer wakes the pilot, line by line (soft fades, nothing flashes). */
+function WakeIntro({ onDone }: { onDone: () => void }) {
+  const [shown, setShown] = useState(0);
+  const [leaving, setLeaving] = useState(false);
+  // the HUD re-renders 10 times a second with a new callback: keep the timers independent of it
+  const done = useRef(onDone);
+  done.current = onDone;
+  useEffect(() => {
+    if (leaving) { const id = setTimeout(() => done.current(), 1400); return () => clearTimeout(id); }
+    const id = setTimeout(() => (shown < WAKE_LINES.length ? setShown(shown + 1) : setLeaving(true)), shown === 0 ? 900 : shown < WAKE_LINES.length ? 1900 : 3200);
+    return () => clearTimeout(id);
+  }, [shown, leaving]);
+  useEffect(() => {
+    // any key or tap skips it
+    const skip = () => setLeaving(true);
+    const t = setTimeout(() => { window.addEventListener('keydown', skip); window.addEventListener('pointerdown', skip); }, 600);
+    return () => { clearTimeout(t); window.removeEventListener('keydown', skip); window.removeEventListener('pointerdown', skip); };
+  }, []);
+  return (
+    <div className={`pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black/85 transition-opacity duration-1000 ${leaving ? 'opacity-0' : 'opacity-100'}`}>
+      <div className="w-[min(90vw,36rem)] space-y-3 font-mono">
+        {WAKE_LINES.map((l, i) => (
+          <div key={l} className={`transition-opacity duration-1000 ${i < shown ? 'opacity-100' : 'opacity-0'} ${i === 0 ? 'text-[11px] tracking-[0.5em] text-cyan-300/80' : 'text-sm text-white/80'}`}>{l}</div>
+        ))}
+        <div className="pt-4 text-[10px] tracking-[0.3em] text-white/30">cualquier tecla para saltar</div>
+      </div>
+    </div>
+  );
+}
+
 export default function Hud({ game, onOpenMap, touch = false }: { game: Game; onOpenMap: () => void; touch?: boolean }) {
   const [s, setS] = useState<HudState | null>(null);
   const [help, setHelp] = useState(true);
@@ -64,7 +114,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
   }, [vision]);
   if (!s) return null;
   // vision mode: nothing over the sky but that hint and the zoom factor
-  if (s.vision && !s.dead) {
+  if (s.vision && !s.dead && !s.survival?.reading && !s.survival?.intro) {
     return (
       <div className="pointer-events-none absolute inset-0 select-none font-mono text-white">
         <div className={`absolute bottom-5 left-1/2 -translate-x-1/2 text-center text-[11px] tracking-[0.3em] text-white/45 transition-opacity duration-1000 ${visionHint ? 'opacity-100' : 'opacity-0'}`}>
@@ -96,6 +146,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
         <div className="text-[10px] tracking-[0.3em] text-cyan-300/80">{s.bodyKind.toUpperCase()}</div>
         <div className="mb-2 text-2xl font-light tracking-wider">{s.bodyName}</div>
         <Row k={altLabel} v={altVal} accent={isGas && s.altitude < 0} />
+        {s.ruin && <Row k="Ruinas" v={`${s.ruin.name} · ${formatDist(s.ruin.dist)}`} />}
         {!touch && (
           <>
             <Row k="Gravedad" v={`${s.gravity} m/s² · ${(s.gravity / 9.81).toFixed(2)} g`} />
@@ -109,6 +160,13 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
 
       {/* target panel */}
       <div className={`absolute right-5 top-5 w-64 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md${smallR}`}>
+        {sv && (
+          <div className="mb-3 border-b border-white/10 pb-3">
+            <div className="text-[10px] tracking-[0.3em] text-amber-300/80">OBJETIVO</div>
+            <div className="mt-1 text-[12px] leading-snug text-white/85">{sv.objective}</div>
+            {sv.objectiveDist !== null && <div className="mt-1 text-[11px] text-amber-200/70">◆ {formatDist(sv.objectiveDist)}</div>}
+          </div>
+        )}
         <div className="text-[10px] tracking-[0.3em] text-amber-300/80">DESTINO</div>
         {s.targetName ? (
           <>
@@ -173,16 +231,16 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
         </div>
         {s.mode === 'ship' ? (
           <div className="flex flex-col gap-2">
-            <Bar label="CASCO" value={s.hull} color={barColor(s.hull, '#7dd3fc')} />
-            {sv && <Bar label="COMBUSTIBLE" value={sv.fuel} color={barColor(sv.fuel, '#fb923c')} />}
-            <Bar label="EMPUJE" value={Math.max(0, s.throttle) * 100} color="#a78bfa" />
+            <Bar key="CASCO" label="CASCO" value={s.hull} color={barColor(s.hull, '#7dd3fc')} />
+            {sv && <Bar key="COMBUSTIBLE" label="COMBUSTIBLE" value={sv.fuel} color={barColor(sv.fuel, '#fb923c')} />}
+            <Bar key="EMPUJE" label="EMPUJE" value={Math.max(0, s.throttle) * 100} color="#a78bfa" />
           </div>
         ) : (
           <div className="flex flex-col gap-2">
-            <Bar label={sv ? 'SALUD' : 'TRAJE'} value={s.suit} color={barColor(s.suit, '#86efac')} />
-            {sv && <Bar label="OXÍGENO" value={sv.oxygen} color={barColor(sv.oxygen, '#e0f2fe')} />}
-            {sv && <Bar label="ENERGÍA" value={sv.energy} color={barColor(sv.energy, '#fde68a')} />}
-            <Bar label="JETPACK" value={s.fuel} color="#7dd3fc" />
+            <Bar key={sv ? 'SALUD' : 'TRAJE'} label={sv ? 'SALUD' : 'TRAJE'} value={s.suit} color={barColor(s.suit, '#86efac')} />
+            {sv && <Bar key="OXÍGENO" label="OXÍGENO" value={sv.oxygen} color={barColor(sv.oxygen, '#e0f2fe')} />}
+            {sv && <Bar key="ENERGÍA" label="ENERGÍA" value={sv.energy} color={barColor(sv.energy, '#fde68a')} />}
+            <Bar key="JETPACK" label="JETPACK" value={s.fuel} color="#7dd3fc" />
           </div>
         )}
         <div className="text-center">
@@ -200,7 +258,12 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
       </div>
 
       {/* survival: mining prompt and progress, above the crosshair (the click prompt sits below it) */}
-      {sv && s.mode === 'foot' && sv.near && (
+      {sv && s.mode === 'foot' && sv.nearLog && (
+        <div className="absolute left-1/2 top-[38%] -translate-x-1/2 text-center text-[11px] tracking-[0.2em] text-amber-200/90">
+          {touch ? 'MINAR' : 'R'}: escuchar el registro
+        </div>
+      )}
+      {sv && s.mode === 'foot' && sv.near && !sv.nearLog && (
         <div className="absolute left-1/2 top-[38%] w-56 -translate-x-1/2 text-center">
           <div className="text-[11px] tracking-[0.2em] text-white/85">{touch ? 'MINAR' : 'R'} (mantener): extraer {sv.near}</div>
           <div className="mx-auto mt-1 h-1 w-40 overflow-hidden rounded-full bg-white/15">
@@ -241,7 +304,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Espacio</b> saltar (mantener: jetpack)</div>
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
-            {sv && <div><b className="text-white">R</b> (mantener) extraer hielo / metal</div>}
+            {sv && <div><b className="text-white">R</b> extraer (mantener) · escuchar registros</div>}
             <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
@@ -254,6 +317,9 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           HAZ CLIC PARA TOMAR EL CONTROL
         </div>
       )}
+
+      {sv?.reading && <LogReader log={sv.reading} touch={touch} onClose={() => game.surv?.closeLog()} />}
+      {sv?.intro && <WakeIntro onDone={() => game.surv?.finishIntro()} />}
 
       {s.dead && (
         <div className="pointer-events-auto absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur-sm">
@@ -282,6 +348,8 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
 
 export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }) {
   const [sel, setSel] = useState<string>(game.target?.def.id ?? 'earth');
+  const [logs, setLogs] = useState(false);
+  const heard = game.surv ? LOGS.filter((l) => game.surv!.logsRead.has(l.id)) : [];
   const def = BODIES.find((b) => b.id === sel)!;
   const stars = BODIES.filter((b) => b.kind === 'star');
   const planetsOf = (star: typeof stars[number]) => BODIES.filter((b) => b.kind !== 'star' && (b.parent === star.id || (star.id === 'sun' && !b.parent)));
@@ -296,7 +364,14 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
             <div className="text-[10px] tracking-[0.5em] text-cyan-300/70">NAVEGACIÓN</div>
             <div className="text-2xl font-extralight tracking-[0.2em]">SISTEMAS ESTELARES</div>
           </div>
-          <button onClick={onClose} className="rounded-md border border-white/20 px-4 py-1.5 text-xs tracking-[0.3em] text-white/80 hover:bg-white/10">CERRAR (M)</button>
+          <div className="flex gap-2">
+            {game.surv && (
+              <button onClick={() => setLogs(!logs)} className={`rounded-md border border-amber-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-amber-100 hover:bg-amber-300/10 ${logs ? 'bg-amber-300/15' : ''}`}>
+                REGISTROS {heard.length}/{LOGS.length}
+              </button>
+            )}
+            <button onClick={onClose} className="rounded-md border border-white/20 px-4 py-1.5 text-xs tracking-[0.3em] text-white/80 hover:bg-white/10">CERRAR (M)</button>
+          </div>
         </div>
         <div className="flex min-h-0 flex-1">
           <div className="w-72 overflow-y-auto border-r border-white/10 p-3">
@@ -327,6 +402,21 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               </div>
             ))}
           </div>
+          {logs ? (
+            <div className="flex-1 overflow-y-auto p-8">
+              <div className="text-[10px] tracking-[0.4em] text-amber-300/70">REGISTROS DE LOS SUPERVIVIENTES</div>
+              {heard.length === 0 && <div className="mt-4 text-sm text-white/50">Todavía no has encontrado ninguno.</div>}
+              <div className="mt-4 space-y-2">
+                {heard.map((l) => (
+                  <button key={l.id} onClick={() => { onClose(); game.surv?.openLog(l); }} className="block w-full rounded-lg border border-white/10 px-4 py-3 text-left hover:bg-white/5">
+                    <div className="text-sm text-white/90">{l.title}</div>
+                    <div className="text-[11px] text-white/45">{l.from}</div>
+                  </button>
+                ))}
+              </div>
+              <div className="mt-6 text-xs text-white/50">Objetivo: {game.surv?.objective().text}</div>
+            </div>
+          ) : (
           <div className="flex-1 overflow-y-auto p-8">
             <div className="flex items-start gap-6">
               <div className="h-28 w-28 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 35% 35%, ${def.markerColor}, #000 75%)`, boxShadow: `0 0 40px ${def.markerColor}55` }} />
@@ -369,6 +459,7 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               </button>
             )}
           </div>
+          )}
         </div>
       </div>
     </div>

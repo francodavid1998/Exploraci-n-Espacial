@@ -2,11 +2,13 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Game } from './Game';
 import { hash3, mulberry32, Noise3, clamp } from './noise';
+import { LOGS, objectiveAt, type LogEntry, type Objective } from './story';
 
 /**
  * Survival mode, phase 1: life support (oxygen, battery, health), ship fuel, mining
  * ice and metal on the surface of rocky worlds, a mild death penalty (you wake up in
  * the ship; what you carried stays where you fell) and saved games.
+ * Phase 2: Earth in ruins, the survivors' recordings and the objective they lead to.
  *
  * Realistic exploration never creates this object, so nothing here can change it.
  */
@@ -28,6 +30,7 @@ const SOLAR_CHARGE = 0.4; // suit panels in full sunlight
 const MINE_ENERGY = 4; // battery used by one extraction
 const MINE_TIME = 1.6; // seconds holding R
 const MINE_RANGE = 3.2; // metres from the deposit
+const READ_RANGE = 2.4; // metres from a terminal
 const THRUST_BURN = 0.08; // normal engines at full throttle (x4 with turbo)
 const RESERVE_POWER = 0.3; // thrusters with an empty tank
 const JUMP_COST = 2; // lighting the pulse engine
@@ -74,6 +77,8 @@ export interface SurvivalSave {
   target: string | null;
   deaths: number;
   playTime: number;
+  /** recordings already heard (phase 2; missing in older saves) */
+  logs?: string[];
 }
 
 export interface SurvivalHud {
@@ -93,6 +98,15 @@ export interface SurvivalHud {
   /** a save happened in the last 2 s */
   saved: boolean;
   emergency: boolean;
+  /** a recording within reach */
+  nearLog: boolean;
+  objective: string;
+  /** distance to the objective (m), when it is in this star system */
+  objectiveDist: number | null;
+  /** the recording on screen (the game is paused) */
+  reading: LogEntry | null;
+  /** the wake-up sequence of a new game is playing */
+  intro: boolean;
 }
 
 /** How rich each world is: chance of a deposit per cell, and the share of ice among them. */
@@ -181,6 +195,13 @@ export class Survival {
   playTime = 0;
   /** jumping on the reserve towards the nearest world: no fuel burnt, autopilot on */
   emergency = false;
+  /** recordings heard, and the one on screen (pauses the game) */
+  logsRead = new Set<string>();
+  reading: LogEntry | null = null;
+  /** a new game opens with the ship's computer waking the pilot */
+  intro = false;
+  /** Earth's ruins belong to the world (both modes); survival places its recordings in them */
+  private get ruins() { return this.g.ruins; }
 
   private g: Game;
   private deposits: Deposit[] = [];
@@ -198,6 +219,10 @@ export class Survival {
   private crateMarker: HTMLDivElement;
   private crateLabel: HTMLDivElement;
   private crateDist: number | null = null;
+  private nearLog: LogEntry | null = null;
+  private objMarker: HTMLDivElement;
+  private objLabel: HTMLDivElement;
+  private objDist: number | null = null;
 
   constructor(g: Game, markerLayer: HTMLElement) {
     this.g = g;
@@ -230,14 +255,76 @@ export class Survival {
     this.crateLabel.style.cssText = 'position:absolute;left:12px;top:-7px;font-size:11px;color:#7dd3fc;text-shadow:0 0 4px #000;letter-spacing:.05em;';
     this.crateMarker.append(dot, this.crateLabel);
     markerLayer.appendChild(this.crateMarker);
+    // the objective: an amber diamond on the place to go
+    this.objMarker = document.createElement('div');
+    this.objMarker.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;display:none;white-space:nowrap;font-family:ui-monospace,monospace;';
+    const od = document.createElement('div');
+    od.style.cssText = 'width:13px;height:13px;border:2px solid #fbbf24;transform:translate(-50%,-50%) rotate(45deg);position:absolute;left:0;top:0;box-sizing:border-box;';
+    this.objLabel = document.createElement('div');
+    this.objLabel.style.cssText = 'position:absolute;left:13px;top:-7px;font-size:11px;color:#fcd34d;text-shadow:0 0 4px #000;letter-spacing:.05em;';
+    this.objMarker.append(od, this.objLabel);
+    markerLayer.appendChild(this.objMarker);
     window.addEventListener('pagehide', this.onHide);
   }
+
+  /** the next recording to find (in story order), or the far side of the Moon once all are heard */
+  objective(): Objective {
+    const i = LOGS.findIndex((l) => !this.logsRead.has(l.id));
+    return objectiveAt(i < 0 ? LOGS.length : i);
+  }
+
+  /** world position of the objective, or null when it is not in this star system */
+  private objectivePos(o: Objective, out: THREE.Vector3): THREE.Vector3 | null {
+    const g = this.g;
+    if (o.place === 'tsiolkovsky') {
+      const moon = g.byId.get('moon')!, earth = g.byId.get('earth')!;
+      if (moon.star !== g.sunBody) return null;
+      // the crater lies on the far side, 20 degrees south of the point facing away from Earth
+      const away = moon.pos.clone().sub(earth.pos).normalize();
+      const d = away.multiplyScalar(Math.cos(0.35)).add(new THREE.Vector3(0, -Math.sin(0.35), 0)).normalize();
+      return out.copy(moon.pos).addScaledVector(d, moon.def.radius + g.terrainH(moon, d));
+    }
+    const s = this.ruins.site(o.place);
+    const earth = g.byId.get('earth')!;
+    if (!s || earth.star !== g.sunBody) return null;
+    return out.copy(s.logPos).add(earth.pos);
+  }
+
+  openLog(l: LogEntry) {
+    this.reading = l;
+    if (document.pointerLockElement) document.exitPointerLock();
+  }
+  closeLog() {
+    const l = this.reading;
+    if (!l) return;
+    this.reading = null;
+    const first = !this.logsRead.has(l.id);
+    this.logsRead.add(l.id);
+    if (first) {
+      this.g.note(`Registro guardado: ${l.title} (${this.logsRead.size}/${LOGS.length}). Puedes releerlo en el mapa`);
+      this.g.note(`Nuevo objetivo: ${this.objective().text}`);
+      this.save();
+    }
+    this.g.requestLock();
+  }
+
+  /** the wake-up sequence ended: first instructions */
+  finishIntro() {
+    if (!this.intro) return;
+    this.intro = false;
+    const g = this.g;
+    g.note(`Objetivo: ${this.objective().text}. Sigue el rombo ◆`);
+    g.note('En la Tierra el aire aún se respira; en los demás mundos el oxígeno del traje dura 6 minutos');
+    g.note(`Cada salto gasta combustible. Extrae hielo y metal con ${g.touchMode ? 'MINAR' : 'R'}`);
+  }
+
 
   private onHide = () => this.save();
 
   dispose() {
     window.removeEventListener('pagehide', this.onHide);
     this.crateMarker.remove();
+    this.objMarker.remove();
   }
 
   private total(c: Cargo) { return c.ice + c.metal; }
@@ -255,9 +342,10 @@ export class Survival {
     this.playTime += dt;
     const foot = g.mode === 'foot';
     if (foot) {
-      // breathing
+      // breathing: Earth's air is still breathable (the suit tops its tank up); anywhere else the tank empties
       const run = g.keys.has('ShiftLeft') || g.keys.has('ShiftRight');
-      this.oxygen = Math.max(0, this.oxygen - dt * O2_RATE * (run ? O2_RUN : 1));
+      if (g.nearest.def.id === 'earth') this.oxygen = Math.min(100, this.oxygen + dt * 5);
+      else this.oxygen = Math.max(0, this.oxygen - dt * O2_RATE * (run ? O2_RUN : 1));
       if (this.oxygen <= 0) {
         g.suit -= dt * NO_O2_DAMAGE;
         g.warnings.push('SIN OXÍGENO · VUELVE A LA NAVE');
@@ -303,6 +391,22 @@ export class Survival {
   private updateMining(dt: number) {
     const g = this.g;
     const p = g.playerPos;
+    // a survivor's recording within reach: R plays it
+    this.nearLog = null;
+    if (g.nearest.def.id === 'earth') {
+      const E = g.nearest;
+      for (const l of LOGS) {
+        const s = this.ruins.site(l.site);
+        if (s && s.logPos.clone().add(E.pos).distanceTo(p) < READ_RANGE) { this.nearLog = l; break; }
+      }
+    }
+    if (this.nearLog) {
+      if (g.pressed.has('KeyR')) this.openLog(this.nearLog);
+      this.mineProgress = 0;
+      this.mineTarget = null;
+      this.nearDeposit = null;
+      return;
+    }
     let best: Deposit | null = null, bd = MINE_RANGE;
     const w = new THREE.Vector3();
     for (const d of this.deposits) {
@@ -490,6 +594,8 @@ export class Survival {
     const g = this.g;
     const body = g.nearest;
     const cw = g.camWorld;
+    this.ruins.updateTerminals(this.logsRead, (site) => LOGS.find((l) => l.site === site)?.id);
+    this.renderObjective();
     const focus = g.mode === 'ship' ? g.shipPos : g.playerPos;
     const near = body.def.kind === 'rocky' && !!body.terrain && g.altitude < 2500 && !g.warp;
     if (near) this.refreshField(body, focus);
@@ -581,6 +687,36 @@ export class Survival {
     }
   }
 
+  private renderObjective() {
+    const g = this.g, cw = g.camWorld;
+    const o = this.objective();
+    const wp = this.objectivePos(o, new THREE.Vector3());
+    this.objDist = null;
+    if (!wp || g.vision) { this.objMarker.style.display = 'none'; return; }
+    const focus = g.mode === 'ship' ? g.shipPos : g.playerPos;
+    const dist = wp.distanceTo(focus);
+    this.objDist = dist;
+    const rel = wp.clone().sub(cw);
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(g.camera.quaternion);
+    if (rel.dot(fwd) <= 0 || dist < 6) { this.objMarker.style.display = 'none'; return; }
+    // behind a world (the other side of the Earth): drawn faint
+    let hidden = false;
+    for (const b of [g.byId.get('earth')!, g.byId.get('moon')!]) {
+      const oc = b.pos.clone().sub(cw), t = oc.dot(rel) / rel.lengthSq();
+      if (t > 0 && t < 1 && oc.clone().sub(rel.clone().multiplyScalar(t)).length() < b.def.radius * 0.995) hidden = true;
+    }
+    const v = rel.clone().project(g.camera);
+    const lay = this.objMarker.parentElement!;
+    const inView = Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1;
+    this.objMarker.style.display = inView ? 'block' : 'none';
+    if (!inView) return;
+    this.objMarker.style.transform = `translate(${((v.x * 0.5 + 0.5) * lay.clientWidth).toFixed(1)}px, ${((-v.y * 0.5 + 0.5) * lay.clientHeight).toFixed(1)}px)`;
+    this.objMarker.style.opacity = hidden ? '0.35' : '1';
+    const name = o.place === 'tsiolkovsky' ? 'BASE TSIOLKOVSKY' : (this.ruins.site(o.place)?.name ?? '').toUpperCase();
+    const txt = dist < 1000 ? `${dist.toFixed(0)} m` : dist < 1e6 ? `${(dist / 1000).toFixed(1)} km` : `${Math.round(dist / 1000).toLocaleString('es-ES')} km`;
+    this.objLabel.textContent = `${name}  ${txt}`;
+  }
+
   // -------------------------------------------------------------------------
   hud(): SurvivalHud {
     return {
@@ -596,6 +732,11 @@ export class Survival {
       refining: this.g.mode === 'ship' ? this.refining : null,
       saved: this.g.time - this.savedAt < 2,
       emergency: this.emergency,
+      nearLog: !!this.nearLog && this.g.mode === 'foot',
+      objective: this.objective().text,
+      objectiveDist: this.objDist,
+      reading: this.reading,
+      intro: this.intro,
     };
   }
 
@@ -619,6 +760,7 @@ export class Survival {
       hull: g.hull, health: Math.max(g.suit, 1), oxygen: this.oxygen, energy: this.energy, fuel: this.fuel,
       carried: this.carried, stored: this.stored, mined: [...this.mined], crate: this.crate,
       target: g.target?.def.id ?? null, deaths: this.deaths, playTime: this.playTime,
+      logs: [...this.logsRead],
     };
     try { localStorage.setItem(SAVE_KEY, JSON.stringify(s)); this.savedAt = g.time; } catch { /* storage full or unavailable */ }
   }
@@ -630,6 +772,7 @@ export class Survival {
     this.mined = new Set(s.mined);
     this.crate = s.crate;
     this.deaths = s.deaths; this.playTime = s.playTime;
+    this.logsRead = new Set(s.logs ?? []);
   }
 
   static load(): SurvivalSave | null {

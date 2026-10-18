@@ -297,7 +297,7 @@ export const BODIES: BodyDef[] = [
     id: 'proxima-b', albedo: 0.3, name: 'Próxima Centauri b', kind: 'rocky', radius: 1.02 * 6371e3, parent: 'proxima', orbit: 0.04856 * AU, angle: 2.9, gravity: 10.1, tempC: -39,
     tempText: '≈ −39 °C de equilibrio (sin efecto invernadero)', pressure: 0.3, composition: 'Desconocida · aquí: N₂ y CO₂ tenues (hipotética)',
     description: 'El exoplaneta confirmado más cercano a la Tierra (2016, HARPS/ESO): masa mínima de 1,07 Tierras en la zona habitable de Próxima. Casi con seguridad en rotación síncrona, con un hemisferio en día perpetuo y otro en noche eterna. Si conserva atmósfera y agua sería un "mundo ojo": océano templado frente a la estrella y hielo en la cara oculta. Así se representa aquí.',
-    facts: ['Masa mínima: 1,07 masas terrestres', 'Período orbital: 11,19 días a 0,0486 UA', 'Recibe el 65% de la luz que la Tierra recibe del Sol', 'Las fulguraciones de Próxima bañan su superficie en rayos X y ultravioleta', 'Objetivo del proyecto Breakthrough Starshot'],
+    facts: ['Masa mínima: 1,07 masas terrestres', 'Período orbital: 11,19 días a 0,0486 UA', 'Recibe el 65% de la luz que la Tierra recibe del Sol', 'Las fulguraciones de Próxima bañan su superficie en rayos X y ultravioleta', 'Objetivo del proyecto Breakthrough Starshot', 'Su vegetación oscura es hipotética: así podrían ser las plantas bajo la luz roja de una enana roja'],
     tilt: 0, scaleHeight: 9000, markerColor: '#7fb8a8', seed: 302,
     atmo: { height: 60e3, betaR: [7e-6, 9e-6, 14e-6], betaM: 8e-6, HR: 9000, HM: 1500, g: 0.76, sun: 20, mieTint: [1, 0.9, 0.8], fogColor: [0.6, 0.55, 0.5], fogDensity: 8e-6, surfaceDensity: 0.3, skyBrightness: 0.6 },
     hazard: { suitDrain: 0.3, text: 'Radiación de las fulguraciones de Próxima' },
@@ -352,7 +352,7 @@ export const BODIES: BodyDef[] = [
     id: 'trappist-1e', albedo: 0.3, name: 'TRAPPIST-1 e', kind: 'rocky', radius: 0.920 * 6371e3, parent: 'trappist-1', orbit: 0.02925 * AU, angle: 1.0, gravity: 8.0, tempC: -23,
     tempText: '≈ −23 °C de equilibrio · templado frente a la estrella si tiene aire', pressure: 0.5, composition: 'Desconocida · aquí: N₂ fino (hipotético; el Webb descartó una atmósfera de hidrógeno)',
     description: 'El candidato más prometedor a tener agua líquida: en plena zona habitable y con una densidad como la de la Tierra. El Webb (2025) descartó una atmósfera gruesa de hidrógeno, pero aún es posible una fina de nitrógeno. Aquí se representa como un "mundo ojo": un océano frente a la estrella rodeado de hielo, con TRAPPIST-1 f en su cielo nocturno, tan grande como nuestra Luna, y g un poco más pequeño.',
-    facts: ['Radio 0,92 Tierras · masa 0,69 Tierras', 'Año: 6,1 días', 'Recibe el 65% de la luz que recibe la Tierra', 'Objetivo principal del Webb: se planean más de 15 observaciones'],
+    facts: ['Radio 0,92 Tierras · masa 0,69 Tierras', 'Año: 6,1 días', 'Recibe el 65% de la luz que recibe la Tierra', 'Objetivo principal del Webb: se planean más de 15 observaciones', 'Su vegetación oscura es hipotética: así podrían ser las plantas bajo la luz roja de una enana roja'],
     tilt: 0, scaleHeight: 9000, markerColor: '#7fb8c8', seed: 404,
     atmo: { height: 60e3, betaR: [2.8e-6, 6.5e-6, 11.2e-6], betaM: 6e-6, HR: 9000, HM: 1400, g: 0.76, sun: 20, mieTint: [1, 0.9, 0.8], fogColor: [0.62, 0.55, 0.52], fogDensity: 6e-6, surfaceDensity: 0.5, skyBrightness: 0.6 },
     hazard: { suitDrain: 0.15, text: 'Frío y radiación de las fulguraciones' },
@@ -394,6 +394,10 @@ export interface TerrainGen {
   rocks(h: number, slope: number): number; // density per m²
   rockScale: number;
   trees?: (x: number, y: number, z: number, h: number, slope: number) => number;
+  /** tree species of a chunk from its centre: 0 conifer, 1 broadleaf, 2 dead (bare trunks), 3 alien (umbrella fronds) */
+  treeKind?: (x: number, y: number, z: number, h: number) => number;
+  /** colour of the trees at a place (linear RGB multiplier; alien canopies take their colour from it) */
+  treeTint?: (x: number, y: number, z: number) => [number, number, number];
   waterDeep?: [number, number, number];
   waterShallow?: [number, number, number];
 }
@@ -408,6 +412,18 @@ type C3 = [number, number, number];
 function mix3(a: C3, b: C3, t: number): C3 {
   return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
 }
+/**
+ * Patches of a region a world's geology or climate makes different (dark lava, bright dust,
+ * frost...): 0..1, `amount` ~ the share of the surface, `sc` its size (m).
+ */
+function regionMask(n: Noise3, px: number, py: number, pz: number, sc: number, amount: number) {
+  const s2 = sc * 0.3;
+  const v = n.noise(px / sc, py / sc, pz / sc) * 0.68 + n.noise(px / s2, py / s2, pz / s2) * 0.32;
+  const t = 0.5 - amount * 1.1;
+  // wide, ragged borders: regions fade into each other instead of ending in a line
+  return smoothstep(t - 0.06, t + 0.22, v);
+}
+interface Region { c: C3; amount: number; sc: number; maria?: boolean }
 
 interface CrateredOpts {
   maria: number;
@@ -422,6 +438,8 @@ interface CrateredOpts {
   irregular?: number;
   stickney?: boolean;
   minCraterCell?: number;
+  /** extra terrains (dark volcanic mantles, bright hollows, blue ice...); maria: only inside the maria */
+  regions?: Region[];
 }
 
 function cratered(R: number, seed: number, o: CrateredOpts): TerrainGen {
@@ -435,6 +453,7 @@ function cratered(R: number, seed: number, o: CrateredOpts): TerrainGen {
   };
   const grooveMask = (px: number, py: number, pz: number) =>
     o.grooves ? smoothstep(-0.05, 0.2, n4.fbm(px, py, pz, R * 0.5, 4, R * 0.01)) : 0;
+  const rn = (o.regions ?? []).map((_, k) => new Noise3(seed + 40 + k));
   return {
     seaLevel: null,
     rockScale: R < 50e3 ? 0.6 : 1,
@@ -466,6 +485,7 @@ function cratered(R: number, seed: number, o: CrateredOpts): TerrainGen {
       const px = x * R, py = y * R, pz = z * R;
       const mare = mareMask(px, py, pz, R * 0.004);
       let c = mix3(o.high, o.mare, mare);
+      o.regions?.forEach((r, k) => { c = mix3(c, r.c, regionMask(rn[k], px, py, pz, r.sc, r.amount) * (r.maria ? mare : 1)); });
       const v = n3.fbm(px, py, pz, R * 0.05, 5, R * 0.0008) * 0.12 + n1.noise(px / 900, py / 900, pz / 900) * 0.04;
       if (o.grooves) {
         const gm = grooveMask(px, py, pz);
@@ -481,6 +501,7 @@ function cratered(R: number, seed: number, o: CrateredOpts): TerrainGen {
 
 function marsGen(R: number, seed: number): TerrainGen {
   const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2), n4 = new Noise3(seed + 3);
+  const m1 = new Noise3(seed + 11), m2 = new Noise3(seed + 12), m3 = new Noise3(seed + 13), m4 = new Noise3(seed + 14), m5 = new Noise3(seed + 15);
   // Olympus Mons ~ 18.65N, 226.2E
   const olat = 0.3255, olon = -2.335;
   const oD = [Math.cos(olat) * Math.cos(olon), Math.sin(olat), Math.cos(olat) * Math.sin(olon)];
@@ -528,6 +549,14 @@ function marsGen(R: number, seed: number): TerrainGen {
       const dark = smoothstep(0.05, 0.4, d);
       let c: C3 = mix3([0.72, 0.4, 0.22], [0.36, 0.22, 0.15], dark);
       c = mix3(c, [0.82, 0.55, 0.36], smoothstep(4000, 15000, h) * 0.6);
+      // Mars' terrains: bright dust deserts (Arabia), dark basaltic dune seas (Syrtis), grey hematite
+      // plains (Meridiani), light-toned clays and layered deposits, frost in the mid latitudes
+      c = mix3(c, [0.8, 0.56, 0.37], regionMask(m1, px, py, pz, 700e3, 0.15) * 0.85);
+      c = mix3(c, [0.24, 0.21, 0.2], regionMask(m2, px, py, pz, 450e3, 0.14) * smoothstep(1500, -1500, h));
+      c = mix3(c, [0.4, 0.3, 0.27], regionMask(m3, px, py, pz, 300e3, 0.08));
+      const layered = Math.sin(h / 60 + n3.noise(px / 4000, py / 4000, pz / 4000) * 3) > 0 ? [0.66, 0.56, 0.44] as C3 : [0.56, 0.44, 0.33] as C3;
+      c = mix3(c, layered, regionMask(m4, px, py, pz, 250e3, 0.08) * smoothstep(0.1, 0.3, slope));
+      c = mix3(c, [0.86, 0.84, 0.83], regionMask(m5, px, py, pz, 120e3, 0.18) * smoothstep(0.5, 0.65, Math.abs(y)) * smoothstep(0.85, 0.8, Math.abs(y)) * 0.6);
       c = mix3(c, [0.42, 0.27, 0.2], smoothstep(0.2, 0.55, slope));
       const v = 1 + n3.noise(px / 700, py / 700, pz / 700) * 0.06;
       const cap = smoothstep(0.9, 0.95, Math.abs(y) + n2.noise(px / 150e3, py / 150e3, pz / 150e3) * 0.03);
@@ -540,6 +569,7 @@ function marsGen(R: number, seed: number): TerrainGen {
 
 function venusGen(R: number, seed: number): TerrainGen {
   const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2);
+  const v1 = new Noise3(seed + 11), v2 = new Noise3(seed + 12);
   return {
     seaLevel: null,
     rockScale: 1,
@@ -558,6 +588,9 @@ function venusGen(R: number, seed: number): TerrainGen {
       const px = x * R, py = y * R, pz = z * R;
       const t = smoothstep(-0.2, 0.4, n1.fbm(px, py, pz, R * 0.08, 5, R * 0.002));
       let c: C3 = mix3([0.3, 0.26, 0.22], [0.48, 0.4, 0.3], t);
+      // smooth dark lava plains, and lobes of fresher, rougher (brighter) flows
+      c = mix3(c, [0.17, 0.15, 0.13], regionMask(v1, px, py, pz, 500e3, 0.2) * smoothstep(1500, 0, h));
+      c = mix3(c, [0.58, 0.47, 0.35], regionMask(v2, px, py, pz, 150e3, 0.12));
       c = mix3(c, [0.22, 0.2, 0.18], smoothstep(0.25, 0.6, slope));
       c = mix3(c, [0.55, 0.5, 0.45], smoothstep(2000, 6000, h) * 0.5);
       put(out, i, c[0], c[1], c[2]);
@@ -577,6 +610,31 @@ function earthGen(R: number, seed: number): TerrainGen {
   const temp = (y: number, h: number, px: number, py: number, pz: number) =>
     1 - Math.abs(y) * 1.12 - Math.max(h, 0) / 4200 + n3.fbm(px, py, pz, R * 0.12, 3, 50e3) * 0.18;
   const moist = (px: number, py: number, pz: number) => n2.fbm(px, py, pz, R * 0.18, 5, 5000) * 0.6 + 0.5;
+  // Regions a few hundred km wide that climate alone does not explain: dead forests (fire,
+  // blight) next to living ones, heathland, red badlands, salt flats and old lava fields.
+  const n6 = new Noise3(seed + 5), n7 = new Noise3(seed + 6);
+  const region = (n: Noise3, px: number, py: number, pz: number, sc: number) =>
+    n.noise(px / sc, py / sc, pz / sc) * 0.7 + n.noise(px / (sc * 0.27), py / (sc * 0.27), pz / (sc * 0.27)) * 0.3;
+  const zones = (px: number, py: number, pz: number) => {
+    const a = region(n6, px, py, pz, 600e3), b = region(n7, px, py, pz, 450e3);
+    return { dead: smoothstep(0.22, 0.36, a), heath: smoothstep(0.28, 0.42, -a), red: smoothstep(0.12, 0.28, b), salt: smoothstep(0.42, 0.52, b), lava: smoothstep(0.46, 0.56, -b) };
+  };
+  /** biome weights (0..1) from temperature, moisture, altitude and the regions */
+  const biomes = (t: number, m: number, h: number, slope: number, zn: ReturnType<typeof zones>) => {
+    const dry = smoothstep(0.45, 0.3, m);
+    return {
+      jungle: smoothstep(0.55, 0.7, t) * smoothstep(0.58, 0.7, m),
+      savanna: smoothstep(0.5, 0.62, t) * smoothstep(0.55, 0.46, m) * smoothstep(0.3, 0.4, m),
+      steppe: smoothstep(0.52, 0.38, t) * smoothstep(0.22, 0.32, t) * smoothstep(0.46, 0.36, m),
+      desert: smoothstep(0.45, 0.62, t) * dry,
+      red: zn.red * smoothstep(0.46, 0.34, m) * smoothstep(0.3, 0.42, t),
+      salt: zn.salt * smoothstep(0.34, 0.24, m) * smoothstep(0.08, 0.03, slope) * smoothstep(700, 300, h),
+      heath: zn.heath * smoothstep(0.5, 0.6, m) * smoothstep(0.18, 0.28, t) * smoothstep(0.52, 0.42, t),
+      swamp: smoothstep(45, 15, h) * smoothstep(0.56, 0.66, m) * smoothstep(0.3, 0.42, t),
+      dead: zn.dead * smoothstep(0.36, 0.48, m) * smoothstep(0.14, 0.24, t),
+      lava: zn.lava * smoothstep(0.5, 0.3, m),
+    };
+  };
   return {
     seaLevel: 0,
     rockScale: 1,
@@ -612,15 +670,28 @@ function earthGen(R: number, seed: number): TerrainGen {
       } else {
         const t = temp(y, h, px, py, pz);
         const m = moist(px, py, pz);
+        const bm = biomes(t, m, h, slope, zones(px, py, pz));
         const grass: C3 = [0.3, 0.42, 0.15];
         const forest: C3 = [0.11, 0.24, 0.07];
         const desert: C3 = [0.76, 0.62, 0.42];
         const taiga: C3 = [0.15, 0.23, 0.13];
         const tundra: C3 = [0.44, 0.41, 0.33];
+        // red badlands show their strata: bands of rock by altitude
+        const band = Math.sin(h / 14 + nv * 25) > 0.15;
         c = mix3(grass, forest, smoothstep(0.45, 0.65, m));
-        c = mix3(c, desert, smoothstep(0.45, 0.62, t) * smoothstep(0.45, 0.3, m));
+        c = mix3(c, [0.05, 0.2, 0.05], bm.jungle);
+        c = mix3(c, [0.55, 0.49, 0.24], bm.savanna);
+        c = mix3(c, [0.48, 0.46, 0.3], bm.steppe);
+        c = mix3(c, desert, bm.desert);
+        c = mix3(c, band ? [0.62, 0.33, 0.19] : [0.47, 0.23, 0.14], bm.red);
+        c = mix3(c, [0.88, 0.86, 0.82], bm.salt);
+        c = mix3(c, [0.36, 0.26, 0.32], bm.heath);
+        c = mix3(c, [0.13, 0.16, 0.08], bm.swamp);
         c = mix3(c, taiga, smoothstep(0.4, 0.25, t));
         c = mix3(c, tundra, smoothstep(0.22, 0.1, t));
+        // dead forest: grey-brown ground under bare trunks, next to living forests
+        c = mix3(c, [0.27, 0.24, 0.2], bm.dead);
+        c = mix3(c, [0.08, 0.075, 0.07], bm.lava);
         c = mix3(c, [0.4, 0.37, 0.33], smoothstep(0.3, 0.55, slope));
         c = mix3(c, [0.95, 0.96, 0.98], smoothstep(0.08, -0.02, t) * (1 - smoothstep(0.55, 0.8, slope)));
       }
@@ -634,8 +705,17 @@ function earthGen(R: number, seed: number): TerrainGen {
       const t = temp(y, h, px, py, pz);
       const m = moist(px, py, pz);
       if (t < 0.12) return 0;
-      const d = smoothstep(0.42, 0.62, m) * (1 - smoothstep(0.45, 0.62, t) * smoothstep(0.45, 0.3, m));
-      return d * 0.004 * (0.5 + 0.5 * n4.noise(px / 300, py / 300, pz / 300) + 0.3) + 0.00008;
+      const bm = biomes(t, m, h, slope, zones(px, py, pz));
+      let d = smoothstep(0.42, 0.62, m) * (1 - bm.desert) + bm.jungle * 1.5 + bm.savanna * 0.08;
+      const open = Math.max(bm.steppe * 0.9, bm.red, bm.salt, bm.lava, bm.heath * 0.75);
+      d *= 1 - open;
+      return d * 0.004 * (0.5 + 0.5 * n4.noise(px / 300, py / 300, pz / 300) + 0.3) + 0.00008 * (1 - open);
+    },
+    treeKind(x, y, z, h) {
+      if (Math.abs(y) > 0.62 || h > 1800) return 0;
+      const px = x * R, py = y * R, pz = z * R;
+      const bm = biomes(temp(y, h, px, py, pz), moist(px, py, pz), h, 0, zones(px, py, pz));
+      return bm.dead > 0.5 ? 2 : 1;
     },
   };
 }
@@ -714,6 +794,7 @@ function europaGen(R: number, seed: number): TerrainGen {
 
 function titanGen(R: number, seed: number): TerrainGen {
   const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2);
+  const t1 = new Noise3(seed + 11);
   return {
     seaLevel: 0,
     rockScale: 0.7,
@@ -739,6 +820,9 @@ function titanGen(R: number, seed: number): TerrainGen {
       const dm = smoothstep(0.55, 0.2, Math.abs(y));
       let c: C3 = mix3([0.58, 0.44, 0.27], [0.27, 0.19, 0.11], dm * smoothstep(-0.3, 0.2, n1.fbm(px, py, pz, R * 0.1, 4, R * 0.003)));
       c = mix3(c, [0.2, 0.15, 0.1], smoothstep(30, 0, h));
+      // bright icy highlands (like Xanadu), and methane-soaked dark ground around the lakes
+      c = mix3(c, [0.68, 0.6, 0.44], regionMask(t1, px, py, pz, 600e3, 0.14) * smoothstep(250, 600, h));
+      c = mix3(c, [0.14, 0.1, 0.07], smoothstep(120, 10, h) * smoothstep(0.6, 0.8, Math.abs(y)));
       c = mix3(c, [0.42, 0.33, 0.22], smoothstep(0.3, 0.6, slope));
       put(out, i, c[0], c[1], c[2]);
     },
@@ -781,7 +865,19 @@ function tritonGen(R: number, seed: number): TerrainGen {
  */
 function eyeballGen(R: number, seed: number, sub: [number, number, number], iceAt = 0): TerrainGen {
   const n1 = new Noise3(seed), n2 = new Noise3(seed + 1), n3 = new Noise3(seed + 2), n4 = new Noise3(seed + 3);
+  const e1 = new Noise3(seed + 11), e2 = new Noise3(seed + 12), e3 = new Noise3(seed + 13);
   const day = (x: number, y: number, z: number) => x * sub[0] + y * sub[1] + z * sub[2];
+  // Hypothetical life under a red dwarf: plants that drink its dim red light would be dark
+  // (purple, crimson, almost black). It grows in the temperate ring between the scorched
+  // point facing the star and the ice, where the ground is wet enough and not too high.
+  const life = (x: number, y: number, z: number, px: number, py: number, pz: number, h: number) => {
+    const d = day(x, y, z);
+    const ring = smoothstep(iceAt + 0.08, iceAt + 0.25, d) * smoothstep(0.82, 0.6, d);
+    const wet = smoothstep(-0.15, 0.2, e1.noise(px / 300e3, py / 300e3, pz / 300e3) * 0.7 + e1.noise(px / 60e3, py / 60e3, pz / 60e3) * 0.3);
+    return ring * wet * smoothstep(1800, 300, h) * smoothstep(3, 12, h);
+  };
+  /** which flora: 0 purple moss, 1 crimson meadows, 2 black forests */
+  const flora = (px: number, py: number, pz: number) => e2.noise(px / 200e3, py / 200e3, pz / 200e3) * 0.75 + e2.noise(px / 40e3, py / 40e3, pz / 40e3) * 0.25;
   // ice where cos(angle from the substellar point) < iceAt: 0 = half the planet, 0.4 = a smaller "eye"
   const iceMask = (x: number, y: number, z: number, px: number, py: number, pz: number) =>
     smoothstep(iceAt + 0.15, iceAt - 0.15, day(x, y, z) + n4.fbm(px, py, pz, R * 0.2, 3, 20e3) * 0.12);
@@ -819,12 +915,36 @@ function eyeballGen(R: number, seed: number, sub: [number, number, number], iceA
       else {
         c = mix3([0.45, 0.33, 0.24], [0.3, 0.25, 0.22], smoothstep(-0.3, 0.3, n3.fbm(px, py, pz, R * 0.1, 4, R * 0.003)));
         c = mix3(c, [0.28, 0.22, 0.18], smoothstep(0.5, 0.9, d) * 0.5); // scorched basalt near the substellar point
+        // near the hot pole: iron-red deserts and white salt pans where seas dried out
+        c = mix3(c, [0.6, 0.3, 0.17], smoothstep(0.55, 0.8, d) * regionMask(e3, px, py, pz, 250e3, 0.3));
+        c = mix3(c, [0.83, 0.79, 0.73], smoothstep(0.5, 0.75, d) * smoothstep(60, 8, h) * smoothstep(0.08, 0.02, slope));
+        const lf = life(x, y, z, px, py, pz, h);
+        if (lf > 0) {
+          const f = flora(px, py, pz);
+          let veg: C3 = mix3([0.2, 0.08, 0.18], [0.42, 0.1, 0.12], smoothstep(-0.05, 0.15, f));
+          veg = mix3(veg, [0.07, 0.05, 0.08], smoothstep(0.25, 0.4, f));
+          c = mix3(c, veg, lf * (1 - smoothstep(0.3, 0.55, slope)));
+        }
         c = mix3(c, [0.5, 0.47, 0.44], smoothstep(0.3, 0.6, slope));
       }
       c = mix3(c, [0.88, 0.92, 0.97], ice * (1 - smoothstep(0.55, 0.85, slope)));
       put(out, i, c[0] * v, c[1] * v, c[2] * v);
     },
     rocks: (h, slope) => (h > 3 ? 0.004 + smoothstep(0.25, 0.6, slope) * 0.03 : 0),
+    trees(x, y, z, h, slope) {
+      if (slope > 0.3) return 0;
+      const px = x * R, py = y * R, pz = z * R;
+      const lf = life(x, y, z, px, py, pz, h);
+      if (lf <= 0) return 0;
+      // the black forests are dense, the meadows have only scattered fronds
+      const f = flora(px, py, pz);
+      return lf * (0.0003 + 0.0045 * smoothstep(0.2, 0.4, f));
+    },
+    treeKind: () => 3,
+    treeTint(x, y, z) {
+      const f = flora(x * R, y * R, z * R);
+      return f > 0.3 ? [0.1, 0.07, 0.12] : f > 0.05 ? [0.55, 0.1, 0.12] : [0.4, 0.13, 0.36];
+    },
   };
 }
 
@@ -839,21 +959,27 @@ export function makeGenerator(def: BodyDef): TerrainGen | null {
   switch (def.id) {
     // TRAPPIST-1: scorched dark rock (b, c), a dry desert (d), an ocean "eye" (e), ice (f, g, h)
     case 'trappist-1b':
-      return cratered(R, s, { maria: 0.15, craterDensity: 0.5, craterDepth: 0.9, hill: 1500, high: [0.3, 0.27, 0.25], mare: [0.17, 0.15, 0.14], rough: 2 });
+      return cratered(R, s, { maria: 0.15, craterDensity: 0.5, craterDepth: 0.9, hill: 1500, high: [0.3, 0.27, 0.25], mare: [0.17, 0.15, 0.14], rough: 2,
+        regions: [{ c: [0.1, 0.085, 0.08], amount: 0.2, sc: 400e3 }, { c: [0.42, 0.34, 0.26], amount: 0.1, sc: 200e3 }] });
     case 'trappist-1c':
       return cratered(R, s, { maria: 0.1, craterDensity: 0.55, craterDepth: 0.9, hill: 1400, high: [0.44, 0.38, 0.32], mare: [0.3, 0.26, 0.22], rough: 2 });
     case 'trappist-1d':
-      return cratered(R, s, { maria: 0.2, craterDensity: 0.45, craterDepth: 0.7, hill: 1300, high: [0.62, 0.48, 0.34], mare: [0.42, 0.32, 0.24], rough: 2.5 });
+      return cratered(R, s, { maria: 0.2, craterDensity: 0.45, craterDepth: 0.7, hill: 1300, high: [0.62, 0.48, 0.34], mare: [0.42, 0.32, 0.24], rough: 2.5,
+        regions: [{ c: [0.8, 0.72, 0.58], amount: 0.14, sc: 300e3 }, { c: [0.55, 0.3, 0.18], amount: 0.16, sc: 500e3 }] });
     case 'trappist-1e': return eyeballGen(R, s, substellar(def), 0.3);
     case 'trappist-1f': return europaGen(R, s);
     case 'trappist-1g': return tritonGen(R, s);
     case 'trappist-1h':
-      return cratered(R, s, { maria: 0.1, craterDensity: 0.6, craterDepth: 0.8, hill: 1000, high: [0.72, 0.72, 0.75], mare: [0.5, 0.5, 0.55], rough: 1.5 });
+      return cratered(R, s, { maria: 0.1, craterDensity: 0.6, craterDepth: 0.8, hill: 1000, high: [0.72, 0.72, 0.75], mare: [0.5, 0.5, 0.55], rough: 1.5,
+        regions: [{ c: [0.55, 0.66, 0.8], amount: 0.18, sc: 300e3 }, { c: [0.45, 0.4, 0.36], amount: 0.1, sc: 200e3 }] });
     case 'proxima-d':
-      return cratered(R, s, { maria: 0.08, craterDensity: 0.55, craterDepth: 0.9, hill: 1200, high: [0.42, 0.36, 0.3], mare: [0.3, 0.25, 0.2], rough: 2 });
+      return cratered(R, s, { maria: 0.08, craterDensity: 0.55, craterDepth: 0.9, hill: 1200, high: [0.42, 0.36, 0.3], mare: [0.3, 0.25, 0.2], rough: 2,
+        regions: [{ c: [0.13, 0.11, 0.1], amount: 0.18, sc: 350e3 }] });
     case 'proxima-b': return eyeballGen(R, s, substellar(def));
     case 'mercury':
-      return cratered(R, s, { maria: 0.12, craterDensity: 0.62, craterDepth: 1, hill: 1500, high: [0.5, 0.47, 0.44], mare: [0.58, 0.55, 0.5], rough: 2 });
+      // Mercury: broad areas of dark "low-reflectance material"
+      return cratered(R, s, { maria: 0.12, craterDensity: 0.62, craterDepth: 1, hill: 1500, high: [0.5, 0.47, 0.44], mare: [0.58, 0.55, 0.5], rough: 2,
+        regions: [{ c: [0.36, 0.34, 0.33], amount: 0.14, sc: 500e3 }] });
     case 'venus': return venusGen(R, s);
     case 'earth': return earthGen(R, s);
     case 'moon':
@@ -868,7 +994,8 @@ export function makeGenerator(def: BodyDef): TerrainGen | null {
     case 'ganymede':
       return cratered(R, s, { maria: 0, craterDensity: 0.42, craterDepth: 0.6, hill: 900, high: [0.38, 0.35, 0.31], mare: [0.38, 0.35, 0.31], rough: 1.5, grooves: 220 });
     case 'callisto':
-      return cratered(R, s, { maria: 0, craterDensity: 0.8, craterDepth: 0.7, hill: 1000, high: [0.3, 0.27, 0.24], mare: [0.3, 0.27, 0.24], rough: 1.5, brightPeaks: 0.8 });
+      return cratered(R, s, { maria: 0, craterDensity: 0.8, craterDepth: 0.7, hill: 1000, high: [0.3, 0.27, 0.24], mare: [0.3, 0.27, 0.24], rough: 1.5, brightPeaks: 0.8,
+        regions: [{ c: [0.55, 0.53, 0.5], amount: 0.12, sc: 400e3 }] });
     case 'titan': return titanGen(R, s);
     case 'triton': return tritonGen(R, s);
   }

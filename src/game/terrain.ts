@@ -95,6 +95,8 @@ function gridIndex() {
 let ROCK_GEO: THREE.BufferGeometry | null = null;
 let CONIFER_GEO: THREE.BufferGeometry | null = null;
 let BROAD_GEO: THREE.BufferGeometry | null = null;
+let DEAD_GEO: THREE.BufferGeometry | null = null;
+let ALIEN_GEO: THREE.BufferGeometry | null = null;
 function rockGeo() {
   if (ROCK_GEO) return ROCK_GEO;
   const g = new THREE.IcosahedronGeometry(1, 2);
@@ -130,6 +132,44 @@ function coniferGeo() {
   CONIFER_GEO = mergeGeometries(parts)!;
   CONIFER_GEO.computeVertexNormals();
   return CONIFER_GEO;
+}
+/** a dead tree: a grey trunk and a few bare branches */
+function deadGeo() {
+  if (DEAD_GEO) return DEAD_GEO;
+  const bark: [number, number, number] = [0.16, 0.135, 0.11];
+  const parts = [colorize(new THREE.CylinderGeometry(0.1, 0.26, 5.2, 6).translate(0, 2.6, 0).toNonIndexed(), bark)];
+  for (const [y, a, tilt, len] of [[2.4, 0.3, 0.9, 1.9], [3.1, 2.4, 0.8, 1.6], [3.8, 4.3, 1.0, 1.4], [4.5, 1.2, 0.6, 1.1]]) {
+    const b = new THREE.CylinderGeometry(0.03, 0.08, len, 5).translate(0, len / 2, 0);
+    b.rotateZ(tilt);
+    b.rotateY(a);
+    b.translate(0, y, 0);
+    parts.push(colorize(b.toNonIndexed(), bark));
+  }
+  DEAD_GEO = mergeGeometries(parts)!;
+  DEAD_GEO.computeVertexNormals();
+  return DEAD_GEO;
+}
+/** an alien tree: a tall slender stem under a drooping umbrella of fronds (coloured per tree) */
+function alienGeo() {
+  if (ALIEN_GEO) return ALIEN_GEO;
+  const n = new Noise3(91);
+  const crown = new THREE.SphereGeometry(3.2, 14, 6, 0, Math.PI * 2, 0, Math.PI * 0.42);
+  const p = crown.attributes.position as THREE.BufferAttribute;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i);
+    v.y = (v.y - 3.2) * 0.9 + n.noise(v.x * 0.8, 0, v.z * 0.8) * 0.25; // a flattened, drooping dome
+    p.setXYZ(i, v.x, v.y, v.z);
+  }
+  crown.translate(0, 7.4, 0);
+  const parts = [
+    colorize(new THREE.CylinderGeometry(0.1, 0.22, 7, 6).translate(0, 3.5, 0).toNonIndexed(), [0.3, 0.26, 0.28]),
+    colorize(crown.toNonIndexed(), [0.8, 0.8, 0.8]),
+    colorize(new THREE.SphereGeometry(0.45, 8, 6).translate(0, 7.3, 0).toNonIndexed(), [0.9, 0.85, 0.8]),
+  ];
+  ALIEN_GEO = mergeGeometries(parts)!;
+  ALIEN_GEO.computeVertexNormals();
+  return ALIEN_GEO;
 }
 function broadGeo() {
   if (BROAD_GEO) return BROAD_GEO;
@@ -270,7 +310,7 @@ export class PlanetTerrain {
     }
 
     if (data.rocks) this.addInstances(node, rockGeo(), this.rockMaterial, data.rocks.count, data.rocks.matrices, data.rocks.colors);
-    if (data.trees) this.addInstances(node, data.trees.conifer ? coniferGeo() : broadGeo(), this.treeMaterial, data.trees.count, data.trees.matrices, data.trees.colors);
+    if (data.trees) this.addInstances(node, [coniferGeo, broadGeo, deadGeo, alienGeo][data.trees.kind]?.() ?? broadGeo(), this.treeMaterial, data.trees.count, data.trees.matrices, data.trees.colors);
 
     node.built = true;
     this.chunkCount++;

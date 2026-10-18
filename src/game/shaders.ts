@@ -991,8 +991,9 @@ function patchChunk(src: string, edits: [string, string][]) {
 }
 
 // ---------------------------------------------------------------------------
-export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
-  const uniforms = {
+export type TerrainUniforms = ReturnType<typeof terrainUniforms>;
+function terrainUniforms() {
+  return {
     uDetailOffset: { value: new THREE.Vector3() },
     uDetail: { value: 1 },
     /** aerial perspective, vectors in view space */
@@ -1020,6 +1021,14 @@ export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
     uCloudOpac: { value: 0 },
     uCloudCam: { value: 1 },
   };
+}
+/**
+ * Terrain lighting: detail noise, night look, haze, cloud shadows, far sunlight. Things
+ * standing on a world (the ruined cities) can share its uniforms, so they get exactly the
+ * same light and haze as the ground under them; `key` must differ when the shader is changed further.
+ */
+export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial, shared?: TerrainUniforms, key = 'terrain-v1') {
+  const uniforms = shared ?? terrainUniforms();
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
@@ -1128,7 +1137,7 @@ if ( uFarSun.r + uFarSun.g + uFarSun.b > 0.0 ) {
 #include <dithering_fragment>`,
       );
   };
-  mat.customProgramCacheKey = () => 'terrain-v1';
+  mat.customProgramCacheKey = () => key;
   return uniforms;
 }
 

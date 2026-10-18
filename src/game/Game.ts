@@ -14,6 +14,7 @@ import {
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
 import { Survival, type GameMode, type SurvivalHud, type SurvivalSave } from './survival';
+import { RuinedEarth } from './ruins';
 
 interface Body {
   def: BodyDef;
@@ -96,6 +97,8 @@ export interface HudState {
   gameMode: GameMode;
   /** survival mode only */
   survival: SurvivalHud | null;
+  /** the nearest ruined city on Earth, when close */
+  ruin: { name: string; dist: number } | null;
 }
 
 /**
@@ -283,6 +286,8 @@ export class Game {
   gameMode: GameMode = 'explore';
   /** survival-mode state and rules (null in realistic exploration) */
   surv: Survival | null = null;
+  /** Earth's ruined cities (part of the world in both modes) */
+  ruins!: RuinedEarth;
   onMenuToggle?: (open: boolean) => void;
   /** lets the title screen's lights button follow the L key */
   onLightsModeChange?: (mode: LightsMode) => void;
@@ -453,6 +458,7 @@ export class Game {
     this.applyLightsMode();
 
     this.spawnStart();
+    this.ruins = new RuinedEarth(this, this.byId.get('earth')!);
     this.bindInput();
     window.addEventListener('resize', this.onResize);
     this.lastT = performance.now();
@@ -968,6 +974,10 @@ export class Game {
     const s = continueSave ? Survival.load() : null;
     if (s && this.restoreSurvival(s)) return true;
     Survival.clear();
+    // a new game: the ship's computer wakes the pilot over the silent Earth
+    this.surv.intro = true;
+    this.target = this.byId.get('earth')!;
+    this.surv.save(); // "Continuar" exists from the first second
     return false;
   }
 
@@ -1427,6 +1437,7 @@ export class Game {
     } else {
       this.onGround = false;
     }
+    if (def.id === 'earth') this.ruins.collide(this.playerPos, this.playerVel);
     this.altitude = r - gr;
     // facing / animation
     const tSpeed = vt.length();
@@ -2254,7 +2265,12 @@ export class Game {
     this.updateSystemPrep();
     this.nearest = this.findNearest(focus).body;
     if (!this.nearest.built) this.prepareSystem(this.nearest.star, true);
-    if (!this.dead && !this.menuOpen) {
+    const sv = this.surv;
+    if (sv?.reading && (this.pressed.has('KeyR') || this.pressed.has('Enter') || this.pressed.has('Space'))) {
+      sv.closeLog();
+      this.pressed.clear(); // that key must not also jump or mine
+    }
+    if (!this.dead && !this.menuOpen && !sv?.reading) {
       if (this.mode === 'ship') this.updateShip(dt);
       else this.updateFoot(dt);
       this.updateEnvironment(dt);
@@ -2264,6 +2280,7 @@ export class Game {
     this.updateCamera(dt);
     this.updateTerrain();
     this.updateScene(dt);
+    this.ruins.update();
     this.surv?.render();
     this.updateGasBake();
     this.updateMarkers();
@@ -2330,12 +2347,18 @@ export class Game {
       zoom: VISION_FOV_MAX / this.camera.fov,
       gameMode: this.gameMode,
       survival: this.surv?.hud() ?? null,
+      ruin: (() => {
+        if (def.id !== 'earth') return null;
+        const n = this.ruins.nearest(p, 150e3);
+        return n ? { name: n.site.name, dist: n.dist } : null;
+      })(),
     };
   }
 
   dispose() {
     this.disposed = true;
     this.surv?.dispose();
+    this.ruins.dispose();
     cancelAnimationFrame(this.raf);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
