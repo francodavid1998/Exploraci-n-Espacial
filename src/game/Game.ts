@@ -13,6 +13,7 @@ import {
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
+import { Survival, type GameMode, type SurvivalHud, type SurvivalSave } from './survival';
 
 interface Body {
   def: BodyDef;
@@ -92,6 +93,9 @@ export interface HudState {
   vision: boolean;
   /** vision mode magnification (1 = no zoom) */
   zoom: number;
+  gameMode: GameMode;
+  /** survival mode only */
+  survival: SurvivalHud | null;
 }
 
 /**
@@ -275,6 +279,10 @@ export class Game {
   private bakeSize = 1024;
   /** false while the title screen is up: the simulation stays paused and M / Tab cannot open the map */
   started = false;
+  /** 'explore' = the realistic simulator exactly as it is; 'survival' adds life support, fuel, mining... */
+  gameMode: GameMode = 'explore';
+  /** survival-mode state and rules (null in realistic exploration) */
+  surv: Survival | null = null;
   onMenuToggle?: (open: boolean) => void;
   /** lets the title screen's lights button follow the L key */
   onLightsModeChange?: (mode: LightsMode) => void;
@@ -927,12 +935,14 @@ export class Game {
     this.mode = 'ship';
     this.dead = null;
     this.pressureNotes.clear();
-    this.note('Nave reconstruida en órbita');
+    if (this.surv) this.surv.onRevive(true);
+    else this.note('Nave reconstruida en órbita');
   }
 
-  private die(reason: string) {
+  die(reason: string) {
     if (this.dead) return;
     this.dead = reason;
+    this.surv?.onDeath(this.mode === 'foot');
     this.warp = false;
     if (document.pointerLockElement) document.exitPointerLock();
   }
@@ -941,7 +951,8 @@ export class Game {
     this.mode = 'ship';
     this.suit = 100;
     this.dead = null;
-    this.note('Has despertado a bordo de la nave');
+    if (this.surv) this.surv.onRevive(false);
+    else this.note('Has despertado a bordo de la nave');
   }
 
   revive() {
@@ -950,8 +961,40 @@ export class Game {
     else this.respawn();
   }
 
+  /** Survival mode: a new game (the old save is replaced) or the saved one. */
+  startSurvival(continueSave: boolean) {
+    this.gameMode = 'survival';
+    this.surv = new Survival(this, this.markerLayer);
+    const s = continueSave ? Survival.load() : null;
+    if (s && this.restoreSurvival(s)) return true;
+    Survival.clear();
+    return false;
+  }
+
+  private restoreSurvival(s: SurvivalSave) {
+    const b = this.byId.get(s.body);
+    if (!b) return false;
+    if (b.star !== this.sunBody) this.switchFrame(b.star);
+    this.prepareSystem(b.star, true);
+    this.surv!.apply(s);
+    this.shipPos.copy(b.pos).add(new THREE.Vector3(...s.off));
+    this.shipQ.fromArray(s.q).normalize();
+    this.camQ.copy(this.shipQ);
+    this.shipVel.set(0, 0, 0);
+    this.throttle = 0;
+    this.landed = s.landed;
+    this.mode = 'ship';
+    this.hull = s.hull;
+    this.suit = s.health;
+    this.target = s.target ? this.byId.get(s.target) ?? null : null;
+    this.nearest = b;
+    this.lastCamWorld.copy(this.shipPos);
+    this.camWorld.copy(this.shipPos);
+    return true;
+  }
+
   // -------------------------------------------------------------------------
-  private terrainH(b: Body, dir: THREE.Vector3) {
+  terrainH(b: Body, dir: THREE.Vector3) {
     return b.terrain ? b.terrain.heightAt(dir.x, dir.y, dir.z) : 0;
   }
 
@@ -1154,6 +1197,7 @@ export class Game {
     if (this.pressed.has('KeyJ')) {
       if (this.warp) {
         this.warp = false;
+        this.surv?.warpEnded();
         this.shipVel.copy(fwd).multiplyScalar(Math.min(this.warpSpeed, 2e5));
         this.note('Motor de pulso desactivado');
       } else if (this.landed) {
@@ -1162,7 +1206,7 @@ export class Game {
         this.note('Sal de la atmósfera para activar el motor de pulso');
       } else if (alt < 15000 && def.kind !== 'star') {
         this.note('Demasiado cerca de la superficie para el salto');
-      } else {
+      } else if (this.surv?.jumpStart() !== 'no') {
         this.warp = true;
         this.warpT = 0;
         this.warpSpeed = Math.max(this.shipVel.length(), 8000);
@@ -1175,12 +1219,13 @@ export class Game {
             how = ` · arranque rápido a ${formatSpeed(this.warpSpeed)}`;
           }
         }
-        this.note((this.autopilot && this.target ? `Salto hacia ${this.target.def.name} (piloto automático)` : 'Salto libre: dirige la nave con el ratón') + how);
+        if (!this.surv?.emergency) this.note((this.autopilot && this.target ? `Salto hacia ${this.target.def.name} (piloto automático)` : 'Salto libre: dirige la nave con el ratón') + how);
       }
     }
 
     if (this.warp) {
       this.warpT += dt;
+      this.surv?.warpBurn(dt, this.warpSpeed);
       // Free flight by default: the ship goes wherever you point it, whatever the
       // selected destination. Only with the autopilot on (K) does it steer there.
       const tgt = this.autopilot ? this.target : null;
@@ -1216,6 +1261,7 @@ export class Game {
       if (!stop && nn.alt < 15000 && nn.body.def.kind !== 'star') stop = `Demasiado cerca de ${nn.body.def.name}: motor de pulso desactivado`;
       if (stop) {
         this.warp = false;
+        this.surv?.warpEnded();
         this.shipVel.copy(f2).multiplyScalar(Math.min(this.warpSpeed, Math.max(nn.alt, 1000) * 0.3));
         this.throttle = 0.6;
         this.note(stop);
@@ -1233,10 +1279,13 @@ export class Game {
     if (def.kind === 'star') maxS = clamp(altEff * 0.5, 1e5, 1e8); // fast enough to dive at the Sun
     if (boost) maxS = Math.min(maxS * 3.5, Math.max(1e7, maxS));
     const vert = (k.has('Space') ? 1 : 0) - (k.has('KeyC') || k.has('KeyQ') ? 1 : 0);
+    // survival: the engines burn fuel, and an empty tank leaves only the weak reserve thrusters
+    if (this.surv && !this.landed && !this.autoLand) maxS *= this.surv.thrustBurn(dt, this.throttle, boost, vert);
 
     if (this.landed) {
       this.shipVel.set(0, 0, 0);
-      this.hull = Math.min(100, this.hull + dt * 2);
+      // exploration repairs itself on the ground; in survival only metal repairs the hull
+      if (!this.surv) this.hull = Math.min(100, this.hull + dt * 2);
       // align with surface
       const q = new THREE.Quaternion().setFromUnitVectors(sUp, up);
       this.shipQ.premultiply(new THREE.Quaternion().slerp(q, Math.min(1, dt * 3))).normalize();
@@ -1396,7 +1445,7 @@ export class Game {
       const sd = this.sunBody.pos.clone().sub(this.playerPos).normalize();
       d = sd.dot(up) > 0 ? 2.2 : 0.8;
     }
-    if (def.id === 'earth') d = -5;
+    if (def.id === 'earth' && !this.surv) d = -5; // breathable air: exploration only
     this.suit = clamp(this.suit - d * dt, -1, 100);
     if (this.suit <= 0) {
       this.die(def.id === 'venus' ? 'El traje colapsó bajo 92 bar de presión y 464 °C. Ningún humano podría sobrevivir en la superficie de Venus.' : `Tu traje espacial falló en ${def.name}: ${def.hazard?.text || 'daños críticos'}.`);
@@ -2180,7 +2229,10 @@ export class Game {
     if (this.vision) { const z = this.camera.fov / VISION_FOV_MAX; this.mdx *= z; this.mdy *= z; }
     if (this.pressed.has('KeyO')) this.toggleVision();
 
-    if (this.pressed.has('KeyF')) { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
+    if (this.pressed.has('KeyF')) {
+      if (!this.lightsOn && this.surv && this.mode === 'foot' && !this.surv.canLight()) this.note('Batería agotada: recárgala al sol o en la nave');
+      else { this.lightsOn = !this.lightsOn; this.note(this.lightsOn ? 'Luces encendidas' : 'Luces apagadas'); }
+    }
     if (this.pressed.has('KeyL')) {
       this.setLightsMode(this.lightsMode === 'comfort' ? 'bright' : 'comfort');
       this.note(this.lightsMode === 'comfort' ? 'Luces cómodas: brillos y resplandores atenuados' : 'Luces brillantes: aspecto original');
@@ -2206,11 +2258,13 @@ export class Game {
       if (this.mode === 'ship') this.updateShip(dt);
       else this.updateFoot(dt);
       this.updateEnvironment(dt);
+      this.surv?.update(dt);
     }
     this.nearest = this.findNearest(this.mode === 'ship' ? this.shipPos : this.playerPos).body;
     this.updateCamera(dt);
     this.updateTerrain();
     this.updateScene(dt);
+    this.surv?.render();
     this.updateGasBake();
     this.updateMarkers();
     this.composer.render();
@@ -2274,11 +2328,14 @@ export class Game {
       fastStart: this.fastStart,
       vision: this.vision,
       zoom: VISION_FOV_MAX / this.camera.fov,
+      gameMode: this.gameMode,
+      survival: this.surv?.hud() ?? null,
     };
   }
 
   dispose() {
     this.disposed = true;
+    this.surv?.dispose();
     cancelAnimationFrame(this.raf);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);

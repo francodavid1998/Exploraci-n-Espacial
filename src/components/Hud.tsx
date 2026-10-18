@@ -3,6 +3,8 @@ import type { Game, HudState } from '../game/Game';
 import { formatDist, formatSpeed } from '../game/Game';
 import { BODIES, C_LIGHT } from '../game/bodies';
 
+const barColor = (v: number, ok: string) => (v > 50 ? ok : v > 25 ? '#fbbf24' : '#ef4444');
+
 function Bar({ value, color, label }: { value: number; color: string; label: string }) {
   return (
     <div className="w-44">
@@ -72,6 +74,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
       </div>
     );
   }
+  const sv = s.survival;
   const isGas = s.bodyKind === 'Gigante gaseoso';
   const altLabel = isGas ? (s.altitude < 0 ? 'Profundidad' : 'Sobre nubes') : 'Altitud';
   const altVal = isGas && s.altitude < 0 ? formatDist(-s.altitude) : formatDist(s.altitude);
@@ -170,21 +173,41 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
         </div>
         {s.mode === 'ship' ? (
           <div className="flex flex-col gap-2">
-            <Bar label="CASCO" value={s.hull} color={s.hull > 50 ? '#7dd3fc' : s.hull > 25 ? '#fbbf24' : '#ef4444'} />
+            <Bar label="CASCO" value={s.hull} color={barColor(s.hull, '#7dd3fc')} />
+            {sv && <Bar label="COMBUSTIBLE" value={sv.fuel} color={barColor(sv.fuel, '#fb923c')} />}
             <Bar label="EMPUJE" value={Math.max(0, s.throttle) * 100} color="#a78bfa" />
           </div>
         ) : (
           <div className="flex flex-col gap-2">
-            <Bar label="TRAJE" value={s.suit} color={s.suit > 50 ? '#86efac' : s.suit > 25 ? '#fbbf24' : '#ef4444'} />
+            <Bar label={sv ? 'SALUD' : 'TRAJE'} value={s.suit} color={barColor(s.suit, '#86efac')} />
+            {sv && <Bar label="OXÍGENO" value={sv.oxygen} color={barColor(sv.oxygen, '#e0f2fe')} />}
+            {sv && <Bar label="ENERGÍA" value={sv.energy} color={barColor(sv.energy, '#fde68a')} />}
             <Bar label="JETPACK" value={s.fuel} color="#7dd3fc" />
           </div>
         )}
         <div className="text-center">
           <div className="text-[10px] tracking-[0.3em] text-white/50">MODO</div>
-          <div className="text-sm tracking-widest text-white/85">{s.mode === 'ship' ? (s.warp ? 'PULSO' : s.landed ? 'ATERRIZADO' : 'VUELO') : 'A PIE'}</div>
+          <div className="text-sm tracking-widest text-white/85">{s.mode === 'ship' ? (s.warp ? (sv?.emergency ? 'EMERGENCIA' : 'PULSO') : s.landed ? 'ATERRIZADO' : 'VUELO') : 'A PIE'}</div>
           <div className="mt-1 text-[10px] text-white/40">{s.lights ? 'LUCES ON' : 'LUCES OFF'}</div>
+          {sv && (s.mode === 'foot' ? (
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal</div></div>
+          ) : (
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">BODEGA<div className="text-white/40">{sv.stored.ice} hielo · {sv.stored.metal} metal</div></div>
+          ))}
+          {sv?.refining && <div className="mt-1 text-[10px] text-orange-200/80">{sv.refining}</div>}
+          {sv && <div className={`mt-1 text-[9px] tracking-[0.2em] text-white/45 transition-opacity duration-700 ${sv.saved ? 'opacity-100' : 'opacity-0'}`}>✓ GUARDADO</div>}
         </div>
       </div>
+
+      {/* survival: mining prompt and progress, above the crosshair (the click prompt sits below it) */}
+      {sv && s.mode === 'foot' && sv.near && (
+        <div className="absolute left-1/2 top-[38%] w-56 -translate-x-1/2 text-center">
+          <div className="text-[11px] tracking-[0.2em] text-white/85">{touch ? 'MINAR' : 'R'} (mantener): extraer {sv.near}</div>
+          <div className="mx-auto mt-1 h-1 w-40 overflow-hidden rounded-full bg-white/15">
+            <div className="h-full rounded-full bg-cyan-200/80" style={{ width: `${sv.mining * 100}%` }} />
+          </div>
+        </div>
+      )}
 
       {/* notifications */}
       <div className={touch ? 'absolute bottom-[164px] left-5 w-64 space-y-1' : 'absolute bottom-6 left-5 w-96 space-y-1.5'}>
@@ -203,6 +226,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">A / D</b> alabeo · <b className="text-white">Shift</b> turbo</div>
             <div><b className="text-white">Espacio / C</b> subir / bajar (vertical)</div>
             <div><b className="text-white">J</b> salto luz (libre) · <b className="text-white">K</b> piloto automático</div>
+            {sv && <div className="text-orange-200/80">El salto gasta combustible: más cuanto más lejos</div>}
             <div><b className="text-white">V</b> arranque rápido del pulso: {s.fastStart ? 'ON' : 'OFF'}</div>
             <div><b className="text-white">T / M</b> destino · mapa</div>
             <div><b className="text-white">E</b> aterrizar / bajar · <b className="text-white">F</b> luces</div>
@@ -217,6 +241,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Espacio</b> saltar (mantener: jetpack)</div>
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
+            {sv && <div><b className="text-white">R</b> (mantener) extraer hielo / metal</div>}
             <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
@@ -235,11 +260,18 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           <div className="max-w-xl rounded-2xl border border-red-500/30 bg-black/70 p-8 text-center">
             <div className="mb-2 text-[11px] tracking-[0.5em] text-red-400">SEÑAL PERDIDA</div>
             <div className="mb-6 text-lg font-light leading-relaxed text-white/90">{s.dead}</div>
+            {sv && (
+              <div className="mb-6 text-sm leading-relaxed text-white/60">
+                {s.mode === 'foot'
+                  ? 'Despertarás a bordo de la nave. Lo que llevabas encima quedará donde caíste: podrás ir a buscarlo.'
+                  : 'La nave se reconstruirá en órbita con lo que quedó: casco al 40% y parte de la bodega perdida.'}
+              </div>
+            )}
             <button
               onClick={() => { game.revive(); setTimeout(() => game.requestLock(), 50); }}
               className="rounded-lg border border-cyan-300/40 bg-cyan-300/10 px-6 py-2 tracking-[0.3em] text-cyan-100 hover:bg-cyan-300/20"
             >
-              REAPARECER
+              {sv ? (s.mode === 'foot' ? 'DESPERTAR EN LA NAVE' : 'RECONSTRUIR LA NAVE') : 'REAPARECER'}
             </button>
           </div>
         </div>
@@ -328,6 +360,14 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               </button>
               <div className="self-center text-xs text-white/50">Luego pulsa <b className="text-white">J</b> fuera de la atmósfera para saltar a velocidad luz.</div>
             </div>
+            {game.surv && (
+              <button
+                onClick={() => { game.surv?.save(); location.reload(); }}
+                className="mt-6 rounded-lg border border-white/20 px-5 py-2 text-xs tracking-[0.3em] text-white/70 hover:bg-white/10"
+              >
+                GUARDAR Y VOLVER AL MENÚ
+              </button>
+            )}
           </div>
         </div>
       </div>
