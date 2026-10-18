@@ -8,6 +8,8 @@ export interface ShipModel {
   navLights: THREE.Mesh[];
   headlight: THREE.SpotLight;
   plasma: THREE.Mesh;
+  /** materials with an environment map and their base intensity (scaled with sunlight at runtime) */
+  envMats: { mat: THREE.MeshStandardMaterial; base: number }[];
 }
 
 export function buildShip(env: THREE.Texture | null, plasmaMat: THREE.Material): ShipModel {
@@ -139,7 +141,8 @@ export function buildShip(env: THREE.Texture | null, plasmaMat: THREE.Material):
   plasma.scale.set(10, 6, 13);
   plasma.visible = false;
   root.add(plasma);
-  return { root, flames, glows, gear, navLights, headlight, plasma };
+  const envMats = [hull, dark, accent, glass].map((m) => ({ mat: m as THREE.MeshStandardMaterial, base: m.envMapIntensity }));
+  return { root, flames, glows, gear, navLights, headlight, plasma, envMats };
 }
 
 export interface AstroModel {
@@ -150,6 +153,7 @@ export interface AstroModel {
   armR: THREE.Group;
   jet: THREE.Mesh[];
   lamp: THREE.SpotLight;
+  envMats: { mat: THREE.MeshStandardMaterial; base: number }[];
 }
 
 export function buildAstronaut(env: THREE.Texture | null): AstroModel {
@@ -205,5 +209,6 @@ export function buildAstronaut(env: THREE.Texture | null): AstroModel {
   lamp.position.set(0, 1.75, -0.25);
   lamp.target.position.set(0, 0.6, -8);
   root.add(lamp, lamp.target);
-  return { root, legL, legR, armL, armR, jet, lamp };
+  const envMats = [grey, visor].map((m) => ({ mat: m, base: m.envMapIntensity }));
+  return { root, legL, legR, armL, armR, jet, lamp, envMats };
 }

@@ -1,29 +1,62 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { TerrainGen } from './bodies';
-import { mulberry32, Noise3 } from './noise';
+import { Noise3 } from './noise';
+import { buildChunkData, chunkWorldSize, FACES, SEG, VN, spherify, type ChunkData, type ChunkRequest } from './terrainBuild';
+import TerrainWorker from './terrainWorker?worker&inline';
 
-const SEG = 32;
-const VN = SEG + 1;
-const GN = SEG + 3;
 const SPLIT_K = 1.55;
 
-const FACES = [
-  { n: [1, 0, 0], a: [0, 0, -1], b: [0, 1, 0] },
-  { n: [-1, 0, 0], a: [0, 0, 1], b: [0, 1, 0] },
-  { n: [0, 1, 0], a: [1, 0, 0], b: [0, 0, -1] },
-  { n: [0, -1, 0], a: [1, 0, 0], b: [0, 0, 1] },
-  { n: [0, 0, 1], a: [1, 0, 0], b: [0, 1, 0] },
-  { n: [0, 0, -1], a: [-1, 0, 0], b: [0, 1, 0] },
-];
+// ---------------------------------------------------------------------------
+// Worker pool. Building one chunk costs several milliseconds of pure JS (a
+// 35x35 grid of multi-octave noise plus rock/tree scattering); done on the main
+// thread it stalled the frame every time the player moved near a planet. The
+// pool builds chunks in parallel off-thread; the main thread only turns the
+// returned arrays into meshes. Falls back to synchronous builds without workers.
+// ---------------------------------------------------------------------------
+class ChunkWorkerPool {
+  private workers: Worker[] = [];
+  private next = 0;
+  private seq = 0;
+  private pending = new Map<number, (d: ChunkData) => void>();
+  inFlight = 0;
+  get size() { return this.workers.length; }
+  constructor(n: number) {
+    for (let i = 0; i < n; i++) {
+      const w = new TerrainWorker();
+      w.onmessage = (e: MessageEvent<{ id: number; data?: ChunkData; error?: string }>) => {
+        this.inFlight--;
+        const cb = this.pending.get(e.data.id);
+        this.pending.delete(e.data.id);
+        if (e.data.error) console.warn('[terrain worker]', e.data.error);
+        else if (cb && e.data.data) cb(e.data.data);
+      };
+      this.workers.push(w);
+    }
+  }
+  request(req: ChunkRequest, cb: (d: ChunkData) => void): number {
+    const id = ++this.seq;
+    this.pending.set(id, cb);
+    this.inFlight++;
+    this.workers[this.next++ % this.workers.length].postMessage({ id, ...req });
+    return id;
+  }
+  /** The result, if it still arrives, is dropped. */
+  cancel(id: number) { this.pending.delete(id); }
+}
 
-function spherify(x: number, y: number, z: number, out: number[]) {
-  const x2 = x * x, y2 = y * y, z2 = z * z;
-  const sx = x * Math.sqrt(Math.max(0, 1 - y2 / 2 - z2 / 2 + (y2 * z2) / 3));
-  const sy = y * Math.sqrt(Math.max(0, 1 - z2 / 2 - x2 / 2 + (z2 * x2) / 3));
-  const sz = z * Math.sqrt(Math.max(0, 1 - x2 / 2 - y2 / 2 + (x2 * y2) / 3));
-  const l = Math.hypot(sx, sy, sz);
-  out[0] = sx / l; out[1] = sy / l; out[2] = sz / l;
+let pool: ChunkWorkerPool | null | undefined;
+function getPool(): ChunkWorkerPool | null {
+  if (pool === undefined) {
+    try {
+      const n = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+      pool = new ChunkWorkerPool(n);
+    } catch (err) {
+      console.warn('[terrain] workers unavailable, building chunks on the main thread', err);
+      pool = null;
+    }
+  }
+  return pool;
 }
 
 // Shared index buffers
@@ -126,13 +159,15 @@ export class TerrainNode {
   water: THREE.Mesh | null = null;
   extras: THREE.Object3D[] = [];
   built = false;
+  /** worker request id while a build is in flight */
+  pending = 0;
   center = new THREE.Vector3();
   worldSize: number;
   constructor(
     public face: number, public level: number,
     public u0: number, public v0: number, public size: number, R: number,
   ) {
-    this.worldSize = R * size * 0.8;
+    this.worldSize = chunkWorldSize(R, size);
     const f = FACES[face];
     const u = u0 + size / 2, v = v0 + size / 2;
     const d = [0, 0, 0];
@@ -146,12 +181,10 @@ export class PlanetTerrain {
   roots: TerrainNode[] = [];
   maxLevel: number;
   private queue: { node: TerrainNode; d: number }[] = [];
-  private tmpH = new Float64Array(GN * GN);
-  private tmpP = new Float64Array(GN * GN * 3);
-  private tmpD = new Float64Array(GN * GN * 3);
   chunkCount = 0;
 
   constructor(
+    public bodyId: string,
     public R: number,
     public gen: TerrainGen,
     public material: THREE.Material,
@@ -161,9 +194,10 @@ export class PlanetTerrain {
   ) {
     gridIndex();
     this.maxLevel = Math.max(2, Math.ceil(Math.log2((R * 1.6) / 22)));
+    // the six root chunks are needed right away: build them here, synchronously
     for (let f = 0; f < 6; f++) {
       const n = new TerrainNode(f, 0, -1, -1, 2, R);
-      this.build(n);
+      this.applyChunk(n, buildChunkData(this.gen, this.R, this.request(n)));
       this.roots.push(n);
     }
   }
@@ -172,108 +206,40 @@ export class PlanetTerrain {
     return this.gen.height(dx, dy, dz, 0.7);
   }
 
-  private build(node: TerrainNode) {
-    const R = this.R;
-    const gen = this.gen;
-    const f = FACES[node.face];
-    const step = node.size / SEG;
-    const spacing = node.worldSize / SEG;
-    const minWl = Math.max(spacing * 1.3, 0.7);
-    const H = this.tmpH, P = this.tmpP, D = this.tmpD;
-    const d = [0, 0, 0];
-    let minH = Infinity, maxH = -Infinity;
-    for (let j = 0; j < GN; j++) {
-      for (let i = 0; i < GN; i++) {
-        const u = node.u0 + (i - 1) * step;
-        const v = node.v0 + (j - 1) * step;
-        spherify(f.n[0] + f.a[0] * u + f.b[0] * v, f.n[1] + f.a[1] * u + f.b[1] * v, f.n[2] + f.a[2] * u + f.b[2] * v, d);
-        const h = gen.height(d[0], d[1], d[2], minWl);
-        const k = j * GN + i;
-        H[k] = h;
-        D[k * 3] = d[0]; D[k * 3 + 1] = d[1]; D[k * 3 + 2] = d[2];
-        const r = R + h;
-        P[k * 3] = d[0] * r; P[k * 3 + 1] = d[1] * r; P[k * 3 + 2] = d[2] * r;
-        if (i > 0 && j > 0 && i < GN - 1 && j < GN - 1) {
-          if (h < minH) minH = h;
-          if (h > maxH) maxH = h;
-        }
-      }
-    }
-    const ck = ((SEG >> 1) + 1) * GN + (SEG >> 1) + 1;
-    const cx = P[ck * 3], cy = P[ck * 3 + 1], cz = P[ck * 3 + 2];
-    node.center.set(cx, cy, cz);
+  private request(node: TerrainNode): ChunkRequest {
+    return { bodyId: this.bodyId, face: node.face, level: node.level, u0: node.u0, v0: node.v0, size: node.size, hasWater: !!this.waterMaterial };
+  }
 
-    const nv = VN * VN + 4 * VN;
-    const pos = new Float32Array(nv * 3);
-    const nor = new Float32Array(nv * 3);
-    const col = new Float32Array(nv * 3);
-    const skirt = node.worldSize * 0.025 + 1;
-    for (let j = 0; j < VN; j++) {
-      for (let i = 0; i < VN; i++) {
-        const k = (j + 1) * GN + (i + 1);
-        const o = j * VN + i;
-        pos[o * 3] = P[k * 3] - cx; pos[o * 3 + 1] = P[k * 3 + 1] - cy; pos[o * 3 + 2] = P[k * 3 + 2] - cz;
-        const kl = k - 1, kr = k + 1, kd = k - GN, ku = k + GN;
-        const ax = P[kr * 3] - P[kl * 3], ay = P[kr * 3 + 1] - P[kl * 3 + 1], az = P[kr * 3 + 2] - P[kl * 3 + 2];
-        const bx = P[ku * 3] - P[kd * 3], by = P[ku * 3 + 1] - P[kd * 3 + 1], bz = P[ku * 3 + 2] - P[kd * 3 + 2];
-        let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
-        const l = Math.hypot(nx, ny, nz) || 1;
-        nx /= l; ny /= l; nz /= l;
-        const ux = D[k * 3], uy = D[k * 3 + 1], uz = D[k * 3 + 2];
-        if (nx * ux + ny * uy + nz * uz < 0) { nx = -nx; ny = -ny; nz = -nz; }
-        nor[o * 3] = nx; nor[o * 3 + 1] = ny; nor[o * 3 + 2] = nz;
-        const slope = 1 - (nx * ux + ny * uy + nz * uz);
-        gen.color(ux, uy, uz, H[k], slope, col, o);
-      }
-    }
-    // skirts
-    const edgeIdx = (e: number, k: number) => (e === 0 ? k : e === 1 ? SEG * VN + k : e === 2 ? k * VN : k * VN + SEG);
-    for (let e = 0; e < 4; e++) {
-      for (let k = 0; k < VN; k++) {
-        const src = edgeIdx(e, k);
-        const dst = VN * VN + e * VN + k;
-        const gi = e === 0 ? GN + 1 + k : e === 1 ? (SEG + 1) * GN + 1 + k : e === 2 ? (k + 1) * GN + 1 : (k + 1) * GN + SEG + 1;
-        pos[dst * 3] = pos[src * 3] - D[gi * 3] * skirt;
-        pos[dst * 3 + 1] = pos[src * 3 + 1] - D[gi * 3 + 1] * skirt;
-        pos[dst * 3 + 2] = pos[src * 3 + 2] - D[gi * 3 + 2] * skirt;
-        for (let c = 0; c < 3; c++) { nor[dst * 3 + c] = nor[src * 3 + c]; col[dst * 3 + c] = col[src * 3 + c]; }
-      }
-    }
+  /** Turn built chunk data into meshes (cheap: typed arrays become GPU buffers). */
+  private applyChunk(node: TerrainNode, data: ChunkData) {
+    const [cx, cy, cz] = data.center;
+    node.center.set(cx, cy, cz);
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setAttribute('position', new THREE.BufferAttribute(data.pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(data.nor, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(data.col, 3));
     geo.setIndex(GRID_INDEX!);
     geo.computeBoundingSphere();
     const mesh = new THREE.Mesh(geo, this.material);
     mesh.position.set(cx, cy, cz);
     mesh.receiveShadow = true;
-    mesh.castShadow = node.worldSize < 20000;
+    // The terrain receives shadows but never casts them: the shadow map only covers a
+    // 90 m slab around the player, so at low sun the ground inside the slab was black
+    // with its own ripples' shadows while the ground outside had none, a hard wedge
+    // pointing away from the Sun. Slopes still shade by their own tilt; the player,
+    // the ship, rocks and trees keep casting their long sunset shadows.
+    mesh.castShadow = false;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
     mesh.visible = false;
     this.group.add(mesh);
     node.mesh = mesh;
 
-    // water
-    const sea = gen.seaLevel;
-    if (sea !== null && this.waterMaterial && minH < sea + 2) {
-      const wpos = new Float32Array(VN * VN * 3);
-      const wnor = new Float32Array(VN * VN * 3);
-      const wdep = new Float32Array(VN * VN);
-      for (let j = 0; j < VN; j++)
-        for (let i = 0; i < VN; i++) {
-          const k = (j + 1) * GN + (i + 1);
-          const o = j * VN + i;
-          const r = R + sea;
-          wpos[o * 3] = D[k * 3] * r - cx; wpos[o * 3 + 1] = D[k * 3 + 1] * r - cy; wpos[o * 3 + 2] = D[k * 3 + 2] * r - cz;
-          wnor[o * 3] = D[k * 3]; wnor[o * 3 + 1] = D[k * 3 + 1]; wnor[o * 3 + 2] = D[k * 3 + 2];
-          wdep[o] = sea - H[k];
-        }
+    if (data.water && this.waterMaterial) {
       const wg = new THREE.BufferGeometry();
-      wg.setAttribute('position', new THREE.BufferAttribute(wpos, 3));
-      wg.setAttribute('normal', new THREE.BufferAttribute(wnor, 3));
-      wg.setAttribute('depth', new THREE.BufferAttribute(wdep, 1));
+      wg.setAttribute('position', new THREE.BufferAttribute(data.water.pos, 3));
+      wg.setAttribute('normal', new THREE.BufferAttribute(data.water.nor, 3));
+      wg.setAttribute('depth', new THREE.BufferAttribute(data.water.depth, 1));
       wg.setIndex(WATER_INDEX!);
       wg.computeBoundingSphere();
       const wm = new THREE.Mesh(wg, this.waterMaterial);
@@ -286,110 +252,18 @@ export class PlanetTerrain {
       node.water = wm;
     }
 
-    // scattered rocks & trees on fine chunks
-    if (node.worldSize < 260) this.scatterRocks(node, pos, nor, col, H, sea);
-    if (gen.trees && node.worldSize < 700) this.scatterTrees(node, pos, nor, D, H);
+    if (data.rocks) this.addInstances(node, rockGeo(), this.rockMaterial, data.rocks.count, data.rocks.matrices, data.rocks.colors);
+    if (data.trees) this.addInstances(node, data.trees.conifer ? coniferGeo() : broadGeo(), this.treeMaterial, data.trees.count, data.trees.matrices, data.trees.colors);
 
     node.built = true;
     this.chunkCount++;
   }
 
-  private sample(pos: Float32Array, nor: Float32Array, fu: number, fv: number, outP: THREE.Vector3, outN: THREE.Vector3) {
-    const i = Math.min(SEG - 1, Math.floor(fu)), j = Math.min(SEG - 1, Math.floor(fv));
-    const tu = fu - i, tv = fv - j;
-    const a = j * VN + i, b = a + 1, c = a + VN, d = c + 1;
-    const w = [(1 - tu) * (1 - tv), tu * (1 - tv), (1 - tu) * tv, tu * tv];
-    const ids = [a, b, c, d];
-    outP.set(0, 0, 0); outN.set(0, 0, 0);
-    for (let q = 0; q < 4; q++) {
-      const k = ids[q];
-      outP.x += pos[k * 3] * w[q]; outP.y += pos[k * 3 + 1] * w[q]; outP.z += pos[k * 3 + 2] * w[q];
-      outN.x += nor[k * 3] * w[q]; outN.y += nor[k * 3 + 1] * w[q]; outN.z += nor[k * 3 + 2] * w[q];
-    }
-    outN.normalize();
-    return a;
-  }
-
-  private scatterRocks(node: TerrainNode, pos: Float32Array, nor: Float32Array, col: Float32Array, H: Float64Array, sea: number | null) {
-    const area = node.worldSize * node.worldSize;
-    const midH = H[((SEG >> 1) + 1) * GN + (SEG >> 1) + 1];
-    const dens = this.gen.rocks(midH, 0.1);
-    const count = Math.min(900, Math.floor(area * dens));
-    if (count < 1) return;
-    const rnd = mulberry32((node.face * 73856093) ^ Math.floor(node.u0 * 1e7) ^ Math.floor(node.v0 * 3e7) ^ node.level);
-    const im = new THREE.InstancedMesh(rockGeo(), this.rockMaterial, count);
-    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-    const p = new THREE.Vector3(), n = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
-    const qr = new THREE.Quaternion(), c = new THREE.Color();
-    let placed = 0;
-    for (let k = 0; k < count; k++) {
-      const fu = rnd() * SEG, fv = rnd() * SEG;
-      const a = this.sample(pos, nor, fu, fv, p, n);
-      const hk = H[(Math.floor(fv) + 1) * GN + Math.floor(fu) + 1];
-      if (sea !== null && hk < sea + 0.5) continue;
-      const slopeK = 1 - Math.max(0, n.dot(p.clone().add(node.center).normalize()));
-      if (rnd() > this.gen.rocks(hk, slopeK) / Math.max(dens, 1e-6)) continue;
-      const r = rnd();
-      const sc = (0.12 + Math.pow(r, 6) * 2.6 + Math.pow(rnd(), 30) * 4) * this.gen.rockScale;
-      q.setFromUnitVectors(up, n);
-      qr.setFromAxisAngle(up, rnd() * Math.PI * 2);
-      q.multiply(qr);
-      s.set(sc * (0.8 + rnd() * 0.5), sc * (0.7 + rnd() * 0.6), sc * (0.8 + rnd() * 0.5));
-      p.addScaledVector(n, -sc * 0.25);
-      m.compose(p, q, s);
-      im.setMatrixAt(placed, m);
-      const b = 0.75 + rnd() * 0.35;
-      c.setRGB(col[a * 3] * b * 1.15, col[a * 3 + 1] * b * 1.1, col[a * 3 + 2] * b * 1.05);
-      im.setColorAt(placed, c);
-      placed++;
-    }
-    im.count = placed;
-    if (placed === 0) return;
-    im.castShadow = true;
-    im.receiveShadow = true;
-    im.computeBoundingSphere();
-    node.mesh!.add(im);
-    node.extras.push(im);
-  }
-
-  private scatterTrees(node: TerrainNode, pos: Float32Array, nor: Float32Array, D: Float64Array, H: Float64Array) {
-    const gen = this.gen;
-    if (!gen.trees) return;
-    const area = node.worldSize * node.worldSize;
-    const maxCount = Math.min(1400, Math.floor(area * 0.006));
-    if (maxCount < 1) return;
-    const rnd = mulberry32((node.face * 19349663) ^ Math.floor(node.u0 * 7e6) ^ Math.floor(node.v0 * 9e6) ^ (node.level * 7));
-    const kc = ((SEG >> 1) + 1) * GN + (SEG >> 1) + 1;
-    const cy = D[kc * 3 + 1];
-    const conifer = Math.abs(cy) > 0.62 || H[kc] > 1800;
-    const im = new THREE.InstancedMesh(conifer ? coniferGeo() : broadGeo(), this.treeMaterial, maxCount);
-    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-    const p = new THREE.Vector3(), n = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0), dir = new THREE.Vector3();
-    const qr = new THREE.Quaternion(), c = new THREE.Color();
-    let placed = 0;
-    for (let k = 0; k < maxCount; k++) {
-      const fu = rnd() * SEG, fv = rnd() * SEG;
-      this.sample(pos, nor, fu, fv, p, n);
-      dir.copy(p).add(node.center).normalize();
-      const h = H[(Math.floor(fv) + 1) * GN + Math.floor(fu) + 1];
-      const slope = 1 - n.dot(dir);
-      const dens = gen.trees(dir.x, dir.y, dir.z, h, slope);
-      if (rnd() > dens / 0.006) continue;
-      const sc = 0.7 + rnd() * 0.9;
-      q.setFromUnitVectors(up, dir);
-      qr.setFromAxisAngle(up, rnd() * Math.PI * 2);
-      q.multiply(qr);
-      s.set(sc, sc * (0.85 + rnd() * 0.4), sc);
-      p.addScaledVector(dir, -0.3);
-      m.compose(p, q, s);
-      im.setMatrixAt(placed, m);
-      const b = 0.75 + rnd() * 0.45;
-      c.setRGB(b, b * (0.95 + rnd() * 0.1), b);
-      im.setColorAt(placed, c);
-      placed++;
-    }
-    im.count = placed;
-    if (placed === 0) { im.dispose(); return; }
+  private addInstances(node: TerrainNode, geo: THREE.BufferGeometry, mat: THREE.Material, count: number, matrices: Float32Array, colors: Float32Array) {
+    const im = new THREE.InstancedMesh(geo, mat, count);
+    (im.instanceMatrix.array as Float32Array).set(matrices.subarray(0, count * 16));
+    im.instanceMatrix.needsUpdate = true;
+    im.instanceColor = new THREE.InstancedBufferAttribute(colors.subarray(0, count * 3).slice(), 3);
     im.castShadow = true;
     im.receiveShadow = true;
     im.computeBoundingSphere();
@@ -410,6 +284,7 @@ export class PlanetTerrain {
   private dispose(node: TerrainNode) {
     if (node.children) for (const c of node.children) this.dispose(c);
     node.children = null;
+    if (node.pending) { getPool()?.cancel(node.pending); node.pending = 0; }
     if (node.mesh) {
       this.group.remove(node.mesh);
       node.mesh.geometry.dispose();
@@ -466,17 +341,35 @@ export class PlanetTerrain {
     }
   }
 
-  /** cam: camera position in body-local coordinates */
+  /**
+   * cam: camera position in body-local coordinates. Returns the number of
+   * chunks still to be built. With workers, `budgetMs` only bounds the
+   * synchronous fallback; builds are dispatched off-thread, nearest first.
+   */
   update(cam: THREE.Vector3, budgetMs: number) {
     this.queue.length = 0;
     for (const r of this.roots) this.updateNode(r, cam);
     if (!this.queue.length) return 0;
     this.queue.sort((a, b) => a.d - b.d);
+    const p = getPool();
+    if (p) {
+      for (const q of this.queue) {
+        const node = q.node;
+        if (node.built || node.pending) continue;
+        if (p.inFlight >= p.size * 2) break;
+        node.pending = p.request(this.request(node), (data) => {
+          node.pending = 0;
+          if (node.built) return; // disposed and rebuilt meanwhile: results for the old request are dropped by cancel()
+          this.applyChunk(node, data);
+        });
+      }
+      return this.queue.filter((q) => !q.node.built).length;
+    }
     const t0 = performance.now();
     let n = 0;
     for (const q of this.queue) {
       if (q.node.built) continue;
-      this.build(q.node);
+      this.applyChunk(q.node, buildChunkData(this.gen, this.R, this.request(q.node)));
       n++;
       if (performance.now() - t0 > budgetMs) break;
     }

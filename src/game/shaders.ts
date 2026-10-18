@@ -99,15 +99,18 @@ export function makeAtmosphereMaterial() {
       uSun: { value: 20 },
       uMieTint: { value: new THREE.Vector3(1, 1, 1) },
       uFade: { value: 1 },
+      // optical depth towards the Sun, precomputed per body: x = altitude (0 = ground, 1 = top), y = cos(sun zenith angle)
+      uLut: { value: null as THREE.Texture | null },
     },
-    // Ray-march sample counts; raised by the graphics quality level (Game.applyQuality).
-    defines: { ATMO_NS: 16, ATMO_NL: 6 },
+    // View-ray sample count; raised by the graphics quality level (Game.applyQuality).
+    defines: { ATMO_NS: 16 },
     vertexShader: SHELL_VERT,
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uCenter; uniform float uRa; uniform vec3 uSunDir; uniform vec3 uBetaR; uniform float uBetaM;
 uniform float uHR; uniform float uHM; uniform float uG; uniform float uSun; uniform vec3 uMieTint; uniform float uFade;
+uniform sampler2D uLut;
 varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
 ${NOISE_GLSL}
 void main(){
@@ -115,13 +118,12 @@ void main(){
   vec3 rd = normalize(vWorld);
   vec3 ro = -uCenter;
   vec2 a = rsi(ro, rd, uRa);
-  if (a.x > a.y || a.y < 0.0) discard;
+  if (a.x > a.y || a.y < 0.0) { gl_FragColor = vec4(0.0); return; }
   vec2 p = rsi(ro, rd, 1.0);
   float t0 = max(a.x, 0.0);
   float t1 = a.y;
   if (p.x < p.y && p.x > 0.0) t1 = min(t1, p.x);
   const int NS = ATMO_NS;
-  const int NL = ATMO_NL;
   float ds = (t1 - t0) / float(NS);
   vec3 sumR = vec3(0.0), sumM = vec3(0.0);
   float odR = 0.0, odM = 0.0;
@@ -135,31 +137,72 @@ void main(){
     float hr = exp(-h / uHR) * ds;
     float hm = exp(-h / uHM) * ds;
     odR += hr; odM += hm;
-    vec2 lp = rsi(pos, uSunDir, 1.0);
-    if (lp.x > 0.0 && lp.x < lp.y) continue;
-    vec2 la = rsi(pos, uSunDir, uRa);
-    float dsl = la.y / float(NL);
-    float odRl = 0.0, odMl = 0.0;
-    for (int j = 0; j < NL; j++){
-      vec3 pl = pos + uSunDir * dsl * (float(j) + 0.5);
-      float hl = max(length(pl) - 1.0, 0.0);
-      odRl += exp(-hl / uHR) * dsl;
-      odMl += exp(-hl / uHM) * dsl;
-    }
-    vec3 tau = uBetaR * (odR + odRl) + uBetaM * 1.1 * (odM + odMl);
+    // optical depth from this point to the Sun: one table lookup instead of a
+    // second ray march (the table encodes a planet-shadowed ray as opaque)
+    float lr = length(pos);
+    float musun = dot(pos / lr, uSunDir);
+    vec2 odl = texture2D(uLut, vec2(musun * 0.5 + 0.5, clamp((lr - 1.0) / (uRa - 1.0), 0.0, 1.0))).rg;
+    vec3 tau = uBetaR * (odR + odl.x) + uBetaM * 1.1 * (odM + odl.y);
     vec3 att = exp(-tau);
     sumR += hr * att;
     sumM += hm * att;
   }
   vec3 col = uSun * (sumR * uBetaR * phR + sumM * uBetaM * phM * uMieTint);
-  gl_FragColor = vec4(col * uFade, 1.0);
+  gl_FragColor = vec4(col * uFade, 0.0); // alpha 0: the atmosphere shell is part of the planet for the bloom mask
 }
 `,
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+    blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.ZeroFactor, // additive colour; alpha := 0 wherever the shell draws (bloom mask)
     side: THREE.FrontSide,
   });
+}
+
+/**
+ * Optical depth table for an atmosphere: for a point at normalized altitude h
+ * (0 = ground, 1 = top) and a Sun at cos(zenith) = mu, the Rayleigh and Mie
+ * optical depths along the ray to the top of the atmosphere. Rays that hit the
+ * planet are stored as opaque. All quantities in planet radii.
+ */
+export function makeOpticalDepthLut(ra: number, hr: number, hm: number): THREE.DataTexture {
+  const W = 128, H = 64, NS = 40;
+  const data = new Uint16Array(W * H * 4);
+  const h2f = (v: number) => THREE.DataUtils.toHalfFloat(Math.min(v, 60000));
+  for (let j = 0; j < H; j++) {
+    const r = 1 + (ra - 1) * (j / (H - 1)) + 1e-6;
+    for (let i = 0; i < W; i++) {
+      const mu = (i / (W - 1)) * 2 - 1;
+      // ray from (0, r, 0) towards direction with cos(zenith) = mu
+      const dx = Math.sqrt(Math.max(0, 1 - mu * mu)), dy = mu;
+      // intersection with the top sphere (always exits) and with the ground
+      const b = r * dy;
+      const tTop = -b + Math.sqrt(Math.max(0, b * b - (r * r - ra * ra)));
+      const dg = b * b - (r * r - 1);
+      let odR: number, odM: number;
+      if (dg > 0 && -b - Math.sqrt(dg) > 0) {
+        odR = odM = 1e4; // in the planet's shadow
+      } else {
+        odR = 0; odM = 0;
+        const ds = tTop / NS;
+        for (let k = 0; k < NS; k++) {
+          const t = ds * (k + 0.5);
+          const px = dx * t, py = r + dy * t;
+          const hgt = Math.max(Math.hypot(px, py) - 1, 0);
+          odR += Math.exp(-hgt / hr) * ds;
+          odM += Math.exp(-hgt / hm) * ds;
+        }
+      }
+      const o = (j * W + i) * 4;
+      data[o] = h2f(odR); data[o + 1] = h2f(odM); data[o + 2] = 0; data[o + 3] = h2f(1);
+    }
+  }
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat, THREE.HalfFloatType);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +345,7 @@ void main(){
   vec3 outc = col * diff * uSunI;
   // faint night-side
   outc += col * 0.002 * uSunI;
-  gl_FragColor = vec4(outc, 1.0);
+  gl_FragColor = vec4(outc, 0.0); // alpha 0 = bloom mask (lit planet surface)
 }
 `,
     side: THREE.FrontSide,
@@ -371,6 +414,9 @@ void main(){
 }
 `,
     transparent: true,
+    // bloom mask: blend the colour but leave the target's alpha (0 over planet surfaces) untouched
+    blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+    blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
     depthWrite: false,
     side: THREE.DoubleSide,
   });
@@ -538,6 +584,9 @@ void main(){
 }
 `,
     transparent: true,
+    // bloom mask: blend the colour but leave the target's alpha (0 over planet surfaces) untouched
+    blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+    blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
     depthWrite: false,
     side: THREE.DoubleSide,
   });
@@ -549,7 +598,10 @@ export function makeWaterMaterial(deep: [number, number, number], shallow: [numb
     uniforms: {
       uSunDir: { value: new THREE.Vector3(1, 0, 0) },
       uSunColor: { value: new THREE.Vector3(3, 3, 3) },
+      /** daytime sky colour; the shader fades it with the water's OWN sun elevation, so a night-side ocean seen from space stays dark */
       uSky: { value: new THREE.Vector3(0.3, 0.5, 0.8) },
+      /** moonlit-sky term added where the player's night floor is active */
+      uSkyNight: { value: new THREE.Vector3() },
       uDeep: { value: new THREE.Vector3(...deep) },
       uShallow: { value: new THREE.Vector3(...shallow) },
       uTime: { value: 0 },
@@ -574,7 +626,7 @@ void main(){
     fragmentShader: /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform vec3 uSunDir; uniform vec3 uSunColor; uniform vec3 uSky; uniform vec3 uDeep; uniform vec3 uShallow;
+uniform vec3 uSunDir; uniform vec3 uSunColor; uniform vec3 uSky; uniform vec3 uSkyNight; uniform vec3 uDeep; uniform vec3 uShallow;
 uniform float uTime; uniform vec3 uOffset; uniform vec3 uFogColor; uniform float uFogDensity;
 varying vec3 vWorld; varying vec3 vNormalW; varying float vDepth;
 void main(){
@@ -601,14 +653,16 @@ void main(){
   float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
   float ndl = dot(N, uSunDir);
   float sunUp = smoothstep(-0.05, 0.15, ndl);
-  vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 30.0, vDepth)) * (0.06 + max(ndl, 0.0)) * uSunColor * 0.32;
+  float dayL = smoothstep(-0.1, 0.3, ndl); // this patch of water's own daylight, not the camera's
+  vec3 sky = uSky * dayL + uSkyNight;
+  vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 30.0, vDepth)) * (0.06 * dayL + max(ndl, 0.0)) * uSunColor * 0.32;
   vec3 Hs = uSunDir + V;
   vec3 H = dot(Hs, Hs) > 1e-8 ? normalize(Hs) : N;
   float nh = max(dot(n, H), 0.0);
   float spec = pow(nh, 900.0) * 60.0 + pow(nh, 80.0) * 0.5;
-  vec3 col = mix(body, uSky, fres) + uSunColor * spec * sunUp * 0.4;
+  vec3 col = mix(body, sky, fres) + uSunColor * spec * sunUp * 0.4;
   float foam = smoothstep(1.0, 0.0, vDepth) * (0.6 + 0.4 * sin(dot(p, vec3(0.7, 0.5, 0.4)) * 3.0 + uTime * 1.7));
-  col += uSunColor * 0.25 * foam * (0.1 + max(ndl, 0.0));
+  col += uSunColor * 0.25 * foam * (0.1 * dayL + max(ndl, 0.0));
   float alpha = mix(0.4, 0.97, smoothstep(0.0, 7.0, vDepth));
   alpha = max(alpha, fres);
   float fog = 1.0 - exp(-dist * uFogDensity);
@@ -618,6 +672,9 @@ void main(){
 }
 `,
     transparent: true,
+    // bloom mask: blend the colour but leave the target's alpha (0 over planet surfaces) untouched
+    blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+    blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
     depthWrite: true,
   });
 }
@@ -629,6 +686,10 @@ export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
     uDetail: { value: 1 },
     uFogColor: { value: new THREE.Vector3() },
     uFogDensity: { value: 0 },
+    /** 0 by day; towards 1 at night on the ground: scotopic look (colourless, compressed contrast) */
+    uNight: { value: 0 },
+    /** scale of the (scene-global) hemisphere light for this body: 1 where the player is, less for other worlds */
+    uHemiScale: { value: 1 },
   };
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
@@ -639,7 +700,7 @@ export function patchTerrainMaterial(mat: THREE.MeshStandardMaterial) {
       .replace(
         '#include <common>',
         `#include <common>
-uniform float uDetail; uniform vec3 uFogColor; uniform float uFogDensity;
+uniform float uDetail; uniform vec3 uFogColor; uniform float uFogDensity; uniform float uNight; uniform float uHemiScale;
 varying vec3 vDetailPos;
 float tHash(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
 float tNoise(vec3 x, float per){
@@ -657,15 +718,19 @@ float tDetail(vec3 p){
       .replace(
         '#include <color_fragment>',
         `#include <color_fragment>
+float heliosDet = -1.0; // detail noise, shared with the normal perturbation below
 {
   float dd = length(vViewPosition);
   float f = (1.0 - smoothstep(25.0, 600.0, dd)) * uDetail;
   if (f > 0.001){
-    float n = tDetail(vDetailPos);
+    heliosDet = tDetail(vDetailPos);
     float n2 = tNoise(vDetailPos*0.0625, 16.0);
-    diffuseColor.rgb *= mix(1.0, (0.62 + 0.75*n) * (0.85 + 0.3*n2), f);
+    diffuseColor.rgb *= mix(1.0, (0.62 + 0.75*heliosDet) * (0.85 + 0.3*n2), f);
   }
-}`,
+}
+// Night vision: rods see no colour and compress brightness, so a moonlit forest floor
+// (albedo 0.05) and snow (0.8) both read instead of one being black and the other white.
+diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11)) * 0.5 + 0.12), uNight);`,
       )
       .replace(
         '#include <normal_fragment_maps>',
@@ -674,7 +739,7 @@ float tDetail(vec3 p){
   float dd = length(vViewPosition);
   float bf = (1.0 - smoothstep(15.0, 220.0, dd)) * uDetail;
   if (bf > 0.001){
-    float hb = tDetail(vDetailPos) * 0.35;
+    float hb = (heliosDet >= 0.0 ? heliosDet : tDetail(vDetailPos)) * 0.35;
     vec3 dpdx = dFdx(-vViewPosition), dpdy = dFdy(-vViewPosition);
     float dhx = dFdx(hb), dhy = dFdy(hb);
     vec3 r1 = cross(dpdy, normal), r2 = cross(normal, dpdx);
@@ -687,11 +752,21 @@ float tDetail(vec3 p){
   }
 }`,
       )
+      // The hemisphere light is global to the scene, but its night floor belongs to the
+      // ground the player stands on: other worlds in the sky must not pick it up.
+      .replace(
+        '#include <lights_fragment_begin>',
+        THREE.ShaderChunk.lights_fragment_begin.replace(
+          'irradiance += getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
+          'irradiance += uHemiScale * getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
+        ),
+      )
       .replace(
         '#include <dithering_fragment>',
         `{
   float fogF = 1.0 - exp(-length(vViewPosition) * uFogDensity);
   gl_FragColor.rgb = mix(gl_FragColor.rgb, uFogColor, fogF);
+  gl_FragColor.a = 0.0; // bloom mask: a lit planet surface never blooms, so a bright crescent cannot glow over the night side
 }
 #include <dithering_fragment>`,
       );
@@ -776,25 +851,23 @@ void main(){
   return pts;
 }
 
-export function makeMilkyWay() {
+/**
+ * The Milky Way is a static procedural image (16 noise evaluations per pixel),
+ * so it is rendered once into a cubemap at start-up and sampled afterwards. At
+ * 1024 px per face a texel spans 0.09°, close to a screen pixel, and the
+ * nebula is soft, so the result is visually identical and ~50x cheaper.
+ */
+export function bakeMilkyWay(renderer: THREE.WebGLRenderer): THREE.CubeTexture {
+  const rt = new THREE.WebGLCubeRenderTarget(1024, { type: THREE.UnsignedByteType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 } },
-    vertexShader: SHELL_VERT,
+    vertexShader: /* glsl */ `
+varying vec3 vObj;
+void main(){ vObj = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
     fragmentShader: /* glsl */ `
 #include <common>
-#include <logdepthbuf_pars_fragment>
-uniform float uAlpha; uniform vec3 uVel; uniform float uDop;
-varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
+varying vec3 vObj;
 ${NOISE_GLSL}
-// Pulse-engine Doppler tint: colour only, positions never change.
-// c = cosine of the angle between the star direction and the direction of travel.
-vec3 dopplerTint(float c, float k){
-  vec3 blue = vec3(0.62, 0.78, 1.0), red = vec3(1.0, 0.55, 0.42);
-  vec3 t = c > 0.0 ? mix(vec3(1.0), blue, c) : mix(vec3(1.0), red, -c);
-  return mix(vec3(1.0), t, k) * (1.0 + k * 0.55 * c);
-}
 void main(){
-  #include <logdepthbuf_fragment>
   vec3 d = normalize(vObj);
   vec3 gn = normalize(vec3(0.2, 0.86, 0.47));
   vec3 core = normalize(vec3(1.0, 0.0, 0.0) - gn * gn.x);
@@ -807,6 +880,43 @@ void main(){
   vec3 col = vec3(0.5, 0.56, 0.72) * band * (0.35 + 0.9*n*n2) * (1.0 + 2.0*cb);
   col += vec3(0.95, 0.75, 0.5) * cb * band * 0.6;
   col *= 1.0 - 0.85*dust;
+  gl_FragColor = vec4(col * 0.4, 1.0); // x0.4 keeps the range inside 8 bits; restored when sampled
+}`,
+    side: THREE.BackSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const scene = new THREE.Scene();
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(5, 32, 16), mat));
+  const cam = new THREE.CubeCamera(0.1, 100, rt);
+  const prevTM = renderer.toneMapping;
+  renderer.toneMapping = THREE.NoToneMapping;
+  cam.update(renderer, scene);
+  renderer.toneMapping = prevTM;
+  mat.dispose();
+  return rt.texture;
+}
+
+export function makeMilkyWay(map: THREE.CubeTexture) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uAlpha: { value: 1 }, uVel: { value: new THREE.Vector3(0, 0, -1) }, uDop: { value: 0 }, uMap: { value: map } },
+    vertexShader: SHELL_VERT,
+    fragmentShader: /* glsl */ `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+uniform float uAlpha; uniform vec3 uVel; uniform float uDop; uniform samplerCube uMap;
+varying vec3 vWorld; varying vec3 vObj; varying vec3 vNormalW;
+// Pulse-engine Doppler tint: colour only, positions never change.
+// c = cosine of the angle between the star direction and the direction of travel.
+vec3 dopplerTint(float c, float k){
+  vec3 blue = vec3(0.62, 0.78, 1.0), red = vec3(1.0, 0.55, 0.42);
+  vec3 t = c > 0.0 ? mix(vec3(1.0), blue, c) : mix(vec3(1.0), red, -c);
+  return mix(vec3(1.0), t, k) * (1.0 + k * 0.55 * c);
+}
+void main(){
+  #include <logdepthbuf_fragment>
+  vec3 d = normalize(vObj);
+  vec3 col = textureCube(uMap, d).rgb * 2.5;
   gl_FragColor = vec4(col * 0.05 * uAlpha * dopplerTint(dot(d, uVel), uDop), 1.0);
 }`,
     side: THREE.BackSide,
@@ -886,6 +996,46 @@ vec3 heliosSane(vec3 c, float lim){
 `;
 
 /** Clamp + sanitize the bloom pass input. `maxValue` is the brightest value allowed to bloom. */
+/**
+ * three r186's hardware-PCF shadow path ignores a reversed depth buffer in two
+ * places (the BASIC and VSM paths handle both): it adds the bias with the
+ * normal-depth sign, so every surface self-shadows (acne), and its frustum test
+ * `z <= 1.0` lets fragments beyond the shadow camera's far plane (z < 0 with
+ * reversed depth) be compared against the map, where the GEQUAL comparison
+ * always fails. That painted a spurious shadow strip, as wide as the shadow
+ * frustum, from 2.5 km behind the player to the horizon whenever the sun was
+ * low enough for the frustum to lie along the ground. Patched once, before any
+ * material compiles.
+ */
+export function patchShadowChunk() {
+  const chunks = THREE.ShaderChunk as unknown as Record<string, string>;
+  const key = 'shadowmap_pars_fragment';
+  const src = chunks[key];
+  if (src.includes('heliosEdge')) return; // already patched (a second Game in the same page, e.g. dev reloads)
+  // anchor on the hardware-PCF getShadow() itself: the chunk has several
+  // `#if defined( SHADOWMAP_TYPE_PCF )` blocks (uniform declarations, helpers)
+  const a = src.indexOf('float getShadow( sampler2DShadow shadowMap');
+  const b = src.indexOf('return mix( 1.0, shadow, shadowIntensity );', a);
+  if (a < 0 || b < 0) { console.warn('[helios] shadow chunk layout changed; PCF reversed-depth patch skipped'); return; }
+  let pcf = src.slice(a, b);
+  const n0 = pcf.length;
+  pcf = pcf.replace('shadowCoord.z += shadowBias;',
+    `#ifdef USE_REVERSED_DEPTH_BUFFER
+			shadowCoord.z -= shadowBias;
+			#else
+			shadowCoord.z += shadowBias;
+			#endif`);
+  pcf = pcf.replace('bool frustumTest = inFrustum && shadowCoord.z <= 1.0;',
+    'bool frustumTest = inFrustum && shadowCoord.z <= 1.0 && shadowCoord.z >= 0.0;');
+  if (pcf.length === n0) { console.warn('[helios] shadow chunk text changed; PCF reversed-depth patch skipped'); return; }
+  // fade the shadow out over the last 8% of the map so the frustum's edge is never a hard line on the ground
+  // (the slice ends right before the function's return statement, so the fade goes in between)
+  const edgeFade = `float heliosEdge = smoothstep( 0.0, 0.08, min( min( shadowCoord.x, 1.0 - shadowCoord.x ), min( shadowCoord.y, 1.0 - shadowCoord.y ) ) );
+			shadow = mix( 1.0, shadow, heliosEdge );
+			`;
+  chunks[key] = src.slice(0, a) + pcf + edgeFade + src.slice(b);
+}
+
 export function hardenBloomPass(bloom: UnrealBloomPass, maxValue: number) {
   const mat = bloom.materialHighPassFilter;
   (bloom.highPassUniforms as Record<string, THREE.IUniform>).heliosMax = { value: maxValue };
@@ -896,6 +1046,7 @@ varying vec2 vUv;
 ${SANE_GLSL}
 void main(){
   vec4 texel = texture2D(tDiffuse, vUv);
+  texel.rgb *= texel.a; // alpha is the bloom mask: planet surfaces write 0, emissive things 1
   texel.rgb = heliosSane(texel.rgb, heliosMax);
   float v = luminance(texel.xyz);
   vec4 outputColor = vec4(defaultColor.rgb, defaultOpacity);

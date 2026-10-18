@@ -18,6 +18,7 @@ export default function App() {
       try {
         g = new Game(containerRef.current!, markerRef.current!);
         g.onMenuToggle = (o) => setMenu(o);
+        g.onLightsModeChange = (m) => setLights(m); // L on the title screen must update its button
         if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) (window as unknown as { __game?: Game }).__game = g; // debug hook (dev only)
         setLights(g.lightsMode);
         setGame(g);
@@ -39,6 +40,7 @@ export default function App() {
   const start = () => {
     setStarted(true);
     if (game) {
+      game.started = true;
       game.menuOpen = false;
       game.requestLock();
       game.note('Órbita terrestre. Destino: la Luna. Pulsa J para saltar.');
@@ -75,7 +77,7 @@ export default function App() {
               Luces:{' '}
               <button
                 disabled={!game}
-                onClick={() => { const next: LightsMode = lights === 'comfort' ? 'bright' : 'comfort'; game?.setLightsMode(next); setLights(next); }}
+                onClick={() => game?.setLightsMode(lights === 'comfort' ? 'bright' : 'comfort')}
                 className="pointer-events-auto rounded border border-white/20 px-2 py-0.5 text-white/80 hover:bg-white/10 disabled:opacity-40"
               >
                 {lights === 'comfort' ? 'cómodas' : 'brillantes'}

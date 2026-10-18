@@ -8,8 +8,8 @@ import { BODIES, AU, LY, C_LIGHT, SUN_STAR, makeGenerator, type BodyDef } from '
 import { PlanetTerrain } from './terrain';
 import {
   makeAtmosphereMaterial, makeGasMaterial, makeRingMaterial, makeSunMaterial, makeCloudMaterial,
-  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture,
-  hardenBloomPass, hardenOutputPass, makeCoronaMaterial,
+  makeWaterMaterial, patchTerrainMaterial, makeStars, makeMilkyWay, bakeMilkyWay, makeOverlay, makePlasmaMaterial, radialTexture,
+  hardenBloomPass, hardenOutputPass, makeCoronaMaterial, makeOpticalDepthLut, patchShadowChunk,
 } from './shaders';
 import { buildShip, buildAstronaut, type ShipModel, type AstroModel } from './models';
 import { clamp, smoothstep } from './noise';
@@ -107,16 +107,17 @@ export interface QualityLevel {
   sceneScale: number;
   /** directional shadow map resolution */
   shadowMap: number;
-  /** atmosphere ray-march samples along the view ray / towards the Sun */
+  /** atmosphere ray-march samples along the view ray (the Sun-ray depth comes from a table) */
   atmoSteps: number;
-  atmoLight: number;
 }
 export const QUALITY_LEVELS: QualityLevel[] = [
-  { name: 'Alta', sceneScale: 1.5, shadowMap: 4096, atmoSteps: 24, atmoLight: 8 },
-  { name: 'Media', sceneScale: 1.25, shadowMap: 4096, atmoSteps: 20, atmoLight: 7 },
-  { name: 'Básica', sceneScale: 1, shadowMap: 2048, atmoSteps: 16, atmoLight: 6 },
+  { name: 'Alta', sceneScale: 1.5, shadowMap: 4096, atmoSteps: 24 },
+  { name: 'Media', sceneScale: 1.25, shadowMap: 4096, atmoSteps: 20 },
+  { name: 'Básica', sceneScale: 1, shadowMap: 2048, atmoSteps: 16 },
 ];
 const QUALITY_KEY = 'helios-quality';
+/** hemisphere-light intensity on the night side of rocky worlds: a "moonlit" grey (~30/255 on lunar soil) */
+const NIGHT_AMBIENT = 0.6;
 /** A level must sustain (nearly) 60 fps on a 60 Hz display to be kept; otherwise step down. */
 const MIN_FPS = 55;
 const posMod = (x: number, m: number) => ((x % m) + m) % m;
@@ -144,6 +145,8 @@ export class Game {
   bloom: UnrealBloomPass;
   bodies: Body[] = [];
   byId = new Map<string, Body>();
+  /** true when the renderer uses a reversed float depth buffer (else logarithmic) */
+  reversedDepth = false;
   /** the star lighting the scene: always the nearest star to the player */
   sunBody!: Body;
   starBodies: Body[] = [];
@@ -232,7 +235,11 @@ export class Game {
   mdy = 0;
   locked = false;
   menuOpen = false;
+  /** false while the title screen is up: the simulation stays paused and M / Tab cannot open the map */
+  started = false;
   onMenuToggle?: (open: boolean) => void;
+  /** lets the title screen's lights button follow the L key */
+  onLightsModeChange?: (mode: LightsMode) => void;
 
   private raf = 0;
   private lastT = 0;
@@ -246,7 +253,24 @@ export class Game {
   constructor(container: HTMLElement, markerLayer: HTMLElement) {
     this.container = container;
     this.markerLayer = markerLayer;
-    const r = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
+    // Depth strategy. A reversed 32-bit float depth buffer keeps millimetre-to-
+    // light-year precision like the logarithmic buffer did, but without every
+    // shader writing gl_FragDepth, which disabled early depth rejection: the sky
+    // shaders (atmosphere, clouds, Milky Way) were shaded on every pixel even
+    // where terrain hides them. Falls back to the logarithmic buffer on GPUs
+    // without EXT_clip_control.
+    const reversedDepth = (() => {
+      // escape hatch for comparisons / driver trouble: ?logdepth=1 forces the old path
+      if (new URLSearchParams(location.search).has('logdepth')) return false;
+      const c = document.createElement('canvas');
+      const gl = c.getContext('webgl2');
+      const ok = !!gl && !!gl.getExtension('EXT_clip_control');
+      gl?.getExtension('WEBGL_lose_context')?.loseContext();
+      return ok;
+    })();
+    this.reversedDepth = reversedDepth;
+    patchShadowChunk();
+    const r = new THREE.WebGLRenderer({ antialias: false, reversedDepthBuffer: reversedDepth, logarithmicDepthBuffer: !reversedDepth, powerPreference: 'high-performance' });
     r.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     r.setSize(container.clientWidth, container.clientHeight);
     r.shadowMap.enabled = true;
@@ -271,7 +295,12 @@ export class Game {
     } catch { /* storage unavailable */ }
     const q0 = QUALITY_LEVELS[this.quality];
     const bw = Math.max(1, Math.round(container.clientWidth * q0.sceneScale)), bh = Math.max(1, Math.round(container.clientHeight * q0.sceneScale));
-    const rt = new THREE.WebGLRenderTarget(bw, bh, { type: THREE.HalfFloatType, samples: 4 });
+    const rt = new THREE.WebGLRenderTarget(bw, bh, {
+      type: THREE.HalfFloatType, samples: 4,
+      // reversed depth only pays off with a float depth attachment (the key must be
+      // absent, not undefined, on the logarithmic path: three rejects undefined)
+      ...(reversedDepth ? { depthTexture: new THREE.DepthTexture(bw, bh, THREE.FloatType) } : {}),
+    });
     this.composer = new EffectComposer(r, rt);
     this.composer.setPixelRatio(1);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
@@ -289,17 +318,25 @@ export class Game {
     const pmrem = new THREE.PMREMGenerator(r);
     const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
-    // sky
+    // sky (the Milky Way is baked once into a cubemap: static image, heavy shader)
     this.stars = makeStars(14000);
-    this.milky = makeMilkyWay();
+    this.milky = makeMilkyWay(bakeMilkyWay(r));
     this.scene.add(this.stars, this.milky);
 
     // lights
     this.light = new THREE.DirectionalLight(0xffffff, 3);
     this.light.castShadow = true;
     this.light.shadow.mapSize.set(q0.shadowMap, q0.shadowMap);
+    // bias sign is the same for both depth modes: patchShadowChunk() fixes three's PCF path
     this.light.shadow.bias = -0.0004;
     this.light.shadow.normalBias = 0.08;
+    // three r186 flags the shadow camera as reversed-depth inside the shadow pass but
+    // never rebuilds its projection, so a projection built before that first pass is a
+    // normal one while the depth test is GEQUAL: the map keeps the FARTHEST surface and
+    // shadows appear without casters (dark polygons, bands) while real ones go missing.
+    // Set the flag ourselves so every updateProjectionMatrix() below builds the right one.
+    (this.light.shadow.camera as unknown as { _reversedDepth: boolean })._reversedDepth = reversedDepth;
+    this.light.shadow.camera.updateProjectionMatrix();
     this.scene.add(this.light, this.light.target);
     this.hemi = new THREE.HemisphereLight(0x88aaff, 0x332211, 0.0);
     this.scene.add(this.hemi);
@@ -458,7 +495,7 @@ export class Game {
         if (gen.seaLevel !== null) b.waterMat = makeWaterMaterial(gen.waterDeep ?? [0.02, 0.08, 0.15], gen.waterShallow ?? [0.05, 0.3, 0.35]);
         const rockMat = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, flatShading: true });
         const treeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 });
-        b.terrain = new PlanetTerrain(def.radius, gen, mat, b.waterMat ?? null, rockMat, treeMat);
+        b.terrain = new PlanetTerrain(def.id, def.radius, gen, mat, b.waterMat ?? null, rockMat, treeMat);
         root.add(b.terrain.group);
       }
       if (def.atmo) {
@@ -474,6 +511,7 @@ export class Game {
         u.uG.value = a.g;
         u.uSun.value = a.sun;
         u.uMieTint.value.set(...a.mieTint);
+        u.uLut.value = makeOpticalDepthLut(1 + a.height / R, a.HR / R, a.HM / R);
         b.atmo = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), b.atmoMat);
         b.atmo.scale.setScalar(R + a.height);
         b.atmo.renderOrder = 4;
@@ -529,6 +567,7 @@ export class Game {
   private bindInput() {
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', this.onBlur);
     document.addEventListener('mousemove', this.onMouseMove);
     document.addEventListener('pointerlockchange', this.onLockChange);
     this.renderer.domElement.addEventListener('click', this.requestLock);
@@ -549,10 +588,15 @@ export class Game {
     if (e.code === 'Tab') e.preventDefault();
     if (!this.keys.has(e.code)) this.pressed.add(e.code);
     this.keys.add(e.code);
-    if (e.code === 'KeyM' || e.code === 'Tab') this.toggleMenu();
+    // a held key auto-repeats: toggling on every repeat made the map flash open and shut
+    if ((e.code === 'KeyM' || e.code === 'Tab') && !e.repeat) this.toggleMenu();
   };
   private onKeyUp = (e: KeyboardEvent) => {
     this.keys.delete(e.code);
+  };
+  /** Alt+Tab while holding a key never delivers its keyup: forget every held key. */
+  private onBlur = () => {
+    this.keys.clear();
   };
   private onMouseMove = (e: MouseEvent) => {
     if (!this.locked) return;
@@ -586,9 +630,8 @@ export class Game {
     for (const b of this.bodies) {
       const m = b.atmoMat;
       if (!m) continue;
-      if (m.defines.ATMO_NS !== q.atmoSteps || m.defines.ATMO_NL !== q.atmoLight) {
+      if (m.defines.ATMO_NS !== q.atmoSteps) {
         m.defines.ATMO_NS = q.atmoSteps;
-        m.defines.ATMO_NL = q.atmoLight;
         m.needsUpdate = true;
       }
     }
@@ -642,9 +685,11 @@ export class Game {
     this.lightsMode = mode;
     this.applyLightsMode();
     try { localStorage.setItem(LIGHTS_KEY, mode); } catch { /* ignore */ }
+    this.onLightsModeChange?.(mode);
   }
 
   toggleMenu(force?: boolean) {
+    if (!this.started) return; // the title screen keeps the game paused
     this.menuOpen = force ?? !this.menuOpen;
     if (this.menuOpen && document.pointerLockElement) document.exitPointerLock();
     this.onMenuToggle?.(this.menuOpen);
@@ -1287,6 +1332,7 @@ export class Game {
         const u = body.tUniforms;
         u.uDetailOffset.value.set(posMod(cw.x - body.pos.x, 256), posMod(cw.y - body.pos.y, 256), posMod(cw.z - body.pos.z, 256));
         u.uFogDensity.value = 0;
+        u.uNight.value = 0;
       }
       if (body.waterMat) {
         const u = body.waterMat.uniforms;
@@ -1294,6 +1340,13 @@ export class Game {
         u.uTime.value = this.time;
         u.uSunDir.value.copy(bSun);
         u.uFogDensity.value = 0;
+        // its own sunlight and daytime sky (the shader fades the sky with the water's own sun elevation);
+        // the nearest body overrides these below with the local values and the night floor
+        const tint = starDef.lightTint;
+        u.uSunColor.value.set(tint[0] * bSunI, tint[1] * bSunI, tint[2] * bSunI);
+        const fc = body.def.atmo?.fogColor ?? [0, 0, 0];
+        u.uSky.value.set(fc[0], fc[1], fc[2]).multiplyScalar(bSunI * 0.3 + 0.005);
+        u.uSkyNight.value.set(0, 0, 0);
       }
     }
     // stars: surface animation + halo. The halo keeps a fixed angular size out to
@@ -1332,7 +1385,12 @@ export class Game {
     // lighting at the camera / focus
     const hor = camAlt > 0 ? Math.acos(clamp(def.radius / camR, -1, 1)) : 0;
     let shadowF = def.kind === 'star' ? 1 : smoothstep(-Math.sin(hor) - 0.03, -Math.sin(hor) + 0.02, sunEl);
-    if (camAlt < 3000) shadowF = 1; // near ground the shadow map handles it
+    // Near the ground the shadow map covers only a few dozen metres, so it cannot
+    // stop a Sun that is already below the horizon from lighting slopes and rocks
+    // tilted towards it (bright far hills and rock sides at night while nearby
+    // things were black). Fade the sunlight through twilight using the local
+    // horizon instead; the shadow map keeps handling daytime shadows.
+    if (camAlt < 3000 && def.kind !== 'star') shadowF = smoothstep(-0.035, 0.005, sunEl);
     const lc = new THREE.Color(...starDef.lightTint);
     let li = sunI;
     let fogDensity = 0;
@@ -1403,7 +1461,30 @@ export class Game {
     li *= shadowF;
     this.light.color.copy(lc);
     this.light.intensity = li;
+    // the studio environment map must not make the hull glow at night
+    const envF = clamp(li / 3.3, 0.06, 1);
+    for (const e of this.ship.envMats) e.mat.envMapIntensity = e.base * envF;
+    for (const e of this.astro.envMats) e.mat.envMapIntensity = e.base * envF;
     this.hemi.intensity = hemiI;
+    // Night floor on worlds with an atmosphere: a dim, bluish "moonlit" ambient so
+    // nearby and distant objects read consistently. Real starlight is ~100 000x
+    // weaker than daylight and would tone-map to pure black, so this is a
+    // deliberate stylisation; the suit lamp and headlights (F) remain the way to see.
+    // The floor exists only near the surface: from orbit the night side of a
+    // planet must stay black, as it really is.
+    // It also starts only once the sun is really below the horizon: a low sun must
+    // keep its long, pitch-black shadows (lunar sunsets).
+    // The floor comes in exactly as the near-ground sunlight goes out (same ramp as
+    // shadowF), so dusk never dips to black. It stays on while approaching and in
+    // orbit (below 1.5 radii) and is gone from afar (6 radii): a distant world shows
+    // only its lit crescent, like the Moon in the sky.
+    const nightT = 1 - smoothstep(-0.035, 0.005, sunEl);
+    const nightFloor = NIGHT_AMBIENT * nightT * (1 - smoothstep(1.5 * def.radius, 6 * def.radius, camAlt));
+    if (a && def.kind === 'rocky') {
+      this.hemi.intensity = Math.max(hemiI, nightFloor);
+      this.hemi.color.lerp(new THREE.Color(0.55, 0.62, 0.8), nightT);
+      this.hemi.groundColor.lerp(new THREE.Color(0.18, 0.18, 0.22), nightT);
+    }
     this.hemi.position.copy(up);
     this.stars.material instanceof THREE.ShaderMaterial && (this.stars.material.uniforms.uAlpha.value = starAlpha);
     (this.stars.material as THREE.ShaderMaterial).uniforms.uPR.value = this.renderer.getPixelRatio();
@@ -1411,20 +1492,29 @@ export class Game {
     if (b.tUniforms) {
       b.tUniforms.uFogDensity.value = fogDensity;
       b.tUniforms.uFogColor.value.set(fogC.r, fogC.g, fogC.b);
+      b.tUniforms.uNight.value = nightFloor / NIGHT_AMBIENT;
     }
     if (b.waterMat) {
       const u = b.waterMat.uniforms;
       u.uFogDensity.value = fogDensity;
       u.uFogColor.value.set(fogC.r, fogC.g, fogC.b);
       u.uSunColor.value.set(lc.r * li, lc.g * li, lc.b * li);
-      const sky = a ? new THREE.Color(...a.fogColor).multiplyScalar(sunI * 0.3 * smoothstep(-0.1, 0.3, sunEl) + 0.005) : new THREE.Color(0, 0, 0);
-      u.uSky.value.set(sky.r, sky.g, sky.b);
+      const sky = a ? new THREE.Color(...a.fogColor).multiplyScalar(sunI * 0.3 + 0.005) : new THREE.Color(0, 0, 0);
+      u.uSky.value.set(sky.r, sky.g, sky.b); // daytime sky; faded per fragment by the water's own sun elevation
+      const nf = nightFloor * 0.08; // moonlit sky on the water at night
+      u.uSkyNight.value.set(0.55 * nf, 0.62 * nf, 0.8 * nf);
     }
     // ambient baseline (space is dark)
     if (!a || def.kind !== 'rocky') {
       this.hemi.color.setRGB(0.6, 0.7, 1);
       this.hemi.groundColor.setRGB(0.2, 0.2, 0.25);
-      this.hemi.intensity = def.kind === 'gas' ? 0.06 : 0.025;
+      // airless worlds: pitch-black daytime shadows as before, the night floor only after sunset
+      this.hemi.intensity = def.kind === 'gas' ? 0.06 : Math.max(0.025, nightFloor);
+    }
+    // other worlds in the sky keep the plain space baseline (0.025) instead of the local sky/night floor
+    for (const body of this.bodies) {
+      if (!body.tUniforms) continue;
+      body.tUniforms.uHemiScale.value = body === b ? 1 : clamp(0.025 / Math.max(this.hemi.intensity, 1e-4), 0, 1);
     }
 
     // shadow light follows focus
@@ -1435,7 +1525,10 @@ export class Game {
     const ext = this.mode === 'ship' ? 70 : 45;
     if (sc.right !== ext) {
       sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext;
-      sc.near = 10; sc.far = 4000;
+      // Casters (player, ship, rocks, trees; the terrain does not cast) within 300 m
+      // towards the Sun, receivers up to 800 m behind the player, so sunset shadows
+      // stay long while the depth range, and with it the bias in metres, stays small.
+      sc.near = 1500 - 300; sc.far = 1500 + 800;
       sc.updateProjectionMatrix();
     }
     this.light.target.updateMatrixWorld();
@@ -1715,6 +1808,7 @@ export class Game {
     cancelAnimationFrame(this.raf);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
+    window.removeEventListener('blur', this.onBlur);
     document.removeEventListener('mousemove', this.onMouseMove);
     document.removeEventListener('pointerlockchange', this.onLockChange);
     window.removeEventListener('resize', this.onResize);

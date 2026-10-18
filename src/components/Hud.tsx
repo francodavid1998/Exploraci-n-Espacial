@@ -47,7 +47,7 @@ export default function Hud({ game, onOpenMap }: { game: Game; onOpenMap: () => 
   const [help, setHelp] = useState(true);
   useEffect(() => {
     const id = setInterval(() => setS(game.getHud()), 100);
-    const k = (e: KeyboardEvent) => { if (e.code === 'KeyH') setHelp((h) => !h); };
+    const k = (e: KeyboardEvent) => { if (e.code === 'KeyH' && !e.repeat) setHelp((h) => !h); };
     window.addEventListener('keydown', k);
     return () => { clearInterval(id); window.removeEventListener('keydown', k); };
   }, [game]);
