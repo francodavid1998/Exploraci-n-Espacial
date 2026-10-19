@@ -182,6 +182,7 @@ export const CACHES: CacheDef[] = [
         'Si estás oyendo esto, soy yo. Tú. Antes de dormir.',
         'Me dijeron que al despertar no recordaría nada: el criosueño largo borra los últimos meses.',
         'Por eso dejo estas notas donde solo yo las buscaría. Siempre quise ver Stickney de cerca.',
+        'La siguiente la dejaré donde llueve metano, junto a los lagos de Saturno.',
       ],
     },
   },
@@ -194,6 +195,7 @@ export const CACHES: CacheDef[] = [
         'Estuve en Tsiolkovsky. Fui yo quien trajo a la Tierra la primera muestra del artefacto.',
         'No sabíamos que la señal viajaba con ella. Que lo que la escuchaba la seguiría.',
         'Lo que pasó en la Tierra empezó en mi nave.',
+        'La última nota estará lejos, en el mundo más frío de TRAPPIST-1. Si llegas hasta allí, ya sabrás por qué.',
       ],
     },
   },
@@ -233,9 +235,13 @@ export interface Place {
   desc: string;
   /** survival only: done, the current objective, or still to do */
   status?: 'hecho' | 'objetivo' | 'pendiente';
+  /** a real place of the solar system (Olympus Mons, Stickney...) */
+  real?: boolean;
+  /** survival: optional (a hidden cache the scanner hears, a distress signal) */
+  optional?: boolean;
 }
 
-/** what the map says about each place */
+/** what the map says about each place (survival: the story's words) */
 export const PLACE_INFO: Record<string, string> = {
   esperanza: 'Ciudad en ruinas junto a la costa. Una baliza de la Estación de Evacuación 7 sigue emitiendo en la plaza.',
   alba: 'Puerto en ruinas. Los barcos nunca zarparon.',
@@ -248,6 +254,42 @@ export const PLACE_INFO: Record<string, string> = {
   'frag-proxima': 'Monolito alienígena en la cara helada de Próxima b, a 4,25 años luz: el último fragmento.',
   spire: 'La Aguja: una torre de piedra negra en la noche eterna de TRAPPIST-1 e. El faro de la señal.',
 };
+/** the same places described for realistic exploration: what they are and why they are worth the trip */
+export const PLACE_INFO_EXPLORE: Record<string, string> = {
+  esperanza: 'Ciudad en ruinas cerca de la costa, bajo el sol de la mañana. En la plaza sigue en pie un mástil con una luz roja fija.',
+  alba: 'Antiguo puerto junto al mar: torres partidas frente al agua.',
+  meridiano: 'La ciudad en ruinas más grande: una plaza central abierta rodeada de torres rotas.',
+  telmo: 'Ciudad universitaria en el lado nocturno de la Tierra: para verla hace falta la linterna.',
+  cumbre: 'Observatorio de montaña, de noche, con su gran antena rota apuntando al cielo.',
+  tsiolkovsky: 'Base científica abandonada en la cara oculta de la Luna, siempre a oscuras. Junto a ella asoma un objeto negro.',
+  'frag-mars': 'Un monolito negro rodeado de piedras en el lado nocturno de Marte. Sus líneas brillan sin parpadear.',
+  'frag-europa': 'Un monolito negro sobre el hielo de Europa, de noche, con Júpiter en el cielo.',
+  'frag-proxima': 'Un monolito negro en la cara helada de Próxima b, a 4,25 años luz del Sol.',
+  spire: 'Una torre de piedra negra de 170 m en la noche eterna de TRAPPIST-1 e, con un haz de luz violeta hacia el cielo.',
+  olympus: 'El volcán más alto del sistema solar: 21,9 km sobre la llanura y 600 km de ancho. Su caldera mide 80 km.',
+  tharsis: 'La meseta de Tharsis: un abombamiento volcánico de miles de kilómetros que sostiene a los grandes volcanes de Marte.',
+  valles: 'Valles Marineris: un sistema de cañones de 4 000 km de largo y hasta 7 km de profundidad.',
+  stickney: 'El cráter Stickney: 9 km de ancho en una luna de solo 22. El golpe que lo hizo casi parte Fobos en dos.',
+};
+
+/** real places modelled on the terrain (both modes): body and unit direction from its centre */
+export const LANDMARKS: { id: string; name: string; body: string; dir: [number, number, number] }[] = [
+  { id: 'olympus', name: 'Monte Olimpo', body: 'mars', dir: [Math.cos(0.3255) * Math.cos(-2.335), Math.sin(0.3255), Math.cos(0.3255) * Math.sin(-2.335)] },
+  { id: 'tharsis', name: 'Meseta de Tharsis', body: 'mars', dir: [Math.cos(0.05) * Math.cos(-1.85), Math.sin(0.05), Math.cos(0.05) * Math.sin(-1.85)] },
+  { id: 'valles', name: 'Valles Marineris', body: 'mars', dir: [Math.cos(-0.14) * Math.cos(-1.35), Math.sin(-0.14), Math.cos(-0.14) * Math.sin(-1.35)] },
+  { id: 'stickney', name: 'Cráter Stickney', body: 'phobos', dir: [0.6, 0.2, 0.77] },
+];
+
+/** exploration's optional grand tour, in order */
+export const GRAND_TOUR: { id: string; name: string; how: string }[] = [
+  { id: 'moon', name: 'Caminar por la Luna', how: 'Baja de la nave en la Luna' },
+  { id: 'olympus', name: 'El Monte Olimpo', how: 'Acércate a menos de 60 km de su cumbre, en Marte' },
+  { id: 'jupiter', name: 'Bajo las nubes de Júpiter', how: 'Desciende por debajo de sus nubes' },
+  { id: 'rings', name: 'Los anillos de Saturno', how: 'Vuela a menos de 1 000 km del plano de los anillos' },
+  { id: 'titan', name: 'Los lagos de Titán', how: 'Baja de la nave en Titán' },
+  { id: 'proxima-b', name: 'Otra estrella: Próxima b', how: 'Baja de la nave en Próxima b' },
+  { id: 'trappist-1e', name: 'TRAPPIST-1 e', how: 'Baja de la nave en TRAPPIST-1 e' },
+];
 
 // ---------------------------------------------------------------------------
 // More to find: the mementos of humanity (in the supply crates and shelters)
@@ -283,8 +325,26 @@ export const VEGA_LAND: Record<string, string> = {
   europa: 'Europa. Bajo este hielo hay un océano. Y quizá algo más.',
   'proxima-b': 'Próxima b. Esta estrella escupe radiación cuando se enfada. No te quedes mucho al descubierto.',
   'trappist-1e': 'TRAPPIST-1 e. De aquí sale la llamada. Lo noto en todos mis sistemas.',
-  phobos: 'Fobos. Casi no hay gravedad: un salto fuerte y no vuelves a bajar.',
+  phobos: 'Fobos. Casi no hay gravedad: un salto fuerte y no vuelves a bajar. La mochila también empuja hacia abajo ({KeyC}).',
+  deimos: 'Deimos. Aquí un salto tarda minutos en volver. Si te pasas, la mochila empuja hacia abajo ({KeyC}).',
   titan: 'Titán. Lagos de metano y un cielo naranja. Precioso, si no tuvieras que respirar.',
+  io: 'Ío. Volcanes de azufre y la radiación de Júpiter. Si el escáner oye algo aquí, que sea rápido.',
+  callisto: 'Calisto. Hielo viejo y cráteres sobre cráteres, lejos de lo peor de la radiación de Júpiter.',
+  mercury: 'Mercurio. Al sol el traje se cuece; a la sombra se congela. No te quedes quieto.',
+  'trappist-1h': 'TRAPPIST-1 h. El mundo más frío de este sistema. Si alguien escondió algo aquí, sabía que nadie vendría a mirar.',
+};
+/** what the screen says when a creature or a danger kills the pilot */
+export const DEATH: Record<string, string> = {
+  stalker: 'Un acechador salió de la oscuridad. No lo viste llegar.',
+  swarm: 'El enjambre te cubrió. Eran demasiados.',
+  colossus: 'El coloso te alcanzó. La luz solo lo frenaba.',
+  spitter: 'El ácido de un escupidor te alcanzó desde lejos.',
+  tracker: 'Los rastreadores te rodearon a plena luz. Cazan en manada.',
+  sentinel: 'El ácido de un vigía te alcanzó. Nada se acerca a su plaza y sale entero.',
+  guardian: 'El Guardián de la Aguja te alcanzó. El faro sigue ardiendo.',
+  hunter: 'Las mantarrayas del vacío destrozaron la nave.',
+  dark: 'Algo salió de la oscuridad. No lo viste llegar.',
+  day: 'Algo te alcanzó. No lo viste llegar.',
 };
 export const VEGA = {
   first: 'Estoy contigo por radio, piloto. Si me necesitas, aquí estaré. Aunque no tenga a dónde ir.',
@@ -296,25 +356,77 @@ export const VEGA = {
   colossus: 'Eso es enorme. La luz no lo detiene, solo lo frena. Dispara y retrocede.',
   colossusDown: 'Lo has tumbado. Ni yo misma me lo creo.',
   tracker: 'Rastreadores. Cazan en manada y a plena luz: la linterna no los asusta. No dejes que te rodeen.',
-  hunters: 'Algo vivo se acerca a la nave por el vacío. Como mantarrayas. Cañones listos: clic para disparar.',
+  hunters: 'Algo vivo se acerca a la nave por el vacío. Como mantarrayas. Cañones listos: {Mouse0} para disparar.',
+  huntersRespawn: 'Sube por encima de 2.500 km: no nos siguen tan alto. O salta con {KeyJ} en cuanto salgamos de su zona.',
   ambushSpace: '¡Nos han seguido! Mantarrayas del vacío detrás de nosotros.',
   lowO2: 'Te queda poco oxígeno. Vuelve a la nave, por favor.',
   lowBattery: 'La batería del traje está casi vacía. Sin ella no hay linterna ni disparos.',
-  lowHealth: 'Tus constantes caen. Si llevas un botiquín, úsalo ya (B).',
+  lowHealth: 'Tus constantes caen. Si llevas un botiquín, úsalo ya ({KeyB}).',
   noMedkit: 'No te quedan botiquines. Busca cajas de suministros en las ruinas.',
   revive: 'Te traje de vuelta. Otra vez. Intenta que no se convierta en costumbre.',
   crate: 'Suministros. Alguien los dejó para quien viniera después.',
   memento: 'Esto era de alguien. Lo guardaré en tu colección.',
   bunker: 'Un refugio. Aquí aguantaron un tiempo. No sé cuánto.',
-  dispersor: 'El dispersor de pulsos del ejército. A corta distancia no perdona. Cámbialo con 1 y 2.',
+  dispersor: 'El dispersor de pulsos del ejército. A corta distancia no perdona. Cámbialo con {WeaponToggle}.',
   ambushRuins: '¡Cuidado! No estábamos solos.',
   signal: 'Capto una señal de socorro automática. Te la marco en el mapa: el círculo ○.',
   signalGone: 'La señal de socorro se ha apagado.',
   wreck: 'Es una nave como la nuestra. Estrellada. Revisa los restos: quizá quede algo útil.',
-  idle: 'Si te pierdes, abre el mapa (M). En MISIONES tienes el siguiente paso.',
+  idle: 'Si te pierdes, abre el mapa ({KeyM}). En MISIONES tienes el siguiente paso.',
   guardian: 'Esa bestia es el cerrojo del faro. Los pilones alimentan su escudo.',
   end: 'Se ha ido. La señal ya no está. Por primera vez en años… silencio.',
+  airborne: 'Llevas un minuto en el aire. Aquí la gravedad casi no tira: empuja la mochila hacia abajo con {KeyC}.',
+  recall: 'Si no puedes volver, pulsa {KeyE}: llevo la nave hasta ti.',
+  swim: 'Estás en el agua. El traje flota, pero nadar con él es lento. Busca la orilla.',
+  noFuelUnsafe: 'Ahí no hay hielo que sacar, o el lugar te mataría antes. Te llevo al mundo más cercano donde sí lo hay.',
+  noFuelFar: 'Con este combustible no llegamos: nos quedaríamos a medio camino. La reserva aguanta, pero el casco sufre.',
+  crafted: 'Hecho. No es bonito, pero funciona.',
+  beacon: 'Una baliza de luz fija. Mientras arda, lo que vive en la oscuridad no se acercará.',
+  lamp: 'La linterna te protege de cerca… pero de lejos te delata. Lo decía la baliza: nada de luces de noche.',
+  notMe: 'Eso que acabas de leer… no era yo. Yo no he dicho nada.',
+  pylonGlow: 'El pilón caído deja energía en el aire. Acércate: recarga el traje.',
+  heart: '¡Su corazón! Después de cada ráfaga baja la cabeza: dispara entonces.',
+  phase2: 'Está llamando a los suyos. Vienen escupidores.',
+  phase3: 'Algo enorme sale de la oscuridad. Aguanta.',
+  marsStones: 'La inscripción está repartida: tres piedras del anillo tienen las líneas apagadas. Ilumínalas con la linterna.',
+  europaIce: 'El hielo cubre la inscripción. Extráelo, pero rápido: la radiación de Júpiter no espera.',
+  proximaScan: 'Quédate cerca mientras el escáner traduce. Y prepárate: esto los va a atraer.',
+  epilogue: 'Todavía tienes el sobre de semillas. Nueva Esperanza tiene sol. Creo que sé lo que quieres hacer.',
+  planted: 'Girasoles. En la Tierra, otra vez. Quizá alguien vuelva algún día y los vea.',
+  radiation: 'Aquí la radiación te quita salud: tienes unos {MIN} minutos fuera de la nave.',
+  suborbital: 'Vuelo suborbital: subo por encima del aire, cruzo y te dejo junto al punto.',
 } as const;
+/** VEGA on the way, during a suborbital flight to a place of the story (once each) */
+export const VEGA_HOP: Record<string, string> = {
+  alba: 'Puerto Alba. Desde aquí arriba se ve el puerto: los barcos siguen amarrados.',
+  meridiano: 'Ciudad Meridiano. La plaza está despejada, pero no vacía. Mejor aterriza a un lado.',
+  telmo: 'San Telmo está en la noche. Enciende la linterna al bajar… y apágala si oyes algo a lo lejos.',
+  cumbre: 'El observatorio está en la cima. Allí arriba el aire es fino y hace frío.',
+  esperanza: 'Nueva Esperanza. La baliza sigue llamando. Vamos a ver quién la dejó encendida.',
+};
+/** what speaks in VEGA's voice in the deep dark, when it is not VEGA */
+export const FAKE_VOICES = [
+  'Piloto… apaga la linterna. Ven hacia mí. Te espero aquí.',
+  'Sal de la luz. Aquí no hay nada. Confía en mí.',
+  'La nave está por aquí. Sigue mi voz.',
+  'No mires atrás. Camina hacia la oscuridad.',
+];
+/** crafted aboard with what is in the hold */
+export type CraftId = 'medkit' | 'beacon';
+export const CRAFTS: { id: CraftId; name: string; desc: string; metal: number; crystal: number }[] = [
+  { id: 'medkit', name: 'Botiquín', desc: '+45 de salud al usarlo (puedes llevar 5)', metal: 2, crystal: 2 },
+  { id: 'beacon', name: 'Baliza de luz', desc: 'Se clava en el suelo y aleja a las criaturas durante 2 minutos (puedes llevar 3)', metal: 3, crystal: 1 },
+];
+/** the epilogue at Nueva Esperanza */
+export const EPILOGUE: LogEntry = {
+  id: 'epilogue', site: 'esperanza', title: 'Girasoles', from: 'Nueva Esperanza · después de la señal',
+  text: [
+    'Abres el sobre. Las semillas son pequeñas, rayadas, y huelen a algo que habías olvidado.',
+    'Las entierras junto a la baliza, donde da el sol toda la mañana. La tierra está seca, pero no muerta.',
+    'VEGA no dice nada durante un rato. Luego, muy bajito: «Gracias por traerme hasta aquí».',
+    'El sol sigue en el mismo sitio de siempre. Ahora, por fin, alumbra algo nuevo.',
+  ],
+};
 /** what VEGA thinks after each recording */
 export const VEGA_STORY: Record<string, string> = {
   beacon: 'No respondan a voces que conozcan… Si alguna vez te hablo raro, desconfía de mí.',

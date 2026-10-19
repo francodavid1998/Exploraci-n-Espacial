@@ -20,6 +20,7 @@ export default function App() {
   const [lights, setLights] = useState<LightsMode>('comfort');
   // survival: the saved game (if any) and the "are you sure?" step of a new game over it
   const [save] = useState(() => Survival.load());
+  const [trip] = useState(() => Game.loadExplore());
   const [confirmNew, setConfirmNew] = useState(false);
 
   useEffect(() => {
@@ -50,6 +51,7 @@ export default function App() {
   }, [game, started, menu]);
 
   const start = (mode: 'explore' | 'survival', continueSave = false) => {
+    game?.sfx.init(); // a click: the sound may start
     if (!game) return;
     if (mode === 'survival' && !continueSave && save && !confirmNew) { setConfirmNew(true); return; }
     setStarted(true);
@@ -58,7 +60,10 @@ export default function App() {
       game.menuOpen = false;
       game.requestLock();
       const jump = IS_TOUCH ? 'SALTO' : 'J';
-      if (mode === 'explore') game.note(`Órbita terrestre. Destino: la Luna. Pulsa ${jump} para saltar.`);
+      if (mode === 'explore') {
+        if (game.startExplore(continueSave)) game.note('Viaje recuperado: donde lo dejaste');
+        else game.note(`Órbita terrestre. Destino: la Luna. Pulsa ${jump} para saltar.`);
+      }
       else if (game.startSurvival(continueSave)) {
         game.note('Partida cargada. Estás a bordo de tu nave');
         game.note(`Objetivo: ${game.surv!.objective().text}`);
@@ -81,7 +86,7 @@ export default function App() {
 
       {game && started && !menu && IS_TOUCH && <TouchControls game={game} />}
       {game && started && <Hud game={game} touch={IS_TOUCH} onOpenMap={() => game.toggleMenu(true)} />}
-      {game && started && menu && <SystemMap game={game} onClose={() => { game.toggleMenu(false); }} />}
+      {game && started && menu && <SystemMap game={game} touch={IS_TOUCH} onClose={() => { game.toggleMenu(false); }} />}
 
       {!started && (
         // phones in landscape have ~360 px of height: a compact screen that can scroll
@@ -102,13 +107,25 @@ export default function App() {
               <div className={`flex flex-col rounded-2xl border border-cyan-200/25 bg-black/40 ${IS_TOUCH ? 'p-3' : 'p-5'} backdrop-blur`}>
                 <div className="text-[10px] tracking-[0.4em] text-cyan-300/80">MODO</div>
                 <div className={`${IS_TOUCH ? 'text-sm' : 'text-lg'} font-light tracking-[0.2em]`}>EXPLORACIÓN REALISTA</div>
-                <p className="mt-2 flex-1 text-[12px] leading-relaxed text-white/60">El universo real, sin peligros añadidos. Viaja, aterriza y contempla.</p>
+                <p className="mt-2 flex-1 text-[12px] leading-relaxed text-white/60">
+                  El universo real, sin peligros añadidos. Viaja, aterriza y contempla.
+                  {!IS_TOUCH && ' La Tierra está en silencio: sus ruinas y unas extrañas estructuras forman parte de este universo; su historia se cuenta en Supervivencia.'}
+                </p>
+                {trip && (
+                  <button
+                    disabled={!game}
+                    onClick={() => start('explore', true)}
+                    className="mt-4 rounded-full border border-cyan-200/40 bg-cyan-200/10 py-2.5 text-xs tracking-[0.4em] text-cyan-50 transition hover:bg-cyan-200/20 disabled:opacity-40"
+                  >
+                    CONTINUAR
+                  </button>
+                )}
                 <button
                   disabled={!game}
                   onClick={() => start('explore')}
-                  className="mt-4 rounded-full border border-cyan-200/40 bg-cyan-200/10 py-2.5 text-xs tracking-[0.4em] text-cyan-50 transition hover:bg-cyan-200/20 disabled:opacity-40"
+                  className={`${trip ? 'mt-2 border-white/20 text-white/70' : 'mt-4 border-cyan-200/40 bg-cyan-200/10 text-cyan-50'} rounded-full border py-2.5 text-xs tracking-[0.4em] transition hover:bg-cyan-200/20 disabled:opacity-40`}
                 >
-                  {game ? 'EXPLORAR' : 'GENERANDO MUNDOS…'}
+                  {game ? (trip ? 'NUEVO VIAJE' : 'EXPLORAR') : 'GENERANDO MUNDOS…'}
                 </button>
               </div>
               <div className={`flex flex-col rounded-2xl border border-red-300/20 bg-black/50 ${IS_TOUCH ? 'p-3' : 'p-5'} backdrop-blur`}>

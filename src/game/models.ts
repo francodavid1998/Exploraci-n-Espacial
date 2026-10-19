@@ -8,6 +8,8 @@ export interface ShipModel {
   navLights: THREE.Mesh[];
   headlight: THREE.SpotLight;
   plasma: THREE.Mesh;
+  /** survival: two cannon tubes under the wings (hidden in exploration) */
+  cannons: THREE.Mesh[];
   /** materials with an environment map and their base intensity (scaled with sunlight at runtime) */
   envMats: { mat: THREE.MeshStandardMaterial; base: number }[];
 }
@@ -141,8 +143,19 @@ export function buildShip(env: THREE.Texture | null, plasmaMat: THREE.Material):
   plasma.scale.set(10, 6, 13);
   plasma.visible = false;
   root.add(plasma);
+  // cannon tubes under the wings, where the ship's bolts come from (survival shows them)
+  const cannons: THREE.Mesh[] = [];
+  const tube = new THREE.CylinderGeometry(0.16, 0.2, 3.2, 10).rotateX(Math.PI / 2);
+  for (const x of [-5.2, 5.2]) {
+    const c = new THREE.Mesh(tube, dark);
+    c.position.set(x, -0.3, -1.6);
+    c.castShadow = true;
+    c.visible = false;
+    root.add(c);
+    cannons.push(c);
+  }
   const envMats = [hull, dark, accent, glass].map((m) => ({ mat: m as THREE.MeshStandardMaterial, base: m.envMapIntensity }));
-  return { root, flames, glows, gear, navLights, headlight, plasma, envMats };
+  return { root, flames, glows, gear, navLights, headlight, plasma, cannons, envMats };
 }
 
 export interface AstroModel {
@@ -153,6 +166,8 @@ export interface AstroModel {
   armR: THREE.Group;
   jet: THREE.Mesh[];
   lamp: THREE.SpotLight;
+  /** survival: the weapon in the right hand (hidden in exploration) */
+  weapons: { rifle: THREE.Group; dispersor: THREE.Group };
   envMats: { mat: THREE.MeshStandardMaterial; base: number }[];
 }
 
@@ -209,6 +224,18 @@ export function buildAstronaut(env: THREE.Texture | null): AstroModel {
   lamp.position.set(0, 1.75, -0.25);
   lamp.target.position.set(0, 0.6, -8);
   root.add(lamp, lamp.target);
+  // the weapons, held in the right hand along the forearm (the barrel continues the arm)
+  const gun = new THREE.MeshStandardMaterial({ color: 0x4a5058, roughness: 0.5, metalness: 0.5 });
+  const coil = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 0.45, 0.55) });
+  const rifle = new THREE.Group();
+  m(new THREE.BoxGeometry(0.08, 0.34, 0.1), gun, rifle, [0, -0.66, -0.03]);
+  m(new THREE.CylinderGeometry(0.02, 0.022, 0.26, 8), gun, rifle, [0, -0.95, -0.03]);
+  m(new THREE.TorusGeometry(0.035, 0.008, 6, 12).rotateX(Math.PI / 2), coil, rifle, [0, -0.86, -0.03]).castShadow = false;
+  const dispersor = new THREE.Group();
+  m(new THREE.BoxGeometry(0.17, 0.3, 0.14), gun, dispersor, [0, -0.66, -0.03]);
+  for (const x of [-0.05, 0, 0.05]) m(new THREE.CylinderGeometry(0.022, 0.026, 0.16, 8), gun, dispersor, [x, -0.88, -0.03]);
+  rifle.visible = dispersor.visible = false;
+  armR.add(rifle, dispersor);
   const envMats = [grey, visor].map((m) => ({ mat: m, base: m.envMapIntensity }));
-  return { root, legL, legR, armL, armR, jet, lamp, envMats };
+  return { root, legL, legR, armL, armR, jet, lamp, weapons: { rifle, dispersor }, envMats };
 }
