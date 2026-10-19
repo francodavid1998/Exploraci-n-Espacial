@@ -131,6 +131,7 @@ export default function TouchControls({ game }: { game: Game }) {
           <div className="absolute bottom-5 right-5 flex items-end gap-3">
             {game.surv && <HoldButton game={game} code="Mouse0" label="FUEGO" />}
             {!ship && game.surv && <HoldButton game={game} code="KeyR" label="MINAR" />}
+            {!ship && game.surv && <TapButton game={game} code="KeyQ" label="ESQ" />}
             <HoldButton game={game} code="ShiftLeft" label={ship ? 'TURBO' : 'CORRER'} />
             {ship && <HoldButton game={game} code="KeyC" label="▼" />}
             <HoldButton game={game} code="Space" label="▲" />
@@ -151,6 +152,8 @@ export default function TouchControls({ game }: { game: Game }) {
             <div className="flex gap-2">
               {ship && <TapButton game={game} code="KeyX" label="PARAR" wide />}
               <TapButton game={game} code="KeyF" label="F" />
+              {!ship && game.surv && <TapButton game={game} code="KeyB" label="CURAR" wide />}
+              {!ship && game.surv && <TapButton game={game} code="WeaponToggle" label="ARMA" wide />}
               <TapButton game={game} code="KeyT" label="T" />
               {ship && <TapButton game={game} code="KeyK" label="K" />}
               <button

@@ -969,6 +969,10 @@ export class Game {
   private waypointPos(out: THREE.Vector3): { pos: THREE.Vector3; far: string | null } | null {
     const id = this.waypoint?.id;
     if (!id) return null;
+    if (id === 'event') {
+      const p = this.surv?.events.pos(out);
+      return p ? { pos: p, far: null } : null;
+    }
     const al = this.alien.site(id);
     const b = al ? this.alien.body(al) : this.byId.get('earth')!;
     if (b.star !== this.sunBody) return { pos: out.copy(b.star.pos), far: b.star.def.name };
@@ -1074,8 +1078,16 @@ export class Game {
   }
 
   private restoreSurvival(s: SurvivalSave) {
+    const okPos = Array.isArray(s.off) && s.off.every((v) => typeof v === 'number' && Number.isFinite(v)) && Array.isArray(s.q) && s.q.every((v) => typeof v === 'number' && Number.isFinite(v));
     const b = this.byId.get(s.body);
-    if (!b) return false;
+    if (!b || !okPos || b.def.kind === 'star') {
+      // a damaged position: keep everything else and wake up in orbit of the Earth
+      this.surv!.apply(s);
+      this.hull = s.hull; this.suit = s.health;
+      this.mode = 'ship'; this.landed = false;
+      this.spawnStart();
+      return true;
+    }
     if (b.star !== this.sunBody) this.switchFrame(b.star);
     this.prepareSystem(b.star, true);
     this.surv!.apply(s);
@@ -2084,7 +2096,12 @@ export class Game {
       this.plasmaMat.uniforms.uTime.value = this.time;
     }
     const as = this.astro;
-    as.root.visible = this.mode === 'foot' && !this.vision; // vision mode: through the astronaut's eyes
+    // vision mode: through the astronaut's own eyes (the body is hidden, its suit lamp still shines)
+    as.root.visible = this.mode === 'foot';
+    if (as.root.userData.hidden !== this.vision) {
+      as.root.userData.hidden = this.vision;
+      as.root.traverse((o) => { if ((o as THREE.Mesh).isMesh) o.visible = !this.vision; });
+    }
     if (this.mode === 'foot') {
       const upP = this.playerPos.clone().sub(b.pos).normalize();
       as.root.position.copy(this.camOff).negate();

@@ -5,8 +5,18 @@ import * as THREE from 'three';
  * the danger, the creatures' clicking and growls placed where they are (3D), the
  * sentinels, the weapon, and a heartbeat at low health. Moderate levels, soft attacks:
  * horror by ear, never a blast. N mutes (remembered).
+ * Music, also synthesised: slow pads that change with the place (space, ground, night) and a
+ * low pulse that comes in when there is a fight.
  */
-export type Sfx = 'shot' | 'hit' | 'bolt' | 'alert' | 'clank' | 'down' | 'chitter' | 'growl' | 'hiss' | 'shriek' | 'hurt';
+export type Sfx = 'shot' | 'hit' | 'bolt' | 'alert' | 'clank' | 'down' | 'chitter' | 'growl' | 'hiss' | 'shriek' | 'hurt' | 'blast' | 'dash' | 'heal' | 'vega';
+export type Mood = 'space' | 'ground' | 'night';
+const midi = (n: number) => 440 * Math.pow(2, (n - 69) / 12);
+/** four chords per mood (MIDI notes), eight seconds each */
+const CHORDS: Record<Mood, number[][]> = {
+  ground: [[57, 60, 64], [53, 57, 64], [55, 60, 64], [52, 55, 59]],
+  night: [[57, 58, 64], [53, 56, 62], [52, 55, 58], [50, 53, 57]],
+  space: [[69, 72, 76], [65, 69, 76], [67, 72, 76], [64, 67, 71]],
+};
 const KEY = 'helios-sound';
 
 export class SoundFX {
@@ -16,6 +26,7 @@ export class SoundFX {
   private noise!: AudioBuffer;
   private drone: { gain: GainNode; wind: GainNode } | null = null;
   private beatT = 0;
+  private music: { gain: GainNode; filter: BiquadFilterNode; nextChord: number; chord: number; nextBeat: number; beat: number; mood: Mood } | null = null;
 
   constructor() {
     try { this.enabled = localStorage.getItem(KEY) !== '0'; } catch { /* ignore */ }
@@ -51,6 +62,71 @@ export class SoundFX {
     src.connect(lp).connect(wind).connect(this.master); src.start();
     gain.connect(this.master);
     this.drone = { gain, wind };
+    // music bus: pads through a soft low-pass, and a short echo for space
+    const mg = ctx.createGain(); mg.gain.value = 0;
+    const filter = ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 650; filter.Q.value = 0.6;
+    const echo = ctx.createDelay(1.5); echo.delayTime.value = 0.42;
+    const fb = ctx.createGain(); fb.gain.value = 0.32;
+    filter.connect(mg); filter.connect(echo); echo.connect(fb).connect(echo); echo.connect(mg);
+    mg.connect(this.master);
+    this.music = { gain: mg, filter, nextChord: ctx.currentTime + 1, chord: 0, nextBeat: 0, beat: 0, mood: 'ground' };
+  }
+
+  /** per frame: the music follows the place and the danger (0..1) */
+  updateMusic(mood: Mood, danger: number) {
+    const ctx = this.ctx, m = this.music;
+    if (!ctx || !m) return;
+    if (!Number.isFinite(danger)) danger = 0;
+    const t = ctx.currentTime;
+    m.mood = mood;
+    m.gain.gain.setTargetAtTime(this.enabled ? (mood === 'space' ? 0.16 : 0.14) + danger * 0.06 : 0, t, 1.5);
+    m.filter.frequency.setTargetAtTime(mood === 'space' ? 1300 : mood === 'night' ? 420 : 650, t, 2);
+    // a new chord every 8 s, attacks and releases of a few seconds (nothing sudden)
+    if (t >= m.nextChord - 0.1) {
+      const chord = CHORDS[mood][m.chord % 4];
+      m.chord++;
+      const at = Math.max(t, m.nextChord);
+      for (const n of chord) {
+        for (const det of [-7, 7]) {
+          const o = ctx.createOscillator();
+          o.type = mood === 'space' ? 'triangle' : 'sawtooth';
+          o.frequency.value = midi(n);
+          o.detune.value = det;
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0.0001, at);
+          g.gain.linearRampToValueAtTime(0.045, at + 2.5);
+          g.gain.setValueAtTime(0.045, at + 7);
+          g.gain.linearRampToValueAtTime(0.0001, at + 10.5);
+          o.connect(g).connect(m.filter);
+          o.start(at); o.stop(at + 11);
+        }
+      }
+      // a deep root under the night
+      if (mood === 'night') {
+        const o = ctx.createOscillator(); o.frequency.value = midi(chord[0] - 24);
+        const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, at); g.gain.linearRampToValueAtTime(0.06, at + 3); g.gain.linearRampToValueAtTime(0.0001, at + 10.5);
+        o.connect(g).connect(m.gain); o.start(at); o.stop(at + 11);
+      }
+      m.nextChord = at + 8;
+    }
+    // a fight: a low pulse at 96 bpm and a muffled ostinato
+    if (danger > 0.55) {
+      if (m.nextBeat < t) m.nextBeat = t + 0.05;
+      while (m.nextBeat < t + 0.25) {
+        const bt = m.nextBeat, i = m.beat++;
+        if (i % 2 === 0) {
+          const o = ctx.createOscillator(); o.frequency.setValueAtTime(75, bt); o.frequency.exponentialRampToValueAtTime(38, bt + 0.2);
+          const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, bt); g.gain.linearRampToValueAtTime(0.13 * danger, bt + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, bt + 0.25);
+          o.connect(g).connect(m.gain); o.start(bt); o.stop(bt + 0.3);
+        }
+        const arp = [45, 52, 48, 52];
+        const o = ctx.createOscillator(); o.type = 'square'; o.frequency.value = midi(arp[i % 4]);
+        const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 520;
+        const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, bt); g.gain.linearRampToValueAtTime(0.025 * danger, bt + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, bt + 0.28);
+        o.connect(lp).connect(g).connect(m.gain); o.start(bt); o.stop(bt + 0.3);
+        m.nextBeat += 0.3125;
+      }
+    }
   }
 
   toggle() {
@@ -66,6 +142,8 @@ export class SoundFX {
     if (!ctx || !this.drone) return;
     const l = ctx.listener;
     const f = new THREE.Vector3(0, 0, -1).applyQuaternion(camQ), u = new THREE.Vector3(0, 1, 0).applyQuaternion(camQ);
+    // audio parameters throw on NaN/Infinity: sound must never be able to stop the game
+    if (![f.x, f.y, f.z, u.x, u.y, u.z, dark, tension, health].every(Number.isFinite)) return;
     if (l.forwardX) {
       l.forwardX.value = f.x; l.forwardY.value = f.y; l.forwardZ.value = f.z;
       l.upX.value = u.x; l.upY.value = u.y; l.upZ.value = u.z;
@@ -97,6 +175,7 @@ export class SoundFX {
     if (!ctx || !this.enabled) return;
     const t = ctx.currentTime;
     let out: AudioNode = this.master;
+    if (at && ![at.x, at.y, at.z].every(Number.isFinite)) at = undefined;
     if (at) {
       const p = ctx.createPanner();
       p.panningModel = 'HRTF'; p.distanceModel = 'inverse'; p.refDistance = 4; p.rolloffFactor = 1.2; p.maxDistance = 400;
@@ -153,6 +232,10 @@ export class SoundFX {
       case 'hiss': noise(0.5, 'highpass', 2500, 0.5, env(0.12, 0.05, 0.45)); break;
       case 'shriek': { const g = env(0.16, 0.03, 0.7); const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1400; bp.Q.value = 2; bp.connect(g); osc('sawtooth', 900, 300, 0.7, bp); break; }
       case 'hurt': { osc('sine', 130, 60, 0.22, env(0.3, 0.005, 0.22)); noise(0.12, 'lowpass', 800, 0.7, env(0.12, 0.004, 0.12)); break; }
+      case 'blast': { noise(0.22, 'lowpass', 1800, 0.7, env(0.3, 0.004, 0.25)); osc('sine', 300, 60, 0.25, env(0.2, 0.004, 0.25)); break; }
+      case 'dash': noise(0.25, 'bandpass', 900, 1.5, env(0.12, 0.03, 0.22)); break;
+      case 'heal': { const g = env(0.12, 0.05, 0.6); osc('sine', 520, 780, 0.6, g); break; }
+      case 'vega': { osc('sine', 880, 880, 0.12, env(0.05, 0.01, 0.15)); const g2 = ctx.createGain(); g2.gain.setValueAtTime(0.0001, t + 0.12); g2.gain.linearRampToValueAtTime(0.05, t + 0.13); g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.35); g2.connect(out); const o2 = ctx.createOscillator(); o2.frequency.value = 1320; o2.connect(g2); o2.start(t + 0.12); o2.stop(t + 0.4); break; }
     }
   }
 

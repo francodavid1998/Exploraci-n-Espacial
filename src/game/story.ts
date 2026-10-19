@@ -41,8 +41,8 @@ export const LOGS: LogEntry[] = [
     text: [
       'Día 3 después del Silencio. Los barcos no zarparon: el mar está negro de ceniza.',
       'Al principio fue la Luna. Dicen que encontraron algo en la cara que nunca vemos, y que lo despertaron.',
-      'Luego llegaron las máquinas. Bajaron del cielo sin hacer ruido y apagaron las ciudades, una por una.',
-      'Pero lo peor no son las máquinas. Lo peor llega cuando oscurece.',
+      'Luego llegaron los vigías. Cayeron del cielo como semillas, se clavaron en las plazas y crecieron hasta ser altos como torres.',
+      'Pero lo peor no son los vigías. Lo peor llega cuando oscurece.',
       'Lo que queda del ejército se reagrupa en Ciudad Meridiano. Mañana camino hacia allí.',
     ],
   },
@@ -51,8 +51,8 @@ export const LOGS: LogEntry[] = [
     title: 'Informe final', from: 'Capitán R. Okafor · 3.ª División',
     text: [
       'Perímetro perdido. Somos once.',
-      'Las máquinas no nos persiguen. Vigilan. Disparan a lo que se acerca a sus torres y vuelven a quedarse quietas.',
-      'Las otras cosas son distintas. No aparecen en los sensores térmicos. Salen de la sombra y vuelven a ella.',
+      'Los vigías no nos persiguen. No pueden: están enraizados. Escupen ácido a todo lo que se acerca y vuelven a quedarse quietos, mirando.',
+      'Las otras cosas son distintas. No aparecen en los sensores térmicos. Salen de la sombra y vuelven a ella. Y de día cazan los rastreadores, en manada.',
       'Regla número uno: no te alejes de la luz. Nunca he visto a una cruzar un charco de sol.',
       'La doctora Ibarra dice que sabe qué las llama. Está en San Telmo, en el laboratorio de la universidad. San Telmo está del lado de la noche: lleva luz.',
     ],
@@ -160,7 +160,7 @@ export const FRAGMENTS: LogEntry[] = [
 // ---------------------------------------------------------------------------
 // Phase 5: secrets, upgrades and the end
 
-export type UpgradeId = 'o2' | 'battery' | 'rifle' | 'armor' | 'engine' | 'cargo';
+export type UpgradeId = 'o2' | 'battery' | 'rifle' | 'armor' | 'engine' | 'cargo' | 'dispersor';
 export const UPGRADES: { id: UpgradeId; name: string; desc: string; metal: number; crystal: number }[] = [
   { id: 'o2', name: 'Tanque de oxígeno ampliado', desc: 'El oxígeno del traje dura 10 minutos en vez de 6', metal: 12, crystal: 4 },
   { id: 'battery', name: 'Batería de alta densidad', desc: 'Linterna, arma y extracción gastan un 35% menos', metal: 10, crystal: 6 },
@@ -168,6 +168,7 @@ export const UPGRADES: { id: UpgradeId; name: string; desc: string; metal: numbe
   { id: 'armor', name: 'Blindaje del traje y del casco', desc: 'Recibes un 35% menos de daño', metal: 20, crystal: 6 },
   { id: 'engine', name: 'Motor de pulso eficiente', desc: 'Los saltos gastan un 30% menos de combustible', metal: 16, crystal: 10 },
   { id: 'cargo', name: 'Bodega del traje', desc: 'Puedes cargar 40 unidades en vez de 24', metal: 8, crystal: 3 },
+  { id: 'dispersor', name: 'Dispersor de pulsos', desc: 'Un abanico de pulsos a corta distancia (tecla 2). El ejército guardaba uno en Ciudad Meridiano', metal: 18, crystal: 5 },
 ];
 
 /** hidden caches: only the scanner hears them (each one holds an upgrade; some, the pilot's own diary) */
@@ -238,7 +239,7 @@ export interface Place {
 export const PLACE_INFO: Record<string, string> = {
   esperanza: 'Ciudad en ruinas junto a la costa. Una baliza de la Estación de Evacuación 7 sigue emitiendo en la plaza.',
   alba: 'Puerto en ruinas. Los barcos nunca zarparon.',
-  meridiano: 'La última posición del ejército. Dos centinelas vigilan la plaza.',
+  meridiano: 'La última posición del ejército. Dos vigías enraizados guardan la plaza.',
   telmo: 'Ciudad universitaria del lado de la noche. El laboratorio de la doctora Ibarra.',
   cumbre: 'Observatorio de montaña, de noche. Desde aquí se mantuvo con vida a las naves en órbita.',
   tsiolkovsky: 'Base científica en la cara oculta de la Luna, siempre a oscuras. Aquí se desenterró el artefacto.',
@@ -246,4 +247,88 @@ export const PLACE_INFO: Record<string, string> = {
   'frag-europa': 'Monolito alienígena en el lado nocturno de Europa: un fragmento del mapa de la señal.',
   'frag-proxima': 'Monolito alienígena en la cara helada de Próxima b, a 4,25 años luz: el último fragmento.',
   spire: 'La Aguja: una torre de piedra negra en la noche eterna de TRAPPIST-1 e. El faro de la señal.',
+};
+
+// ---------------------------------------------------------------------------
+// More to find: the mementos of humanity (in the supply crates and shelters)
+
+export interface Memento { id: string; name: string; text: string }
+export const MEMENTOS: Memento[] = [
+  { id: 'm-boda', name: 'Una foto de boda', text: 'Dos personas riéndose bajo la lluvia, con el vestido manchado de barro. Detrás pone: «El mejor día. Aunque se mojara el pastel».' },
+  { id: 'm-dibujo', name: 'Un dibujo infantil', text: 'Una Luna enorme pintada con lápiz gris, y debajo una casa con cuatro figuras. Encima, con letra torcida: «Mi papá trabaja allí».' },
+  { id: 'm-medalla', name: 'Una medalla de natación', text: 'Segundo puesto, 100 metros libres, categoría infantil. La cinta está gastada de tanto tocarla.' },
+  { id: 'm-carta', name: 'Una carta sin enviar', text: '«Mamá: sé que discutimos. Cuando todo esto pase, voy a ir a verte. Te lo prometo.» No tiene sello.' },
+  { id: 'm-llaves', name: 'Unas llaves con un pez', text: 'Tres llaves y un llavero de goma con forma de pez payaso. Alguien pensó que volvería a casa.' },
+  { id: 'm-receta', name: 'Una receta de familia', text: 'Torta de la abuela Rosa: harina, naranja, mucho cariño. «Si la haces tú, no le pongas tanta azúcar como yo.»' },
+  { id: 'm-entrada', name: 'Una entrada de concierto', text: 'Fila 12, asiento 7. El concierto era la semana después del Silencio. Nunca se celebró.' },
+  { id: 'm-diario', name: 'Un diario de niña', text: '«Hoy la profe dijo que la Luna nos habla. Yo creo que nos está pidiendo ayuda. Nadie me hace caso.»' },
+  { id: 'm-semillas', name: 'Un sobre de semillas', text: 'Girasoles. «Plantar en primavera, al sol.» El sobre sigue cerrado.' },
+  { id: 'm-reloj', name: 'Un reloj de bolsillo', text: 'Parado a las 4:12. Grabado en la tapa: «Para que nunca llegues tarde. Te quiere, Elías».' },
+  { id: 'm-postal', name: 'Una postal de Marte', text: 'Una foto del monte Olimpo para turistas. «¡Algún día iremos de verdad! Ahorra, ¿eh?»' },
+  { id: 'm-osito', name: 'Un osito de peluche', text: 'Le falta un ojo y tiene una venda de tela atada al brazo. Alguien lo curó con cuidado.' },
+  { id: 'm-mapa', name: 'Un mapa con rutas marcadas', text: 'Carreteras tachadas en rojo. Un círculo en la costa: «Barcos. Llegar antes del día 10».' },
+  { id: 'm-cassette', name: 'Una grabación de voz', text: 'Una voz cansada canta una nana, muy bajito, para que no la oiga lo que espera fuera.' },
+  { id: 'm-insignia', name: 'Una insignia de piloto', text: 'Programa de Naves de Criosueño, promoción 41. La misma que llevas en el hombro.' },
+  { id: 'm-nota', name: 'Una nota en la pared', text: '«Si lees esto, no estás solo. Aquí estuvimos. Aquí nos quisimos. Que eso cuente.»' },
+];
+
+// ---------------------------------------------------------------------------
+// VEGA, the ship's computer: it talks to the pilot (dry, a little warm, never chatty)
+
+/** first time on each world */
+export const VEGA_LAND: Record<string, string> = {
+  earth: 'La Tierra. El aire todavía se respira. Lo demás… mejor no lo midas.',
+  moon: 'Sin aire, gravedad un sexto de la terrestre. Salta con cuidado: aquí caer tarda.',
+  mars: 'Marte. Polvo fino como harina y frío de verdad. El oxígeno del traje es lo único que tienes.',
+  europa: 'Europa. Bajo este hielo hay un océano. Y quizá algo más.',
+  'proxima-b': 'Próxima b. Esta estrella escupe radiación cuando se enfada. No te quedes mucho al descubierto.',
+  'trappist-1e': 'TRAPPIST-1 e. De aquí sale la llamada. Lo noto en todos mis sistemas.',
+  phobos: 'Fobos. Casi no hay gravedad: un salto fuerte y no vuelves a bajar.',
+  titan: 'Titán. Lagos de metano y un cielo naranja. Precioso, si no tuvieras que respirar.',
+};
+export const VEGA = {
+  first: 'Estoy contigo por radio, piloto. Si me necesitas, aquí estaré. Aunque no tenga a dónde ir.',
+  zone: 'Movimiento en la oscuridad, cerca. Ten la linterna a mano.',
+  sentinel: 'Un vigía. Está enraizado: no te seguirá, pero escupe ácido. Muévete de lado para esquivarlo.',
+  stalker: 'Eso que viste… se acerca cuando no lo miras. No le des la espalda.',
+  swarm: 'Un enjambre. Pequeños pero muchos. El dispersor sería ideal aquí.',
+  spitter: 'Escupe desde lejos. Acércate rápido o busca dónde cubrirte.',
+  colossus: 'Eso es enorme. La luz no lo detiene, solo lo frena. Dispara y retrocede.',
+  colossusDown: 'Lo has tumbado. Ni yo misma me lo creo.',
+  tracker: 'Rastreadores. Cazan en manada y a plena luz: la linterna no los asusta. No dejes que te rodeen.',
+  hunters: 'Algo vivo se acerca a la nave por el vacío. Como mantarrayas. Cañones listos: clic para disparar.',
+  ambushSpace: '¡Nos han seguido! Mantarrayas del vacío detrás de nosotros.',
+  lowO2: 'Te queda poco oxígeno. Vuelve a la nave, por favor.',
+  lowBattery: 'La batería del traje está casi vacía. Sin ella no hay linterna ni disparos.',
+  lowHealth: 'Tus constantes caen. Si llevas un botiquín, úsalo ya (B).',
+  noMedkit: 'No te quedan botiquines. Busca cajas de suministros en las ruinas.',
+  revive: 'Te traje de vuelta. Otra vez. Intenta que no se convierta en costumbre.',
+  crate: 'Suministros. Alguien los dejó para quien viniera después.',
+  memento: 'Esto era de alguien. Lo guardaré en tu colección.',
+  bunker: 'Un refugio. Aquí aguantaron un tiempo. No sé cuánto.',
+  dispersor: 'El dispersor de pulsos del ejército. A corta distancia no perdona. Cámbialo con 1 y 2.',
+  ambushRuins: '¡Cuidado! No estábamos solos.',
+  signal: 'Capto una señal de socorro automática. Te la marco en el mapa: el círculo ○.',
+  signalGone: 'La señal de socorro se ha apagado.',
+  wreck: 'Es una nave como la nuestra. Estrellada. Revisa los restos: quizá quede algo útil.',
+  idle: 'Si te pierdes, abre el mapa (M). En MISIONES tienes el siguiente paso.',
+  guardian: 'Esa bestia es el cerrojo del faro. Los pilones alimentan su escudo.',
+  end: 'Se ha ido. La señal ya no está. Por primera vez en años… silencio.',
+} as const;
+/** what VEGA thinks after each recording */
+export const VEGA_STORY: Record<string, string> = {
+  beacon: 'No respondan a voces que conozcan… Si alguna vez te hablo raro, desconfía de mí.',
+  alba: '"Lo peor llega cuando oscurece." Anotado. Prefiero el lado del día.',
+  meridiano: 'Los vigías no se mueven y las sombras huyen de la luz. Ya tenemos dos reglas. Los rastreadores, ninguna.',
+  telmo: 'TRAPPIST-1, a cuarenta años luz. Tenemos combustible para eso… si lo cuidas.',
+  cumbre: 'Eres uno de los pilotos que despertaron. Supongo que eso me hace tu única compañía.',
+  'tsio-1': 'Los focos de la excavación siguen encendidos. Alguien cumplió su palabra.',
+  'tsio-2': 'Marte, Europa y Próxima. Un mapa repartido por las estrellas. Qué poco práctico.',
+  'tsio-3': 'Tu escáner y yo ahora oímos lo mismo que el artefacto. No me gusta cómo suena.',
+  'frag-mars': 'Uno de tres. "Los que vienen no se van." Encantador.',
+  'frag-europa': '"La luz es el muro." Eso explica muchas cosas.',
+  'frag-proxima': 'El mapa está completo. Rumbo a TRAPPIST-1 e. Esto se acaba allí, de un modo u otro.',
+  'pilot-1': 'Esa voz es la tuya. No sabía que dejaste notas. No me lo contaste.',
+  'pilot-2': 'Así que empezó contigo. No es culpa tuya. Bueno… no solo tuya.',
+  'pilot-3': 'Un cerrojo, no un monstruo. Haz lo que tengas que hacer, piloto.',
 };

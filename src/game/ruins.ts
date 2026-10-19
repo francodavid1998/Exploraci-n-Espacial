@@ -238,6 +238,8 @@ export class RuinedEarth {
   }
 
   site(id: string) { return this.sites.find((s) => s.id === id); }
+  /** the city's buildings exist (things can be placed around them) */
+  built(id: string) { return this.cities.has(id); }
 
   /** world position of a site's centre on the ground */
   sitePos(s: RuinSite, out = new THREE.Vector3()) {

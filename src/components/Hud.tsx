@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Game, HudState } from '../game/Game';
 import { formatDist, formatSpeed } from '../game/Game';
 import { BODIES, C_LIGHT } from '../game/bodies';
-import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, WAKE_LINES, END_LINES, type LogEntry, type UpgradeId, type Place } from '../game/story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, MEMENTOS, WAKE_LINES, END_LINES, type LogEntry, type UpgradeId, type Place } from '../game/story';
 
 /** every recording of the story, in order (the pilot's own diaries last) */
 const ALL_LOGS: LogEntry[] = [...LOGS, ...BASE_LOGS, ...FRAGMENTS, ...CACHES.flatMap((c) => (c.log ? [c.log] : []))];
@@ -98,7 +98,7 @@ function WakeIntro({ onDone }: { onDone: () => void }) {
 }
 
 /** The Spire falls silent: the last lines, soft fades, then the numbers of the journey. */
-function EndSequence({ stats, onDone }: { stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number }; onDone: () => void }) {
+function EndSequence({ stats, onDone }: { stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number; mementos: number; mementosTotal: number }; onDone: () => void }) {
   const [shown, setShown] = useState(0);
   useEffect(() => {
     if (shown > END_LINES.length) return;
@@ -116,6 +116,7 @@ function EndSequence({ stats, onDone }: { stats: { time: number; deaths: number;
           <div>TIEMPO · {m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`}</div>
           <div>VECES QUE CAÍSTE · {stats.deaths}</div>
           <div>REGISTROS · {stats.logs}/{stats.logsTotal} · SECRETOS · {stats.caches}/{stats.cachesTotal}</div>
+          <div>RECUERDOS · {stats.mementos}/{stats.mementosTotal}</div>
           <button onClick={onDone} className="mt-6 rounded-full border border-violet-200/30 bg-violet-200/10 px-8 py-2 text-xs tracking-[0.4em] text-violet-50 hover:bg-violet-200/20">SEGUIR EXPLORANDO</button>
         </div>
       </div>
@@ -169,6 +170,23 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
       <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
         <div className="h-1 w-1 rounded-full bg-white/70 shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
       </div>
+      {/* survival: a hit landed (a soft × that fades, never blinks) and the target's strength left */}
+      {sv && sv.hitT < 0.4 && (
+        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-lg leading-none text-white/80" style={{ opacity: 1 - sv.hitT / 0.4 }}>×</div>
+      )}
+      {sv && sv.hitT < 1.6 && sv.hitHp > 0 && (
+        <div className="absolute left-1/2 top-1/2 mt-4 h-[3px] w-12 -translate-x-1/2 overflow-hidden rounded-full bg-white/15" style={{ opacity: 1 - sv.hitT / 1.6 }}>
+          <div className="h-full bg-red-300/80" style={{ width: `${sv.hitHp * 100}%` }} />
+        </div>
+      )}
+      {/* VEGA: the ship's computer talks */}
+      {sv?.vega && (
+        <div className={`absolute left-1/2 ${touch ? 'top-[30%]' : 'bottom-[150px]'} w-[min(90vw,40rem)] -translate-x-1/2 text-center`} style={{ opacity: sv.vega.alpha }}>
+          <span className="rounded-lg bg-black/45 px-3 py-1.5 text-[13px] leading-relaxed text-cyan-50/90 backdrop-blur">
+            <b className="mr-2 text-[10px] tracking-[0.3em] text-cyan-300/80">VEGA</b>{sv.vega.text.slice(0, sv.vega.chars)}
+          </span>
+        </div>
+      )}
 
       {/* location panel */}
       <div className={`absolute left-5 top-5 w-72 rounded-xl border border-white/10 bg-black/35 p-4 backdrop-blur-md${small}`}>
@@ -291,7 +309,7 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           <div className="text-sm tracking-widest text-white/85">{s.mode === 'ship' ? (s.warp ? (sv?.emergency ? 'EMERGENCIA' : 'PULSO') : s.landed ? 'ATERRIZADO' : 'VUELO') : 'A PIE'}</div>
           <div className="mt-1 text-[10px] text-white/40">{s.lights ? 'LUCES ON' : 'LUCES OFF'}</div>
           {sv && (s.mode === 'foot' ? (
-            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal + sv.carried.crystal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal{sv.carried.crystal ? ` · ${sv.carried.crystal} cristal` : ''}</div><div className="mt-1 text-cyan-200/60">ARMA · {sv.shotCost}% por disparo</div></div>
+            <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">CARGA {sv.carried.ice + sv.carried.metal + sv.carried.crystal}/{sv.cap}<div className="text-white/40">{sv.carried.ice} hielo · {sv.carried.metal} metal{sv.carried.crystal ? ` · ${sv.carried.crystal} cristal` : ''}</div><div className="mt-1 text-cyan-200/60">{sv.weapon === 'dispersor' ? 'DISPERSOR' : 'FUSIL'} · {sv.shotCost}%{sv.dispersor ? ' · 1/2' : ''}</div><div className="text-rose-200/60">BOTIQUINES {sv.medkits}{touch ? '' : ' · B'}</div></div>
           ) : (
             <div className="mt-2 text-[10px] tracking-[0.15em] text-white/60">BODEGA<div className="text-white/40">{sv.stored.ice} hielo · {sv.stored.metal} metal</div><div className="text-violet-200/50">{sv.stored.crystal} cristal</div></div>
           ))}
@@ -366,7 +384,8 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
             <div><b className="text-white">Ratón</b> cámara · <b className="text-white">Rueda</b> zoom</div>
             <div><b className="text-white">E</b> subir a la nave · <b className="text-white">F</b> linterna</div>
             {sv && <div><b className="text-white">R</b> extraer (mantener) · escuchar registros</div>}
-            {sv && <div><b className="text-white">Clic</b> disparar · <b className="text-white">N</b> sonido: {sv.sound ? 'ON' : 'OFF'}</div>}
+            {sv && <div><b className="text-white">Clic</b> disparar · <b className="text-white">1 / 2</b> arma</div>}
+            {sv && <div><b className="text-white">Q</b> esquivar · <b className="text-white">B</b> botiquín · <b className="text-white">N</b> sonido: {sv.sound ? 'ON' : 'OFF'}</div>}
             <div><b className="text-white">O</b> modo visión: sin letras, zoom</div>
             <div><b className="text-white">G</b> calidad gráfica: {s.quality}</div>
             <div><b className="text-white">L</b> luces: {s.lightsMode === 'comfort' ? 'cómodas' : 'brillantes'}</div>
@@ -564,6 +583,17 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
                   </button>
                 ))}
               </div>
+              {sv && (
+                <>
+                  <div className="mt-8 text-[10px] tracking-[0.4em] text-rose-200/70">RECUERDOS DE LA HUMANIDAD ({sv.mementos.size}/{MEMENTOS.length})</div>
+                  {sv.mementos.size === 0 && <div className="mt-2 text-sm text-white/50">Búscalos en las cajas de suministros y en los refugios de las ruinas.</div>}
+                  <div className="mt-3 grid gap-2 md:grid-cols-2">
+                    {MEMENTOS.filter((m) => sv.mementos.has(m.id)).map((m) => (
+                      <button key={m.id} onClick={() => { onClose(); sv.openLog({ id: m.id, site: 'memento', title: m.name, from: 'Recuerdo', text: [m.text] }); }} className="rounded-lg border border-white/10 px-4 py-2 text-left text-sm text-white/85 hover:bg-white/5">{m.name}</button>
+                    ))}
+                  </div>
+                </>
+              )}
               <div className="mt-6 text-xs text-white/50">Objetivo: {game.surv?.objective().text}</div>
             </div>
           ) : (

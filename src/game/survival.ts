@@ -2,9 +2,11 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Game } from './Game';
 import { hash3, mulberry32, Noise3, clamp } from './noise';
-import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, objectiveAt, type LogEntry, type Objective, type UpgradeId, type CacheDef, type Place } from './story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, MEMENTOS, VEGA, VEGA_LAND, VEGA_STORY, objectiveAt, type LogEntry, type Objective, type UpgradeId, type CacheDef, type Place, type Memento } from './story';
+import { LootSystem, TravelEvents, type LootSpot } from './loot';
+import { Vega } from './vega';
 import { SITE_POINTS } from './alien';
-import { EnemyDirector, SHOT_ENERGY } from './enemies';
+import { EnemyDirector, SHOT_ENERGY, SPREAD_ENERGY } from './enemies';
 import { SoundFX } from './sound';
 
 /**
@@ -16,6 +18,9 @@ import { SoundFX } from './sound';
  * Phase 4: Base Tsiolkovsky and the scanner, the three map fragments on alien monoliths.
  * Phase 5: hunters in orbit, the Guardian of the Spire and the end; hidden caches heard by
  * the scanner; dark crystals and upgrades bought in the ship.
+ * And to keep it alive: supply crates, shelters and mementos in the ruins (loot.ts), distress
+ * signals and ambushes on the way, more creatures, the dispersor, a dash and medkits,
+ * music, and VEGA, the ship's computer, who talks to you (vega.ts).
  *
  * Realistic exploration never creates this object, so nothing here can change it.
  */
@@ -92,6 +97,12 @@ export interface SurvivalSave {
   logs?: string[];
   /** sentinels destroyed (phase 3); also the Spire's pylons and the Guardian (phase 5) */
   destroyed?: string[];
+  /** crates and shelters opened, mementos found, medkits carried, weapon in hand, what VEGA already said */
+  loot?: string[];
+  mementos?: string[];
+  medkits?: number;
+  weapon?: 'rifle' | 'dispersor';
+  vega?: string[];
   /** phase 5: caches opened, upgrades owned, the story finished */
   caches?: string[];
   upgrades?: string[];
@@ -137,9 +148,18 @@ export interface SurvivalHud {
   upgrades: string[];
   /** the end sequence is playing */
   ending: boolean;
-  stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number };
+  stats: { time: number; deaths: number; logs: number; logsTotal: number; caches: number; cachesTotal: number; mementos: number; mementosTotal: number };
   flying: boolean;
   hunters: boolean;
+  vega: { text: string; chars: number; alpha: number } | null;
+  /** seconds since the last hit landed, and what is left of the target */
+  hitT: number;
+  hitHp: number;
+  weapon: 'rifle' | 'dispersor';
+  dispersor: boolean;
+  medkits: number;
+  mementos: number;
+  mementosTotal: number;
 }
 
 interface Interactable { pos: THREE.Vector3; prompt: string; act: () => void }
@@ -231,6 +251,18 @@ export class Survival {
   ended = false;
   /** the end sequence on screen */
   ending = false;
+  /** survival kit and finds */
+  medkits = 1;
+  weapon: 'rifle' | 'dispersor' = 'rifle';
+  mementos = new Set<string>();
+  loot: LootSystem;
+  events: TravelEvents;
+  vega: Vega;
+  private dashT = 0;
+  private dashCD = 0;
+  private dashDir = new THREE.Vector3();
+  /** last time something moved the game forward (VEGA reminds you of the map after a while) */
+  private lastProgress = 0;
   mined = new Set<string>();
   crate: Crate | null = null;
   deaths = 0;
@@ -321,6 +353,19 @@ export class Survival {
     markerLayer.appendChild(this.objMarker);
     this.enemies = new EnemyDirector(g, this.sfx);
     this.enemies.onGuardianDown = () => this.guardianDown();
+    this.loot = new LootSystem(g);
+    this.events = new TravelEvents(g);
+    this.vega = new Vega(this.sfx);
+    // VEGA comments the first meeting with each thing, and the dangers
+    const firstSeen: Record<string, string> = {
+      'seen:stalker': VEGA.stalker, 'seen:swarm': VEGA.swarm, 'seen:spitter': VEGA.spitter, 'seen:colossus': VEGA.colossus,
+      'seen:tracker': VEGA.tracker, 'seen:sentinel': VEGA.sentinel, 'kill:colossus': VEGA.colossusDown, hunters: VEGA.hunters,
+    };
+    this.enemies.onEvent = (ev) => {
+      if (ev === 'zone') this.vega.say(VEGA.zone, 'zone', { cooldown: 240 });
+      else if (firstSeen[ev]) this.vega.say(firstSeen[ev], ev, { once: true });
+    };
+    this.events.onEvent = (ev) => this.vega.say(VEGA[ev], ev, { cooldown: 45 });
     window.addEventListener('pagehide', this.onHide);
   }
 
@@ -352,6 +397,7 @@ export class Survival {
     return null;
   }
   get hasScanner() { return this.logsRead.has('tsio-3'); }
+  get hasDispersor() { return this.upgrades.has('dispersor'); }
 
   // -------------------------------------------------------------------------
   // The story: Earth's recordings, Base Tsiolkovsky, the three fragments, the Spire
@@ -399,6 +445,7 @@ export class Survival {
   /** the end sequence closed */
   finishEnding() {
     this.ending = false;
+    this.vega.say(VEGA.end, 'end', { once: true });
     this.g.note('La señal se ha apagado. Puedes seguir explorando: los secretos y las mejoras siguen ahí');
     this.g.requestLock();
   }
@@ -428,6 +475,14 @@ export class Survival {
     const l = this.reading;
     if (!l) return;
     this.reading = null;
+    if (l.site === 'memento') {
+      this.g.note(`Recuerdo guardado en tu colección (${this.mementos.size}/${MEMENTOS.length}). Están en el mapa, en REGISTROS`);
+      this.save();
+      this.g.requestLock();
+      return;
+    }
+    this.lastProgress = this.playTime;
+    if (VEGA_STORY[l.id]) this.vega.say(VEGA_STORY[l.id], `story:${l.id}`, { once: true });
     const first = !this.logsRead.has(l.id);
     this.logsRead.add(l.id);
     if (first) {
@@ -459,6 +514,7 @@ export class Survival {
     this.crateMarker.remove();
     this.objMarker.remove();
     this.enemies.dispose();
+    this.loot.dispose();
     this.sfx.dispose();
   }
 
@@ -498,6 +554,7 @@ export class Survival {
       }
       this.updateMining(dt);
       this.updateCrate();
+      this.updateKit(dt);
     } else {
       // aboard: the ship's life support refills the suit and treats you
       this.oxygen = Math.min(100, this.oxygen + dt * 20);
@@ -514,8 +571,18 @@ export class Survival {
       this.mineTarget = null;
       this.nearDeposit = null;
     }
-    // what lives in the dark (and the machines)
+    // the first steps on each world
+    if (foot && !this.wasFoot) {
+      this.vega.say(VEGA.first, 'first', { once: true });
+      const line = VEGA_LAND[g.nearest.def.id];
+      if (line) this.vega.say(line, `land:${g.nearest.def.id}`, { once: true });
+    }
+    // what lives in the dark
     this.enemies.update(dt);
+    this.events.update(dt);
+    if (this.enemies.boss()) this.vega.say(VEGA.guardian, 'guardian', { once: true });
+    if (this.playTime - this.lastProgress > 300) this.vega.say(VEGA.idle, 'idle', { cooldown: 600 });
+    this.vega.update(dt);
     if (g.suit <= 0 && !g.dead) {
       const why = this.enemies.lastHit;
       g.die(why === 'guardian' ? 'El Guardián de la Aguja te alcanzó. El faro sigue ardiendo.'
@@ -538,7 +605,9 @@ export class Survival {
     else g.astro.armR.rotation.z = 0;
     if (g.pressed.has('KeyN')) g.note(this.sfx.toggle() ? 'Sonido activado' : 'Sonido desactivado (N)');
     const dark = 1 - clamp(g.light.intensity / 3.3 / 0.35, 0, 1);
-    this.sfx.update(dt, g.camera.quaternion, dark, this.enemies.tension(), g.suit, foot);
+    const tension = this.enemies.tension();
+    this.sfx.update(dt, g.camera.quaternion, dark, tension, g.suit, foot);
+    this.sfx.updateMusic(g.mode === 'ship' && g.altitude > 60e3 ? 'space' : dark > 0.6 ? 'night' : 'ground', tension);
     // boarding the ship is a good moment to save
     if (this.wasFoot && !foot) this.save();
     this.wasFoot = foot;
@@ -547,6 +616,78 @@ export class Survival {
   }
 
   canLight() { return this.energy > 1; }
+
+  /** on foot: B medkit, Q dash, 1 / 2 weapons; VEGA warns when things run low */
+  private updateKit(dt: number) {
+    const g = this.g, k = g.keys;
+    if (g.pressed.has('KeyB')) {
+      if (this.medkits <= 0) { g.note('No te quedan botiquines'); this.vega.say(VEGA.noMedkit, 'noMedkit', { cooldown: 60 }); }
+      else if (g.suit >= 99) g.note('Tu salud está completa');
+      else {
+        this.medkits--;
+        g.suit = Math.min(100, g.suit + 45);
+        this.sfx.play('heal');
+        g.note(`Botiquín usado: +45 de salud (te quedan ${this.medkits})`);
+      }
+    }
+    this.dashCD -= dt;
+    const dashCost = 4 * this.mods().energy;
+    if (g.pressed.has('KeyQ') && this.dashCD <= 0 && this.energy >= dashCost) {
+      const up = g.playerPos.clone().sub(g.nearest.pos).normalize();
+      const right = new THREE.Vector3().crossVectors(g.camFwd, up).normalize();
+      const mv = g.camFwd.clone().multiplyScalar((k.has('KeyW') ? 1 : 0) - (k.has('KeyS') ? 1 : 0)).addScaledVector(right, (k.has('KeyD') ? 1 : 0) - (k.has('KeyA') ? 1 : 0));
+      this.dashDir.copy(mv.lengthSq() > 0.01 ? mv.normalize() : g.camFwd);
+      this.dashT = 0.22;
+      this.dashCD = 1.2;
+      this.energy -= dashCost;
+      this.sfx.play('dash');
+    }
+    if (this.dashT > 0) {
+      this.dashT -= dt;
+      g.playerPos.addScaledVector(this.dashDir, 24 * dt);
+    }
+    if (g.pressed.has('Digit1') && this.weapon !== 'rifle') { this.weapon = 'rifle'; g.note('Fusil de arco'); }
+    if (g.pressed.has('Digit2') || g.pressed.has('WeaponToggle')) {
+      const want = g.pressed.has('Digit2') ? 'dispersor' : this.weapon === 'rifle' ? 'dispersor' : 'rifle';
+      if (want === 'dispersor' && !this.hasDispersor) g.note('Aún no tienes el dispersor: el ejército guardaba uno en Ciudad Meridiano');
+      else if (want !== this.weapon) { this.weapon = want; g.note(want === 'dispersor' ? 'Dispersor de pulsos: devastador de cerca' : 'Fusil de arco'); }
+    }
+    if (g.nearest.def.id !== 'earth' && this.oxygen < 25) this.vega.say(VEGA.lowO2, 'lowO2', { cooldown: 120 });
+    if (this.energy < 15) this.vega.say(VEGA.lowBattery, 'lowBattery', { cooldown: 120 });
+    if (g.suit < 35) this.vega.say(this.medkits ? VEGA.lowHealth : VEGA.noMedkit, 'lowHealth', { cooldown: 90 });
+  }
+
+  /** open a crate, a shelter or a wreck: its contents, maybe a memento, maybe company */
+  private openSpot(s: LootSpot) {
+    const g = this.g;
+    this.loot.opened.add(s.id);
+    this.lastProgress = this.playTime;
+    const got: string[] = [];
+    let memento: Memento | null = null;
+    for (const it of s.items) {
+      if (it.k === 'medkit') { this.medkits = Math.min(5, this.medkits + it.n); got.push('botiquín'); }
+      else if (it.k === 'battery') { this.energy = Math.min(100, this.energy + 40); got.push('celda de batería'); }
+      else if (it.k === 'o2') { this.oxygen = Math.min(100, this.oxygen + 40); got.push('cartucho de oxígeno'); }
+      else if (it.k === 'metal' || it.k === 'crystal') { const n = this.addCargo(it.k, it.n); if (n) got.push(`${n} ${RES_LABEL[it.k]}`); }
+      else if (it.k === 'memento') memento = MEMENTOS.find((m) => !this.mementos.has(m.id)) ?? null;
+      else if (it.k === 'dispersor') { this.upgrades.add('dispersor'); got.push('¡el dispersor de pulsos!'); }
+    }
+    const what = s.kind === 'bunker' ? 'Refugio' : s.kind === 'wreck' ? 'Restos de la nave' : 'Caja de suministros';
+    g.note(got.length ? `${what}: ${got.join(', ')}` : `${what}: no queda nada útil`);
+    this.sfx.play('clank');
+    this.vega.say(s.kind === 'bunker' ? VEGA.bunker : VEGA.crate, s.kind === 'bunker' ? 'bunker' : 'crate', { once: true });
+    if (s.items.some((i) => i.k === 'dispersor')) this.vega.say(VEGA.dispersor, 'dispersor', { once: true });
+    if (s.ambush) {
+      const dark = g.light.intensity / 3.3 < 0.25;
+      this.enemies.ambush(dark ? 'night' : 'day', dark ? 3 : 2);
+      this.vega.say(VEGA.ambushRuins, 'ambushRuins', { cooldown: 60 });
+    }
+    if (memento) {
+      this.mementos.add(memento.id);
+      this.vega.say(VEGA.memento, 'memento', { once: true });
+      this.openLog({ id: memento.id, site: 'memento', title: memento.name, from: `Recuerdo · ${s.place}`, text: [memento.text] });
+    } else this.save();
+  }
 
   /** put things in the suit (up to its capacity); returns how many fitted */
   addCargo(kind: Res, n: number) {
@@ -700,7 +841,14 @@ export class Survival {
       if (w) this.beginEmergency(w);
     }
   }
-  warpEnded() { this.emergency = false; }
+  warpEnded() {
+    // sometimes something was waiting at the end of the jump
+    if (!this.emergency && Math.random() < 0.12) {
+      this.enemies.hunterAmbush(2);
+      this.vega.say(VEGA.ambushSpace, 'ambushSpace', { cooldown: 45 });
+    }
+    this.emergency = false;
+  }
 
   /** Fuel burnt by the normal engines; returns their power factor (reduced on an empty tank). */
   thrustBurn(dt: number, throttle: number, boost: boolean, vert: number) {
@@ -748,6 +896,7 @@ export class Survival {
       g.suit = 50;
       g.note(this.crate ? 'Despiertas a bordo. Lo que llevabas quedó donde caíste: sigue la señal ◇' : 'Despiertas a bordo de la nave');
     }
+    this.vega.say(VEGA.revive, 'revive', { cooldown: 120 });
     this.save();
   }
 
@@ -761,6 +910,7 @@ export class Survival {
     this.ruins.updateTerminals(this.logsRead, (site) => LOGS.find((l) => l.site === site)?.id);
     this.renderObjective();
     this.enemies.render();
+    this.loot.update();
     this.renderCaches();
     // the signal dies: the alien glyphs fade out over a few seconds
     if (this.signalFade > 0 && g.alien.signal > 0) g.alien.signal = Math.max(0, 1 - (this.signalFade += 1 / 60) / 5);
@@ -912,7 +1062,7 @@ export class Survival {
       reading: this.reading,
       intro: this.intro,
       hurt: this.enemies.hurt,
-      shotCost: Math.round(SHOT_ENERGY * this.mods().energy * 10) / 10,
+      shotCost: Math.round((this.weapon === 'dispersor' ? SPREAD_ENERGY : SHOT_ENERGY) * this.mods().energy * 10) / 10,
       sound: this.sfx.enabled,
       prompt: this.g.mode === 'foot' ? this.prompt : null,
       scanner: this.hasScanner,
@@ -925,9 +1075,18 @@ export class Survival {
         logs: [...LOGS, ...BASE_LOGS, ...FRAGMENTS].filter((l) => this.logsRead.has(l.id)).length,
         logsTotal: LOGS.length + BASE_LOGS.length + FRAGMENTS.length,
         caches: this.cachesOpen.size, cachesTotal: CACHES.length,
+        mementos: this.mementos.size, mementosTotal: MEMENTOS.length,
       },
       flying: this.g.mode === 'ship' && !this.g.landed,
       hunters: this.enemies.tension() >= 0.7 && this.g.mode === 'ship',
+      vega: this.vega.hud(),
+      hitT: this.enemies.hitT,
+      hitHp: this.enemies.hitHp,
+      weapon: this.weapon,
+      dispersor: this.hasDispersor,
+      medkits: this.medkits,
+      mementos: this.mementos.size,
+      mementosTotal: MEMENTOS.length,
     };
   }
 
@@ -938,6 +1097,8 @@ export class Survival {
     const g = this.g;
     if (!g.started || g.gameMode !== 'survival') return;
     this.saveT = 0;
+    // never write a broken position (it would bring the game back inside a star)
+    if (![g.shipPos.x, g.shipPos.y, g.shipPos.z, g.shipQ.x, g.shipQ.w].every(Number.isFinite)) return;
     let body = g.bodies[0], bd = Infinity;
     for (const b of g.bodies) {
       const d = g.shipPos.distanceTo(b.pos) - b.def.radius;
@@ -956,6 +1117,11 @@ export class Survival {
       caches: [...this.cachesOpen],
       upgrades: [...this.upgrades],
       ended: this.ended,
+      loot: [...this.loot.opened],
+      mementos: [...this.mementos],
+      medkits: this.medkits,
+      weapon: this.weapon,
+      vega: [...this.vega.once],
     };
     try { localStorage.setItem(SAVE_KEY, JSON.stringify(s)); this.savedAt = g.time; } catch { /* storage full or unavailable */ }
   }
@@ -972,6 +1138,11 @@ export class Survival {
     this.cachesOpen = new Set(s.caches ?? []);
     this.upgrades = new Set((s.upgrades ?? []) as UpgradeId[]);
     this.ended = !!s.ended;
+    this.loot.opened = new Set(s.loot ?? []);
+    this.mementos = new Set(s.mementos ?? []);
+    this.medkits = s.medkits ?? 1;
+    this.weapon = s.weapon === 'dispersor' && this.upgrades.has('dispersor') ? 'dispersor' : 'rifle';
+    this.vega.once = new Set(s.vega ?? []);
   }
 
   // -------------------------------------------------------------------------
@@ -1002,6 +1173,10 @@ export class Survival {
           act: () => (this.hasScanner ? this.openLog(f) : g.note('Las líneas brillan, pero no entiendes nada. Quizá con el escáner de Tsiolkovsky…')),
         });
       }
+    }
+    // supply crates, shelters, wrecks
+    for (const s of this.loot.near(g.playerPos, READ_RANGE + 0.6)) {
+      out.push({ pos: this.loot.usePos(s), prompt: s.kind === 'bunker' ? 'entrar en el refugio' : s.kind === 'wreck' ? 'registrar los restos' : 'abrir la caja', act: () => this.openSpot(s) });
     }
     if (this.hasScanner) {
       for (const c of CACHES) {

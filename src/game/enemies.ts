@@ -5,26 +5,43 @@ import { clamp } from './noise';
 import { nightDir, tsiolkovskyDir, SITE_POINTS } from './alien';
 
 /**
- * Survival mode, phase 3: what lives in the ruins.
- *  - Sentinels (machines): fixed towers guarding a few squares. They ignore light, wake up
- *    when someone comes within ~110 m and fire slow, dodgeable bolts.
+ * Survival mode: what lives in the ruins. Everything is alive (no machines: they are not
+ * frightening).
+ *  - Watchers ("vigías", internally sentinels): tall rooted creatures guarding a few squares.
+ *    They ignore light, wake up when someone comes within ~110 m and spit slow, dodgeable acid.
  *  - Stalkers (creatures): only where the Sun does not shine. A few per zone (the night-side
  *    towns of Earth, the far side of the Moon, the night side of a few worlds) and, rarely,
  *    one alone in deep darkness. They creep up when you are not looking, flee from the
  *    flashlight and strike, then pull back.
  * Never many at once (at most MAX_STALKERS), only around the player, only on foot.
+ * More kinds: the swarm (small, fast, many), the colossus (huge, slow, the light only slows
+ * it, it charges), the spitter (keeps its distance and spits) and the trackers (wild pack
+ * beasts that hunt in daylight and do not fear the lamp: daytime ruins and ambushes).
  * Phase 5:
- *  - Hunters: alien drones in low orbit of Proxima b and TRAPPIST-1 e. They keep pace with
+ *  - Void rays ("mantarrayas", internally hunters): creatures of the void in low orbit of
+ *    Proxima b and TRAPPIST-1 e (and ambushes anywhere in flight). They keep pace with
  *    the ship whatever its speed (positions are ship-relative) and are fought with the
  *    ship's cannons (left click while flying).
- *  - The Guardian of the Spire (TRAPPIST-1 e): shielded while any of its three pylons
+ *  - The Guardian of the Spire (TRAPPIST-1 e), a giant watcher: shielded while any of its three pylons
  *    stands; volleys of bolts; the creatures of the night come to its call.
  * Nothing flashes: lights ramp smoothly, hits are soft fading puffs.
  */
 type Body = Game['bodies'][number];
 
 const MAX_STALKERS = 6;
-const STALKER_HP = 45, STALKER_HIT = 10;
+/** every creature together, swarms included */
+const MAX_CREATURES = 10;
+export type CreatureKind = 'stalker' | 'swarm' | 'colossus' | 'spitter' | 'tracker';
+const KINDS: Record<CreatureKind, { hp: number; run: number; creep: number; hit: number; reach: number; size: [number, number]; light: 'flee' | 'slow' | 'ignore'; drop: number }> = {
+  stalker: { hp: 45, run: 5.5, creep: 1.1, hit: 10, reach: 2.1, size: [0.9, 1.35], light: 'flee', drop: 1 },
+  swarm: { hp: 10, run: 7.5, creep: 4, hit: 4, reach: 1.3, size: [0.32, 0.45], light: 'flee', drop: 0 },
+  colossus: { hp: 220, run: 3.4, creep: 2.4, hit: 25, reach: 3.6, size: [2.4, 2.8], light: 'slow', drop: 3 },
+  spitter: { hp: 60, run: 4.5, creep: 3, hit: 8, reach: 0, size: [1.0, 1.2], light: 'flee', drop: 1 },
+  tracker: { hp: 70, run: 8.5, creep: 6.5, hit: 12, reach: 2.5, size: [1.15, 1.45], light: 'ignore', drop: 1 },
+};
+/** the dispersor: a cone of pulses, strong up close */
+const PELLETS = 7, PELLET_DMG = 9, PELLET_SPEED = 110, SPREAD_RATE = 0.75;
+export const SPREAD_ENERGY = 6;
 /** sentinels are 1.5x the model: ~11 m tall machines */
 const SENT_SCALE = 1.5;
 const SENTINEL_HP = 120, SENTINEL_RANGE = 110, SENTINEL_BOLT = 12, SENTINEL_RATE = 2.2, SENTINEL_BOLT_SPEED = 30;
@@ -45,10 +62,15 @@ interface Zone {
 interface SentinelDef { id: string; body: string; dir: THREE.Vector3 }
 
 interface Stalker {
+  kind: CreatureKind;
   pos: THREE.Vector3; // relative to the body's centre
   body: Body;
   hp: number;
-  state: 'stalk' | 'flee' | 'retreat' | 'dying';
+  state: 'stalk' | 'flee' | 'retreat' | 'dying' | 'charge';
+  /** spitting / charging cooldown */
+  fireT: number;
+  /** not tied to a zone (rare encounter, ambush) */
+  free: boolean;
   t: number;
   phase: number;
   facing: THREE.Vector3;
@@ -68,7 +90,7 @@ interface Sentinel {
   dead: number; // 0 alive, >0 seconds since destroyed
   mesh: SentinelMesh;
 }
-interface Bolt { pos: THREE.Vector3; vel: THREE.Vector3; enemy: boolean; ttl: number; mesh: THREE.Mesh }
+interface Bolt { pos: THREE.Vector3; vel: THREE.Vector3; enemy: boolean; ttl: number; mesh: THREE.Mesh; dmg: number; src: string }
 /** orbit fights happen in the ship's frame: rel = position minus the ship's */
 interface RelBolt { rel: THREE.Vector3; vel: THREE.Vector3; enemy: boolean; ttl: number; mesh: THREE.Mesh }
 interface Hunter { rel: THREE.Vector3; vel: THREE.Vector3; hp: number; fireT: number; orbit: number; mesh: THREE.Group; dying: number }
@@ -93,20 +115,75 @@ const G = {
   bolt: new THREE.SphereGeometry(0.11, 8, 6),
   puff: new THREE.SphereGeometry(0.3, 10, 8),
 };
-const skin = new THREE.MeshStandardMaterial({ color: 0x0a090b, roughness: 0.32, metalness: 0.15 });
-const metal = new THREE.MeshStandardMaterial({ color: 0x2b2e33, roughness: 0.42, metalness: 0.7 });
-const wreck = new THREE.MeshStandardMaterial({ color: 0x141517, roughness: 0.8, metalness: 0.4 });
+/** wet dark hide: black at a distance, glistening when the lamp finds it */
+const skin = new THREE.MeshStandardMaterial({ color: 0x1c1517, roughness: 0.3, metalness: 0.2 });
 
-function buildStalker(): StalkerMesh {
+const spitSkin = new THREE.MeshStandardMaterial({ color: 0x0c120b, roughness: 0.28, metalness: 0.1 });
+/** the hide of the rooted watchers: dark, wet, a little red */
+const hide = new THREE.MeshStandardMaterial({ color: 0x26140f, roughness: 0.32, metalness: 0.15 });
+const deadHide = new THREE.MeshStandardMaterial({ color: 0x0a0807, roughness: 0.85, metalness: 0 });
+const SPIKE = new THREE.ConeGeometry(0.12, 0.7, 5);
+
+/** a tracker: a long-legged predator on four legs, spines along its back, a long jaw */
+function buildTracker(): StalkerMesh {
+  const root = new THREE.Group();
+  const body = new THREE.Mesh(G.body, skin);
+  body.scale.set(0.62, 0.55, 1.7);
+  body.position.y = 1.15;
+  const head = new THREE.Mesh(G.head, skin);
+  head.scale.set(0.95, 0.75, 1.9);
+  head.position.set(0, 1.25, 1.15);
+  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.08, 0.5), skin);
+  jaw.position.set(0, 1.05, 1.35);
+  jaw.rotation.x = 0.25;
+  root.add(body, head, jaw);
+  const eyes = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.45, 0.32, 0.08) });
+  for (const x of [-0.11, 0.11]) {
+    const e = new THREE.Mesh(G.eye, eyes);
+    e.position.set(x, 1.34, 1.55);
+    root.add(e);
+  }
+  for (let i = 0; i < 6; i++) {
+    const sp = new THREE.Mesh(SPIKE, skin);
+    sp.position.set(0, 1.45, 0.55 - i * 0.24);
+    sp.rotation.x = -0.5;
+    root.add(sp);
+  }
+  const legs: THREE.Group[] = [];
+  for (let i = 0; i < 4; i++) {
+    const side = i % 2 ? 1 : -1, row = Math.floor(i / 2);
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.24, 1.1, 0.55 - row * 1.1);
+    const leg = new THREE.Mesh(G.leg, skin);
+    leg.scale.set(1.8, 0.75, 1.8);
+    leg.rotation.z = side * 0.18;
+    pivot.add(leg);
+    root.add(pivot);
+    legs.push(pivot);
+  }
+  root.traverse((o) => { if ((o as THREE.Mesh).isMesh) o.castShadow = true; });
+  return { root, legs, eyes };
+}
+
+function buildStalker(kind: CreatureKind = 'stalker'): StalkerMesh {
+  if (kind === 'tracker') return buildTracker();
   const root = new THREE.Group();
   const body = new THREE.Mesh(G.body, skin);
   body.scale.set(0.55, 0.42, 1.35);
   body.position.y = 1.0;
+  if (kind === 'spitter') {
+    // a swollen sac behind: what it spits
+    const sac = new THREE.Mesh(G.body, spitSkin);
+    sac.scale.set(0.75, 0.65, 0.8);
+    sac.position.set(0, 1.25, -0.55);
+    root.add(sac);
+  }
+  if (kind === 'colossus') body.scale.set(0.75, 0.6, 1.4);
   const head = new THREE.Mesh(G.head, skin);
   head.scale.set(0.8, 0.7, 1.25);
   head.position.set(0, 1.12, 0.92);
-  // two faint pale eyes: what you see first in the dark
-  const eyes = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.32, 0.36, 0.3) });
+  // two faint pale eyes: what you see first in the dark (greenish for the spitter, dull red for the colossus)
+  const eyes = new THREE.MeshBasicMaterial({ color: kind === 'spitter' ? new THREE.Color(0.22, 0.4, 0.16) : kind === 'colossus' ? new THREE.Color(0.42, 0.12, 0.08) : new THREE.Color(0.32, 0.36, 0.3) });
   for (const x of [-0.09, 0.09]) {
     const e = new THREE.Mesh(G.eye, eyes);
     e.position.set(x, 1.17, 1.22);
@@ -128,29 +205,49 @@ function buildStalker(): StalkerMesh {
   return { root, legs, eyes };
 }
 
+/** a watcher: three long insect legs rooted in the ground, a swollen body, a head of jaws and three eyes */
 function buildSentinel(): SentinelMesh {
   const root = new THREE.Group();
   const body = new THREE.Group();
   body.position.y = 5.4;
   for (let i = 0; i < 3; i++) {
-    const leg = new THREE.Mesh(G.sLeg, metal);
+    const leg = new THREE.Mesh(G.sLeg, hide);
+    leg.scale.set(0.7, 1, 0.7);
     const a = (i / 3) * Math.PI * 2;
-    leg.rotation.set(Math.cos(a) * 0.32, 0, Math.sin(a) * 0.32, 'XYZ');
+    leg.rotation.set(Math.cos(a) * 0.36, 0, Math.sin(a) * 0.36, 'XYZ');
     body.add(leg);
   }
-  const core = new THREE.Mesh(G.sBody, metal);
-  core.position.y = 0.5;
-  const ring = new THREE.Mesh(G.sRing, metal);
-  ring.rotation.x = Math.PI / 2;
-  ring.position.y = 0.3;
-  body.add(core, ring);
+  const core = new THREE.Mesh(G.body, hide);
+  core.scale.set(1.7, 2.1, 1.7);
+  core.position.y = 0.55;
+  body.add(core);
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2;
+    const sp = new THREE.Mesh(SPIKE, hide);
+    sp.scale.setScalar(1.6);
+    sp.position.set(Math.cos(a) * 0.7, 1.2, Math.sin(a) * 0.7);
+    sp.rotation.set(Math.sin(a) * 0.6, 0, -Math.cos(a) * 0.6);
+    body.add(sp);
+  }
   const head = new THREE.Group();
-  head.position.y = 1.65;
-  const hm = new THREE.Mesh(G.sHead, metal);
+  head.position.y = 1.85;
+  const hm = new THREE.Mesh(G.head, hide);
+  hm.scale.set(1.9, 1.5, 2.6);
   const eye = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.3, 0.04, 0.02) });
-  const em = new THREE.Mesh(G.sEye, eye);
-  em.position.set(0, 0.05, 0.45);
-  head.add(hm, em);
+  for (const [x, y] of [[-0.2, 0.12], [0.2, 0.12], [0, 0.26]]) {
+    const em = new THREE.Mesh(G.sEye, eye);
+    em.scale.setScalar(0.75);
+    em.position.set(x, y, 0.62);
+    head.add(em);
+  }
+  for (const x of [-1, 1]) {
+    const mand = new THREE.Mesh(SPIKE, hide);
+    mand.scale.set(1.4, 1.8, 1.4);
+    mand.position.set(x * 0.28, -0.25, 0.7);
+    mand.rotation.set(1.9, 0, x * 0.35);
+    head.add(mand);
+  }
+  head.add(hm);
   body.add(head);
   root.add(body);
   root.scale.setScalar(SENT_SCALE);
@@ -158,31 +255,40 @@ function buildSentinel(): SentinelMesh {
   return { root, head, eye, body };
 }
 
-/** a hunter drone: a dark arrowhead with three fins and a violet eye (~6 m) */
+/** a void ray: a creature of the vacuum, wide slow-beating wings dotted with dim violet light (~9 m) */
 function buildHunter() {
   const root = new THREE.Group();
-  const hullG = new THREE.OctahedronGeometry(1, 0);
-  const hull = new THREE.Mesh(hullG, skin);
-  hull.scale.set(1.3, 0.6, 3.2);
-  root.add(hull);
-  // dark hulls vanish against space: the fins' edges and the drive glow, steady and dim
-  const glow = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.32, 0.14, 0.55) });
-  for (let i = 0; i < 3; i++) {
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.6, 1.8), glow);
-    fin.position.z = 1.4;
-    fin.rotation.z = (i / 3) * Math.PI * 2;
-    fin.position.x = Math.sin(fin.rotation.z) * -0.8;
-    fin.position.y = Math.cos(fin.rotation.z) * 0.8;
-    root.add(fin);
+  const body = new THREE.Mesh(G.body, skin);
+  body.scale.set(2.2, 0.5, 3.6);
+  root.add(body);
+  // dark hide vanishes against space: rows of steady, dim light spots along the wings
+  const glow = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.34, 0.15, 0.6) });
+  const wings: THREE.Group[] = [];
+  for (const x of [-1, 1]) {
+    const w = new THREE.Group();
+    const membrane = new THREE.Mesh(G.body, skin);
+    membrane.scale.set(2.4, 0.12, 1.6);
+    membrane.position.x = x * 2.1;
+    w.add(membrane);
+    for (let i = 0; i < 4; i++) {
+      const dot = new THREE.Mesh(G.eye, glow);
+      dot.scale.setScalar(3);
+      dot.position.set(x * (1.2 + i * 0.75), 0.1, 0.3 - i * 0.2);
+      w.add(dot);
+    }
+    root.add(w);
+    wings.push(w);
   }
-  const eye = new THREE.Mesh(G.sEye, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.5, 0.2, 0.9) }));
-  eye.position.z = -2.9;
-  eye.scale.setScalar(1.4);
-  const drive = new THREE.Mesh(G.puff, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 0.2, 0.75), transparent: true, opacity: 0.6, depthWrite: false }));
-  drive.position.z = 3.2;
-  drive.scale.set(1.2, 1.2, 2);
-  root.add(eye, drive);
-  root.scale.setScalar(1.8);
+  const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.25, 4.5, 6).rotateX(Math.PI / 2), skin);
+  tail.position.z = 3.6;
+  root.add(tail);
+  for (const x of [-0.35, 0.35]) {
+    const eye = new THREE.Mesh(G.sEye, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.5, 0.2, 0.9) }));
+    eye.position.set(x, 0.12, -1.75);
+    root.add(eye);
+  }
+  root.userData.wings = wings;
+  root.scale.setScalar(1.6);
   return root;
 }
 
@@ -217,6 +323,24 @@ export class EnemyDirector {
   /** seconds since the player last fired (arm pose) */
   sinceShot = 10;
   private hunters: Hunter[] = [];
+  /** daylight ruins: a pack of trackers once per visit */
+  private dayT = 0;
+  private dayPackSite = '';
+  private dayPacks = new Set<string>();
+  private lastZone = '';
+  /** hunters coming to an ambush anywhere in space (not only near their worlds) */
+  private ambushHunters = 0;
+  private ambushT = 0;
+  /** the last hit landed: seconds since, and what is left of the target (0..1), for the crosshair */
+  hitT = 9;
+  hitHp = 1;
+  /** what the player has met (VEGA comments the first time) */
+  onEvent?: (ev: string) => void;
+  private seen = new Set<string>();
+  private glob = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.45, 0.85, 0.25) });
+  /** the watchers' and the Guardian's acid: sickly yellow; the void rays' spit: violet */
+  private acid = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.85, 0.7, 0.15) });
+  private voidSpit = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.55, 0.25, 0.9) });
   private relBolts: RelBolt[] = [];
   private hunterT = 0;
   private cannonT = 0;
@@ -312,12 +436,22 @@ export class EnemyDirector {
 
     // --- stalkers: spawn where it is dark
     const zone = onFoot ? this.zoneAt(b, pRel) : null;
+    const zid = zone && dark > 0.5 ? zone.id : '';
+    if (zid && zid !== this.lastZone) this.onEvent?.('zone');
+    this.lastZone = zid;
     this.darkT = onFoot && dark > 0.9 ? this.darkT + dt : 0;
     const live = this.stalkers.filter((s) => s.state !== 'dying');
     const want = zone ? Math.min(Math.round(zone.stalkers * dark), this.guardian && !this.guardian.dead ? 3 : 99) : 0;
+    // a swarm counts as one presence in its zone
+    const presences = live.filter((s) => s.kind !== 'swarm').length + (live.some((s) => s.kind === 'swarm') ? 1 : 0);
     this.spawnT -= dt;
-    if (onFoot && live.length < Math.min(want, MAX_STALKERS) && this.spawnT <= 0) {
-      this.spawn(b, pRel, false);
+    if (onFoot && zone && presences < Math.min(want, MAX_STALKERS) && live.length < MAX_CREATURES && this.spawnT <= 0) {
+      // what comes: mostly stalkers; spitters, swarms and, in the deepest dark, a colossus
+      const r = Math.random();
+      const colossus = zone.stalkers >= 4 && !live.some((s) => s.kind === 'colossus') && r < 0.12;
+      const kind: CreatureKind = colossus ? 'colossus' : r < 0.32 ? 'spitter' : r < 0.47 ? 'swarm' : 'stalker';
+      if (kind === 'swarm') for (let i = 0; i < 4 + Math.floor(Math.random() * 3); i++) this.spawn(b, pRel, false, 'swarm');
+      else this.spawn(b, pRel, false, kind);
       this.spawnT = 6 + Math.random() * 8; // they come one by one
     }
     // rare: one alone, after a while in total darkness away from every zone
@@ -330,26 +464,71 @@ export class EnemyDirector {
     }
     for (const s of [...this.stalkers]) this.updateStalker(s, dt, onFoot, pRel, dark, zone);
 
+    this.updateDayPack(dt, onFoot, pRel, dark);
+    this.hitT += dt;
     this.updateBolts(dt);
     this.updatePuffs(dt);
   }
 
-  private spawn(b: Body, pRel: THREE.Vector3, rare: boolean) {
+  private spawn(b: Body, pRel: THREE.Vector3, rare: boolean, kind: CreatureKind = 'stalker', near = false) {
     const g = this.g;
     const up = pRel.clone().normalize();
-    // behind the player, outside the view, 45-80 m away
+    // behind the player, outside the view, 45-80 m away (an ambush: 18-30 m)
     const camF = new THREE.Vector3(0, 0, -1).applyQuaternion(g.camera.quaternion).projectOnPlane(up).normalize();
     const a = Math.PI + (Math.random() - 0.5) * 2.4;
     const dir = camF.clone().applyAxisAngle(up, a);
-    const p = pRel.clone().addScaledVector(dir, 45 + Math.random() * 35);
+    const p = pRel.clone().addScaledVector(dir, near ? 18 + Math.random() * 12 : 45 + Math.random() * 35);
     const d = p.normalize();
     const pos = this.surface(b, d);
-    const mesh = buildStalker();
-    const size = 0.9 + Math.random() * 0.45;
+    const k = KINDS[kind];
+    const mesh = buildStalker(kind);
+    const size = k.size[0] + Math.random() * (k.size[1] - k.size[0]);
     mesh.root.scale.setScalar(size);
     g.scene.add(mesh.root);
-    this.stalkers.push({ pos, body: b, hp: STALKER_HP, state: 'stalk', t: 0, phase: Math.random() * 6, facing: dir.clone().negate(), mesh, chirp: 1 + Math.random() * 3, rare, size });
+    this.stalkers.push({ kind, pos, body: b, hp: k.hp, state: 'stalk', fireT: 2 + Math.random() * 2, free: rare || near, t: 0, phase: Math.random() * 6, facing: dir.clone().negate(), mesh, chirp: 1 + Math.random() * 3, rare, size });
   }
+
+  /** an ambush right here: night creatures in the dark, a pack of trackers in the light */
+  ambush(what: 'night' | 'day', n: number) {
+    const g = this.g, b = g.nearest;
+    if (g.mode !== 'foot' || b.def.kind !== 'rocky') return;
+    const pRel = g.playerPos.clone().sub(b.pos);
+    if (what === 'day') { for (let i = 0; i < n; i++) this.spawn(b, pRel, false, 'tracker', true); return; }
+    if (n >= 3 && Math.random() < 0.5) { for (let i = 0; i < 5; i++) this.spawn(b, pRel, false, 'swarm', true); return; }
+    for (let i = 0; i < n; i++) this.spawn(b, pRel, false, Math.random() < 0.3 ? 'spitter' : 'stalker', true);
+  }
+  /** hunters will come for the ship wherever it flies */
+  hunterAmbush(n: number) {
+    this.ambushHunters = n;
+    this.ambushT = 90;
+    this.hunterT = 0;
+  }
+
+
+  /** daylight in a ruined city of Earth: after a while, a pack of trackers comes (once per city) */
+  private updateDayPack(dt: number, onFoot: boolean, pRel: THREE.Vector3, dark: number) {
+    const g = this.g, b = g.nearest;
+    if (!onFoot || b.def.id !== 'earth' || dark > 0.3) { this.dayT = 0; return; }
+    const n = g.ruins.nearest(g.playerPos, 900);
+    if (!n || n.dist > n.site.radius + 150 || this.dayPacks.has(n.site.id)) { this.dayT = 0; return; }
+    if (this.dayPackSite !== n.site.id) { this.dayPackSite = n.site.id; this.dayT = 0; }
+    this.dayT += dt;
+    if (this.dayT > 30 + (n.site.seed % 20)) {
+      this.dayPacks.add(n.site.id);
+      const k = n.site.kind === 'city' && n.site.radius > 500 ? 3 : 2;
+      for (let i = 0; i < k; i++) this.spawn(b, pRel, false, 'tracker');
+      // they come from afar, howling
+      for (const s of this.stalkers) if (s.kind === 'tracker') s.free = true;
+      this.sfx.play('growl', new THREE.Vector3(30, 0, 30));
+    }
+  }
+
+  private seeOnce(key: string) {
+    if (this.seen.has(key)) return;
+    this.seen.add(key);
+    this.onEvent?.(key);
+  }
+  private markHit(left: number) { this.hitT = 0; this.hitHp = clamp(left, 0, 1); }
 
   private updateStalker(s: Stalker, dt: number, onFoot: boolean, pRel: THREE.Vector3, dark: number, zone: Zone | null) {
     const g = this.g, b = s.body;
@@ -367,8 +546,9 @@ export class EnemyDirector {
       this.place(s);
       return;
     }
+    const k = KINDS[s.kind];
     // gone: the player left (boarded the ship, walked away) or the place is lit
-    if (!onFoot || dist > 160 || (!zone && !s.rare) || dark < 0.25) {
+    if (!onFoot || dist > 160 || (!zone && !s.free) || (dark < 0.25 && !s.free)) {
       if (s.state !== 'flee') { s.state = 'flee'; s.t = 0; }
       if (s.t > 4 || dist > 160) { remove(); return; }
     }
@@ -381,34 +561,59 @@ export class EnemyDirector {
     const toS = s.pos.clone().addScaledVector(up, 0.9).sub(lamp);
     const beam = g.playerFacing.clone().projectOnPlane(pRel.clone().normalize()).normalize();
     const lit = g.lightsOn && toS.length() < 24 && toS.dot(beam) / toS.length() > Math.cos((27 * Math.PI) / 180);
-    if (lit && s.state === 'stalk') { s.state = 'flee'; s.t = 0; this.sfx.play('hiss', fromCam); }
+    // the light drives most of them away; the colossus only slows down
+    if (lit && s.state === 'stalk' && k.light === 'flee') { s.state = 'flee'; s.t = 0; this.sfx.play('hiss', fromCam); }
+    if (s.kind === 'tracker' && s.state === 'flee' && onFoot && dist < 160) { s.state = 'stalk'; s.t = 0; }
+    if (watched && dist < 45) this.seeOnce(`seen:${s.kind}`);
 
     const flat = toP.clone().projectOnPlane(up);
     const toward = flat.lengthSq() > 1e-6 ? flat.normalize() : s.facing.clone();
     let speed = 0;
     let dirMove = toward;
+    s.fireT -= dt;
+    const strike = () => {
+      g.suit -= k.hit * g.surv!.mods().taken;
+      this.hurt = 1;
+      this.lastHit = s.kind;
+      this.sfx.play('growl', fromCam);
+      this.sfx.play('hurt');
+      s.state = 'retreat'; s.t = 0;
+    };
     if (s.state === 'stalk') {
       // they creep when watched and rush when you look away
-      speed = watched ? 1.1 : 5.5;
-      if (dist < 2.1) {
-        g.suit -= STALKER_HIT * g.surv!.mods().taken;
-        this.hurt = 1;
-        this.lastHit = 'stalker';
+      speed = (watched ? k.creep : k.run) * (lit && k.light === 'slow' ? 0.5 : 1);
+      if (s.kind === 'spitter') {
+        // keeps its distance and spits
+        if (dist < 18) dirMove = toward.clone().negate();
+        else if (dist < 32) { dirMove = new THREE.Vector3().crossVectors(up, toward).normalize(); speed *= 0.6; }
+        if (s.fireT <= 0 && dist < 45) {
+          s.fireT = 2.6 * (0.85 + Math.random() * 0.3);
+          const mouth = s.pos.clone().addScaledVector(up, 1.3).add(b.pos);
+          const tgt = g.playerPos.clone().addScaledVector(pRel.clone().normalize(), 1.1);
+          this.addBolt(mouth, tgt.sub(mouth).normalize().multiplyScalar(20), true, k.hit, 'spitter', 'glob');
+          this.sfx.play('hiss', fromCam);
+        }
+      } else if (s.kind === 'colossus' && dist < 14 && s.fireT <= 0) {
+        s.state = 'charge'; s.t = 0; s.fireT = 6;
         this.sfx.play('growl', fromCam);
-        this.sfx.play('hurt');
-        s.state = 'retreat'; s.t = 0;
-      }
+      } else if (dist < k.reach) strike();
+    } else if (s.state === 'charge') {
+      speed = 9.5;
+      if (dist < k.reach) strike();
+      else if (s.t > 1.4) { s.state = 'retreat'; s.t = 0; }
     } else if (s.state === 'flee' || s.state === 'retreat') {
-      speed = s.state === 'flee' ? 8 : 6;
+      speed = s.state === 'flee' ? 8 : s.kind === 'colossus' ? 2.5 : 6;
       dirMove = toward.clone().negate();
-      if (s.t > (s.state === 'flee' ? 2.8 : 1.8) && onFoot && dark > 0.25 && (zone || s.rare)) { s.state = 'stalk'; s.t = 0; }
+      const back = s.state === 'flee' ? 2.8 : s.kind === 'swarm' ? 0.8 : 1.8;
+      if (s.t > back && onFoot && (dark > 0.25 || s.free) && (zone || s.free)) { s.state = 'stalk'; s.t = 0; }
     }
     // keep apart from each other
     for (const o of this.stalkers) {
       if (o === s) continue;
       const d = s.pos.clone().sub(o.pos);
       const l = d.length();
-      if (l < 3 && l > 0.01) dirMove = dirMove.clone().addScaledVector(d.projectOnPlane(up).normalize(), (3 - l) * 0.5).normalize();
+      const room = s.kind === 'swarm' && o.kind === 'swarm' ? 1.2 : 3 * Math.max(s.size, o.size);
+      if (l < room && l > 0.01) dirMove = dirMove.clone().addScaledVector(d.projectOnPlane(up).normalize(), (room - l) * 0.5).normalize();
     }
     s.pos.addScaledVector(dirMove, speed * dt);
     if (b.def.id === 'earth') {
@@ -449,7 +654,7 @@ export class EnemyDirector {
       if (!m.root.userData.wrecked) {
         m.root.userData.wrecked = true;
         m.eye.color.setRGB(0.02, 0.01, 0.01);
-        m.root.traverse((o) => { if ((o as THREE.Mesh).isMesh && (o as THREE.Mesh).material === metal) (o as THREE.Mesh).material = wreck; });
+        m.root.traverse((o) => { if ((o as THREE.Mesh).isMesh && (o as THREE.Mesh).material === hide) (o as THREE.Mesh).material = deadHide; });
       }
       return;
     }
@@ -477,7 +682,8 @@ export class EnemyDirector {
       s.fireT = SENTINEL_RATE * (0.85 + Math.random() * 0.3);
       const spread = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.04 * dist);
       const v = toP.clone().add(spread).normalize().multiplyScalar(SENTINEL_BOLT_SPEED);
-      this.addBolt(head.clone().add(s.body.pos), v, true);
+      this.addBolt(head.clone().add(s.body.pos), v, true, SENTINEL_BOLT, 'sentinel', 'acid');
+      this.seeOnce('seen:sentinel');
       this.sfx.play('bolt', head.clone().add(s.body.pos).sub(g.camWorld));
     }
   }
@@ -486,13 +692,13 @@ export class EnemyDirector {
   /** the arc rifle: a fast bolt along the view, costs battery */
   private fire() {
     const g = this.g, sv = g.surv!;
-    const cost = SHOT_ENERGY * sv.mods().energy;
+    const cost = (sv.weapon === 'dispersor' ? SPREAD_ENERGY : SHOT_ENERGY) * sv.mods().energy;
     if (sv.energy < cost) {
       if (g.pressed.has('Mouse0')) g.note('Batería agotada: el arma no dispara. Recárgala al sol o en la nave');
       return;
     }
     sv.energy -= cost;
-    this.fireT = PLAYER_RATE;
+    this.fireT = sv.weapon === 'dispersor' ? SPREAD_RATE : PLAYER_RATE;
     this.sinceShot = 0;
     const b = g.nearest;
     const up = g.playerPos.clone().sub(b.pos).normalize();
@@ -508,15 +714,27 @@ export class EnemyDirector {
     for (const s of this.stalkers) if (s.state !== 'dying') ray(s.body.pos.clone().add(s.pos).addScaledVector(s.pos.clone().normalize(), 1), 0.9);
     for (const s of this.sentinels.values()) if (!s.dead) ray(s.body.pos.clone().add(s.pos).addScaledVector(s.pos.clone().normalize(), 6.2 * SENT_SCALE), 1.4 * SENT_SCALE);
     const aim = g.camWorld.clone().addScaledVector(camF, Math.max(range, 3));
-    this.addBolt(origin, aim.sub(origin).normalize().multiplyScalar(PLAYER_BOLT_SPEED), false);
-    this.sfx.play('shot');
+    const dir = aim.sub(origin).normalize();
+    const dealt = sv.mods().dealt;
+    if (sv.weapon === 'dispersor') {
+      // a cone of pulses: devastating close, useless far
+      for (let i = 0; i < PELLETS; i++) {
+        const j = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.2);
+        this.addBolt(origin, dir.clone().add(j).normalize().multiplyScalar(PELLET_SPEED), false, PELLET_DMG * dealt, 'player', 'pellet');
+      }
+      this.sfx.play('blast');
+    } else {
+      this.addBolt(origin, dir.multiplyScalar(PLAYER_BOLT_SPEED), false, PLAYER_BOLT * dealt, 'player');
+      this.sfx.play('shot');
+    }
   }
 
-  private addBolt(pos: THREE.Vector3, vel: THREE.Vector3, enemy: boolean) {
-    const mesh = new THREE.Mesh(G.bolt, enemy ? this.boltMats.enemy : this.boltMats.player);
-    mesh.scale.set(1, 1, enemy ? 2.2 : 4);
+  private addBolt(pos: THREE.Vector3, vel: THREE.Vector3, enemy: boolean, dmg = SENTINEL_BOLT, src = 'sentinel', look: 'bolt' | 'glob' | 'acid' | 'pellet' = 'bolt') {
+    const mesh = new THREE.Mesh(G.bolt, look === 'glob' ? this.glob : look === 'acid' ? this.acid : enemy ? this.boltMats.enemy : this.boltMats.player);
+    if (look === 'glob' || look === 'acid') mesh.scale.setScalar(look === 'acid' ? 2.2 : 1.8);
+    else mesh.scale.set(1, 1, look === 'pellet' ? 2 : enemy ? 2.2 : 4);
     this.g.scene.add(mesh);
-    this.bolts.push({ pos: pos.clone(), vel, enemy, ttl: enemy ? 8 : 1.6, mesh });
+    this.bolts.push({ pos: pos.clone(), vel, enemy, ttl: look === 'pellet' ? 0.45 : enemy ? 8 : 1.6, mesh, dmg, src });
   }
 
   private updateBolts(dt: number) {
@@ -540,27 +758,31 @@ export class EnemyDirector {
         const chest = g.playerPos.clone().addScaledVector(g.playerPos.clone().sub(b.pos).normalize(), 1.1);
         if (seg(chest, 0.75)) {
           hit = true;
-          g.suit -= SENTINEL_BOLT * g.surv!.mods().taken;
+          g.suit -= bo.dmg * g.surv!.mods().taken;
           this.hurt = 1;
-          this.lastHit = this.guardian && !this.guardian.dead ? 'guardian' : 'sentinel';
+          this.lastHit = bo.src;
           this.sfx.play('hurt');
         }
       }
       if (!hit && !bo.enemy) {
         for (const s of this.stalkers) {
           if (s.state === 'dying') continue;
-          const c = s.body.pos.clone().add(s.pos).addScaledVector(s.pos.clone().normalize(), 1);
-          if (seg(c, 0.9)) {
+          const c = s.body.pos.clone().add(s.pos).addScaledVector(s.pos.clone().normalize(), s.size);
+          if (seg(c, 0.8 * s.size)) {
             hit = true;
-            s.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
+            s.hp -= bo.dmg;
+            this.markHit(s.hp / KINDS[s.kind].hp);
             this.sfx.play('hit', c.clone().sub(g.camWorld));
             if (s.hp <= 0) {
               s.state = 'dying'; s.t = 0;
               this.sfx.play('shriek', c.clone().sub(g.camWorld));
-              // what is left of it hardens into a dark crystal
-              if (g.surv!.addCargo('crystal', 1)) g.note('+1 cristal oscuro: lo que queda de la criatura');
+              // what is left of it hardens into dark crystal
+              const drop = KINDS[s.kind].drop;
+              const got = drop ? g.surv!.addCargo('crystal', drop) : 0;
+              if (got) g.note(`+${got} cristal oscuro: lo que queda de la criatura`);
+              if (s.kind === 'colossus') this.onEvent?.('kill:colossus');
             }
-            else { s.state = 'retreat'; s.t = 0; }
+            else if (s.kind !== 'colossus') { s.state = 'retreat'; s.t = 0; }
             break;
           }
         }
@@ -570,13 +792,14 @@ export class EnemyDirector {
           const c1 = s.body.pos.clone().add(s.pos).addScaledVector(up, 6.2 * SENT_SCALE);
           if (seg(c1, 1.4 * SENT_SCALE)) {
             hit = true;
-            s.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
+            s.hp -= bo.dmg;
+            this.markHit(s.hp / SENTINEL_HP);
             s.alert = 1;
             this.sfx.play('clank', c1.clone().sub(g.camWorld));
             if (s.hp <= 0) this.destroySentinel(s);
           }
         }
-        if (!hit) hit = this.hitGuardian(seg);
+        if (!hit) hit = this.hitGuardian(seg, bo.dmg);
       }
       if (hit) {
         this.g.scene.remove(bo.mesh);
@@ -594,10 +817,10 @@ export class EnemyDirector {
     s.dead = 0.001;
     this.destroyed.add(s.def.id);
     this.sfx.play('down', s.body.pos.clone().add(s.pos).sub(g.camWorld));
-    // its armour is good metal
+    // its hardened hide holds dark crystal
     const sv = g.surv!;
-    const got = sv.addCargo('metal', 6);
-    g.note(got ? `Centinela destruido. Recuperas ${got} de metal de su blindaje` : 'Centinela destruido');
+    const got = sv.addCargo('crystal', 3);
+    g.note(got ? `Vigía abatido. Arrancas ${got} cristales oscuros de su piel` : 'Vigía abatido');
     sv.save();
   }
 
@@ -638,6 +861,8 @@ export class EnemyDirector {
     const ship = this.g.camOff.clone().negate();
     if (this.g.mode !== 'ship') ship.copy(this.g.shipPos).sub(cw);
     for (const h of this.hunters) {
+      const wings = h.mesh.userData.wings as THREE.Group[] | undefined;
+      wings?.forEach((w, i) => { w.rotation.z = (i ? -1 : 1) * Math.sin(this.g.time * 1.6 + h.orbit) * 0.28; });
       h.mesh.position.copy(ship).add(h.rel);
       const look = h.vel.lengthSq() > 1 ? h.vel.clone().normalize() : h.rel.clone().negate().normalize();
       h.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), look);
@@ -658,7 +883,10 @@ export class EnemyDirector {
   private updateHunters(dt: number) {
     const g = this.g, b = g.nearest;
     const flying = g.mode === 'ship' && !g.warp && !g.landed && !g.dead;
-    const zone = flying && (b.def.id === 'proxima-b' || b.def.id === 'trappist-1e') && g.altitude < HUNTER_ALT && !this.guardianDown;
+    this.ambushT = Math.max(0, this.ambushT - dt);
+    if (this.ambushT <= 0) this.ambushHunters = 0;
+    const homeZone = flying && (b.def.id === 'proxima-b' || b.def.id === 'trappist-1e') && g.altitude < HUNTER_ALT && !this.guardianDown;
+    const zone = homeZone || (flying && this.ambushHunters > 0);
     // the ship's cannons
     this.cannonT -= dt;
     if (flying && g.keys.has('Mouse0') && this.cannonT <= 0) {
@@ -674,13 +902,14 @@ export class EnemyDirector {
       this.sfx.play('shot');
     }
     this.hunterT -= dt;
-    if (zone && this.hunters.length < MAX_HUNTERS && this.hunterT <= 0) {
+    const cap = homeZone ? MAX_HUNTERS : this.ambushHunters;
+    if (zone && this.hunters.filter((h) => !h.dying).length < cap && this.hunterT <= 0) {
       this.hunterT = 4 + Math.random() * 3;
       const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
       const mesh = buildHunter();
       g.scene.add(mesh);
       this.hunters.push({ rel: d.multiplyScalar(1600), vel: new THREE.Vector3(), hp: HUNTER_HP, fireT: 2 + Math.random() * 2, orbit: Math.random() * 6, mesh, dying: 0 });
-      if (this.hunters.length === 1) g.note('⚠ Contactos no identificados acercándose a la nave. Clic: cañones');
+      if (this.hunters.length === 1) { g.note('⚠ Algo vivo se acerca a la nave por el vacío. Clic: cañones'); this.onEvent?.('hunters'); }
     }
     for (const h of [...this.hunters]) {
       const remove = () => { g.scene.remove(h.mesh); this.hunters.splice(this.hunters.indexOf(h), 1); };
@@ -702,8 +931,8 @@ export class EnemyDirector {
       if (h.fireT <= 0 && h.rel.length() < 900) {
         h.fireT = HUNTER_RATE * (0.8 + Math.random() * 0.4);
         const spread = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.06);
-        const mesh = new THREE.Mesh(G.bolt, this.boltMats.enemy);
-        mesh.scale.set(3, 3, 8);
+        const mesh = new THREE.Mesh(G.bolt, this.voidSpit);
+        mesh.scale.set(4, 4, 6);
         g.scene.add(mesh);
         this.relBolts.push({ rel: h.rel.clone(), vel: h.rel.clone().negate().normalize().add(spread).normalize().multiplyScalar(260), enemy: true, ttl: 5, mesh });
         this.sfx.play('bolt', h.rel.clone().sub(g.camOff));
@@ -731,12 +960,15 @@ export class EnemyDirector {
           if (h.dying || !near(h.rel, 7)) continue;
           hit = true;
           h.hp -= CANNON;
+          this.markHit(h.hp / HUNTER_HP);
           this.sfx.play('clank', h.rel.clone().sub(g.camOff));
           if (h.hp <= 0) {
             h.dying = 0.001;
             this.sfx.play('down', h.rel.clone().sub(g.camOff));
             g.surv!.stored.crystal += 2;
-            g.note('Cazador destruido: +2 cristales oscuros a la bodega');
+            g.note('Mantarraya del vacío abatida: +2 cristales oscuros a la bodega');
+            if (this.ambushHunters > 0 && !homeZone) this.ambushHunters--;
+            this.markHit(0);
           }
           break;
         }
@@ -759,9 +991,11 @@ export class EnemyDirector {
       const mesh = buildSentinel();
       mesh.root.scale.setScalar(GUARDIAN_SCALE);
       mesh.eye.color.setRGB(0.5, 0.2, 0.9);
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(1.6, 0.12, 8, 32), new THREE.MeshBasicMaterial({ color: new THREE.Color(0.35, 0.15, 0.6) }));
-      ring.rotation.x = Math.PI / 2;
-      mesh.head.add(ring);
+      // its heart shows through the hide: a steady violet glow in the chest
+      const heart = new THREE.Mesh(G.sEye, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.38, 0.16, 0.66) }));
+      heart.scale.setScalar(2.2);
+      heart.position.set(0, 0.7, 0.78);
+      mesh.body.add(heart);
       g.scene.add(mesh.root);
       const dead = this.guardianDown;
       this.guardian = {
@@ -801,14 +1035,14 @@ export class EnemyDirector {
       gd.fireT = shield ? 2.6 : 1.8;
       for (let i = 0; i < 3; i++) {
         const spread = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.06 * toP.length());
-        this.addBolt(head.clone().add(b.pos), toP.clone().add(spread).normalize().multiplyScalar(34), true);
+        this.addBolt(head.clone().add(b.pos), toP.clone().add(spread).normalize().multiplyScalar(34), true, 10, 'guardian', 'acid');
       }
       this.sfx.play('bolt', head.clone().add(b.pos).sub(g.camWorld));
     }
   }
 
   /** a player bolt against the Guardian and its pylons (seg = the bolt's path test) */
-  private hitGuardian(seg: (c: THREE.Vector3, r: number) => boolean) {
+  private hitGuardian(seg: (c: THREE.Vector3, r: number) => boolean, dmg: number) {
     const gd = this.guardian, g = this.g;
     if (!gd || gd.dead) return false;
     const s = g.alien.site('spire')!;
@@ -817,7 +1051,8 @@ export class EnemyDirector {
       const [px, pz] = SITE_POINTS.spire.pylons[i];
       const c = g.alien.point(s, px, pz, 16.5);
       if (!seg(c, 2.6)) continue;
-      gd.pylons[i] -= PLAYER_BOLT * g.surv!.mods().dealt;
+      gd.pylons[i] -= dmg;
+      this.markHit(gd.pylons[i] / PYLON_HP);
       this.sfx.play('clank', c.clone().sub(g.camWorld));
       if (gd.pylons[i] <= 0) {
         this.destroyed.add(`pylon-${i}`);
@@ -837,7 +1072,8 @@ export class EnemyDirector {
       if (!gd.shieldNote) { gd.shieldNote = true; g.note('Un escudo protege al Guardián: destruye primero los tres pilones'); }
       return true;
     }
-    gd.hp -= PLAYER_BOLT * g.surv!.mods().dealt;
+    gd.hp -= dmg;
+    this.markHit(gd.hp / GUARDIAN_HP);
     this.sfx.play('hit', core.clone().sub(g.camWorld));
     if (gd.hp <= 0) {
       gd.dead = 0.001;
@@ -878,6 +1114,7 @@ export class EnemyDirector {
     this.bolts = [];
     for (const h of this.hunters) this.g.scene.remove(h.mesh);
     this.hunters = [];
+    this.ambushHunters = 0;
     for (const b of this.relBolts) this.g.scene.remove(b.mesh);
     this.relBolts = [];
     this.hurt = 0;
