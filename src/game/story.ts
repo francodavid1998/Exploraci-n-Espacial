@@ -219,3 +219,31 @@ export const END_LINES = [
   'Nadie te va a dar las gracias. No queda nadie.',
   'Pero el camino está cerrado. Y el universo, por fin, está en silencio.',
 ];
+
+// ---------------------------------------------------------------------------
+/** a place of the world the map can send you to (a mission point in survival) */
+export interface Place {
+  id: string;
+  name: string;
+  /** body id and names of its world and star system */
+  body: string;
+  world: string;
+  system: string;
+  desc: string;
+  /** survival only: done, the current objective, or still to do */
+  status?: 'hecho' | 'objetivo' | 'pendiente';
+}
+
+/** what the map says about each place */
+export const PLACE_INFO: Record<string, string> = {
+  esperanza: 'Ciudad en ruinas junto a la costa. Una baliza de la Estación de Evacuación 7 sigue emitiendo en la plaza.',
+  alba: 'Puerto en ruinas. Los barcos nunca zarparon.',
+  meridiano: 'La última posición del ejército. Dos centinelas vigilan la plaza.',
+  telmo: 'Ciudad universitaria del lado de la noche. El laboratorio de la doctora Ibarra.',
+  cumbre: 'Observatorio de montaña, de noche. Desde aquí se mantuvo con vida a las naves en órbita.',
+  tsiolkovsky: 'Base científica en la cara oculta de la Luna, siempre a oscuras. Aquí se desenterró el artefacto.',
+  'frag-mars': 'Monolito alienígena en el lado nocturno de Marte: un fragmento del mapa de la señal.',
+  'frag-europa': 'Monolito alienígena en el lado nocturno de Europa: un fragmento del mapa de la señal.',
+  'frag-proxima': 'Monolito alienígena en la cara helada de Próxima b, a 4,25 años luz: el último fragmento.',
+  spire: 'La Aguja: una torre de piedra negra en la noche eterna de TRAPPIST-1 e. El faro de la señal.',
+};

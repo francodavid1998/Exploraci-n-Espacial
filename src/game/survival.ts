@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Game } from './Game';
 import { hash3, mulberry32, Noise3, clamp } from './noise';
-import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, objectiveAt, type LogEntry, type Objective, type UpgradeId, type CacheDef } from './story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, objectiveAt, type LogEntry, type Objective, type UpgradeId, type CacheDef, type Place } from './story';
 import { SITE_POINTS } from './alien';
 import { EnemyDirector, SHOT_ENERGY } from './enemies';
 import { SoundFX } from './sound';
@@ -373,6 +373,23 @@ export class Survival {
     if (!this.enemies.guardianDown) return { text: 'Viaja a TRAPPIST-1 e y apaga el faro: la Aguja', place: 'spire' };
     return { text: 'La señal se ha apagado. El universo es tuyo', place: '' };
   }
+  /** the mission points the story has revealed so far, in order, each with its state */
+  missionPlaces(): Place[] {
+    const g = this.g, read = (id: string) => this.logsRead.has(id);
+    const obj = this.objective().place;
+    const out: Place[] = [];
+    const add = (id: string, done: boolean) => {
+      const p = g.placeOf(id);
+      if (p) out.push({ ...p, status: done ? 'hecho' : id === obj ? 'objetivo' : 'pendiente' });
+    };
+    const first = LOGS.findIndex((l) => !read(l.id));
+    LOGS.forEach((l, i) => { if (first < 0 || i <= first) add(l.site, read(l.id)); });
+    if (first < 0 || BASE_LOGS.some((l) => read(l.id))) add('tsiolkovsky', BASE_LOGS.every((l) => read(l.id)));
+    if (this.hasScanner) for (const f of FRAGMENTS) add(f.site, read(f.id));
+    if (FRAGMENTS.every((f) => read(f.id))) add('spire', this.enemies.guardianDown);
+    return out;
+  }
+
   private guardianDown() {
     this.ending = true;
     this.ended = true;

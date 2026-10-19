@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Game, HudState } from '../game/Game';
 import { formatDist, formatSpeed } from '../game/Game';
 import { BODIES, C_LIGHT } from '../game/bodies';
-import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, WAKE_LINES, END_LINES, type LogEntry, type UpgradeId } from '../game/story';
+import { LOGS, BASE_LOGS, FRAGMENTS, CACHES, UPGRADES, WAKE_LINES, END_LINES, type LogEntry, type UpgradeId, type Place } from '../game/story';
 
 /** every recording of the story, in order (the pilot's own diaries last) */
 const ALL_LOGS: LogEntry[] = [...LOGS, ...BASE_LOGS, ...FRAGMENTS, ...CACHES.flatMap((c) => (c.log ? [c.log] : []))];
@@ -208,6 +208,9 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
           </div>
         )}
         <div className="text-[10px] tracking-[0.3em] text-amber-300/80">DESTINO</div>
+        {s.waypoint && (
+          <div className="mt-1 text-[11px] text-cyan-200/80">○ {s.waypoint.name}{s.waypoint.dist !== null ? ` · ${formatDist(s.waypoint.dist)}` : ''}</div>
+        )}
         {s.targetName ? (
           <>
             <div className="mb-2 text-xl font-light tracking-wider">{s.targetName}</div>
@@ -406,9 +409,59 @@ export default function Hud({ game, onOpenMap, touch = false }: { game: Game; on
   );
 }
 
+/** The map's list of places: mission points (survival) or the ruins and alien places (exploration). */
+function PlacesTab({ game, places, sel, onSel, onGo }: { game: Game; places: Place[]; sel: string | null; onSel: (id: string) => void; onGo: (id: string) => void }) {
+  const cur = places.find((p) => p.id === sel) ?? places.find((p) => p.status === 'objetivo') ?? places[0];
+  const label = { hecho: '✓ HECHO', objetivo: '◆ OBJETIVO ACTUAL', pendiente: 'PENDIENTE' } as const;
+  const tone = { hecho: 'text-white/40', objetivo: 'text-amber-200', pendiente: 'text-cyan-200/70' } as const;
+  // grouped by star system, then world, in the order they come
+  const groups: { key: string; title: string; items: Place[] }[] = [];
+  for (const p of places) {
+    const key = `${p.system}/${p.world}`;
+    let gr = groups.find((x) => x.key === key);
+    if (!gr) groups.push((gr = { key, title: p.system === p.world || p.system === 'Sol' ? p.world : `${p.world} · ${p.system}`, items: [] }));
+    gr.items.push(p);
+  }
+  return (
+    <div className="flex-1 overflow-y-auto p-8">
+      <div className="text-[10px] tracking-[0.4em] text-cyan-300/70">{game.surv ? 'PUNTOS DE MISIÓN' : 'LUGARES'}</div>
+      {cur && (
+        <div className="mt-3 rounded-xl border border-cyan-300/20 bg-cyan-300/5 p-4">
+          <div className="text-[10px] tracking-[0.3em] text-white/45">{cur.world.toUpperCase()}{cur.system !== 'Sol' && cur.system !== cur.world ? ` · ${cur.system.toUpperCase()}` : ''}</div>
+          <div className="text-2xl font-extralight tracking-[0.12em]">{cur.name}</div>
+          {cur.status && <div className={`mt-1 text-[11px] tracking-[0.2em] ${tone[cur.status]}`}>{label[cur.status]}</div>}
+          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-white/70">{cur.desc}</p>
+          <div className="mt-3 flex items-center gap-3">
+            <button onClick={() => onGo(cur.id)} className="rounded-lg border border-cyan-300/40 bg-cyan-300/10 px-5 py-2 text-xs tracking-[0.3em] text-cyan-50 hover:bg-cyan-300/20">FIJAR DESTINO</button>
+            {game.waypoint?.id === cur.id && <span className="text-[11px] text-cyan-200/70">○ es tu destino actual</span>}
+          </div>
+        </div>
+      )}
+      {places.length === 0 && <div className="mt-4 text-sm text-white/50">Todavía no conoces ningún lugar.</div>}
+      <div className="mt-5 space-y-4">
+        {groups.map((gr) => (
+          <div key={gr.key}>
+            <div className="mb-1 text-[10px] tracking-[0.3em] text-white/40">{gr.title.toUpperCase()}</div>
+            <div className="grid gap-1 md:grid-cols-2">
+              {gr.items.map((p) => (
+                <button key={p.id} onClick={() => onSel(p.id)} className={`flex items-center justify-between rounded-lg border px-3 py-2 text-left text-sm hover:bg-white/5 ${cur?.id === p.id ? 'border-cyan-300/40 bg-white/5' : 'border-white/10'}`}>
+                  <span className={p.status === 'hecho' ? 'text-white/45' : 'text-white/90'}>{p.name}</span>
+                  {p.status && <span className={`text-[10px] tracking-[0.15em] ${tone[p.status]}`}>{p.status === 'hecho' ? '✓' : p.status === 'objetivo' ? '◆' : '·'}</span>}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }) {
   const [sel, setSel] = useState<string>(game.target?.def.id ?? 'earth');
-  const [tab, setTab] = useState<'map' | 'logs' | 'upg'>('map');
+  const [tab, setTab] = useState<'map' | 'logs' | 'upg' | 'places'>('map');
+  const places = game.places();
+  const [placeSel, setPlaceSel] = useState<string | null>(null);
   const [, redraw] = useState(0);
   const [msg, setMsg] = useState<string | null>(null);
   const sv = game.surv;
@@ -428,6 +481,9 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
             <div className="text-2xl font-extralight tracking-[0.2em]">SISTEMAS ESTELARES</div>
           </div>
           <div className="flex gap-2">
+            <button onClick={() => setTab(tab === 'places' ? 'map' : 'places')} className={`rounded-md border border-cyan-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-cyan-100 hover:bg-cyan-300/10 ${tab === 'places' ? 'bg-cyan-300/15' : ''}`}>
+              {sv ? 'MISIONES' : 'LUGARES'}
+            </button>
             {sv && (
               <button onClick={() => setTab(tab === 'logs' ? 'map' : 'logs')} className={`rounded-md border border-amber-300/30 px-4 py-1.5 text-xs tracking-[0.3em] text-amber-100 hover:bg-amber-300/10 ${tab === 'logs' ? 'bg-amber-300/15' : ''}`}>
                 REGISTROS {heard.length}
@@ -470,7 +526,9 @@ export function SystemMap({ game, onClose }: { game: Game; onClose: () => void }
               </div>
             ))}
           </div>
-          {tab === 'upg' && sv ? (
+          {tab === 'places' ? (
+            <PlacesTab game={game} places={places} sel={placeSel} onSel={setPlaceSel} onGo={(id) => { game.setWaypoint(id); onClose(); setTimeout(() => game.requestLock(), 50); }} />
+          ) : tab === 'upg' && sv ? (
             <div className="flex-1 overflow-y-auto p-8">
               <div className="text-[10px] tracking-[0.4em] text-violet-300/70">MEJORAS DEL TRAJE Y DE LA NAVE</div>
               <div className="mt-2 text-sm text-white/70">En la bodega: {sv.stored.metal} metal · {sv.stored.crystal} cristal oscuro {game.mode !== 'ship' && <span className="text-white/40">· solo se instalan a bordo</span>}</div>

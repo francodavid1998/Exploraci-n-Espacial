@@ -16,6 +16,7 @@ import { clamp, smoothstep } from './noise';
 import { Survival, type GameMode, type SurvivalHud, type SurvivalSave } from './survival';
 import { RuinedEarth } from './ruins';
 import { AlienWorld } from './alien';
+import { PLACE_INFO, type Place } from './story';
 
 interface Body {
   def: BodyDef;
@@ -100,6 +101,8 @@ export interface HudState {
   survival: SurvivalHud | null;
   /** the nearest ruined city on Earth, when close */
   ruin: { name: string; dist: number } | null;
+  /** the point chosen in the map, and how far it is (null when in another star system) */
+  waypoint: { name: string; dist: number | null } | null;
 }
 
 /**
@@ -291,6 +294,11 @@ export class Game {
   ruins!: RuinedEarth;
   /** the places of the signal: Base Tsiolkovsky, the monoliths, the Spire (both modes) */
   alien!: AlienWorld;
+  /** a point on a world chosen in the map (a ruin, a mission place): marked on the ground */
+  waypoint: { id: string; name: string } | null = null;
+  private wpMarker!: HTMLDivElement;
+  private wpLabel!: HTMLDivElement;
+  private wpDist: number | null = null;
   onMenuToggle?: (open: boolean) => void;
   /** lets the title screen's lights button follow the L key */
   onLightsModeChange?: (mode: LightsMode) => void;
@@ -463,6 +471,15 @@ export class Game {
     this.spawnStart();
     this.ruins = new RuinedEarth(this, this.byId.get('earth')!);
     this.alien = new AlienWorld(this);
+    // the chosen point: a cyan ring on the ground with its name and distance
+    this.wpMarker = document.createElement('div');
+    this.wpMarker.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;display:none;white-space:nowrap;font-family:ui-monospace,monospace;';
+    const wd = document.createElement('div');
+    wd.style.cssText = 'width:14px;height:14px;border:2px solid #67e8f9;border-radius:50%;transform:translate(-50%,-50%);position:absolute;left:0;top:0;box-sizing:border-box;';
+    this.wpLabel = document.createElement('div');
+    this.wpLabel.style.cssText = 'position:absolute;left:12px;top:-7px;font-size:11px;color:#a5f3fc;text-shadow:0 0 4px #000;letter-spacing:.05em;';
+    this.wpMarker.append(wd, this.wpLabel);
+    this.markerLayer.appendChild(this.wpMarker);
     this.bindInput();
     window.addEventListener('resize', this.onResize);
     this.lastT = performance.now();
@@ -924,6 +941,64 @@ export class Game {
     this.menuOpen = force ?? !this.menuOpen;
     if (this.menuOpen && document.pointerLockElement) document.exitPointerLock();
     this.onMenuToggle?.(this.menuOpen);
+  }
+
+  /** the places the map lists: mission points known so far (survival), or every ruin and alien place */
+  places(): Place[] {
+    if (this.surv) return this.surv.missionPlaces();
+    return [...this.ruins.sites.map((s) => s.id), ...this.alien.sites.map((s) => s.id)].map((id) => this.placeOf(id)!).filter(Boolean);
+  }
+  placeOf(id: string): Place | null {
+    const al = this.alien.site(id);
+    if (al) {
+      const b = this.byId.get(al.body)!;
+      return { id, name: al.name, body: al.body, world: b.def.name, system: b.star.def.name, desc: PLACE_INFO[id] ?? '' };
+    }
+    const ru = this.ruins.site(id);
+    if (!ru) return null;
+    return { id, name: ru.name, body: 'earth', world: 'Tierra', system: 'Sol', desc: PLACE_INFO[id] ?? (ru.kind === 'station' ? 'Estación en ruinas.' : 'Ciudad en ruinas. Nadie responde.') };
+  }
+  /** Go to a place: its world becomes the destination (jump, autopilot) and the point is marked on the ground. */
+  setWaypoint(id: string | null) {
+    const p = id ? this.placeOf(id) : null;
+    if (!p) { this.waypoint = null; return; }
+    this.waypoint = { id: p.id, name: p.name };
+    this.target = this.byId.get(p.body) ?? null;
+    this.note(`Destino: ${p.name} (${p.world}). J: salto · K: piloto automático; al llegar, sigue el círculo ○`);
+  }
+  private waypointPos(out: THREE.Vector3): { pos: THREE.Vector3; far: string | null } | null {
+    const id = this.waypoint?.id;
+    if (!id) return null;
+    const al = this.alien.site(id);
+    const b = al ? this.alien.body(al) : this.byId.get('earth')!;
+    if (b.star !== this.sunBody) return { pos: out.copy(b.star.pos), far: b.star.def.name };
+    if (al) return { pos: this.alien.centre(al, out), far: null };
+    const ru = this.ruins.site(id);
+    return ru ? { pos: out.copy(ru.logPos).add(b.pos), far: null } : null;
+  }
+  private updateWaypoint() {
+    const m = this.wpMarker;
+    this.wpDist = null;
+    const wp = this.waypointPos(new THREE.Vector3());
+    // the objective's own marker already shows it
+    if (!wp || this.vision || (this.surv && this.surv.objective().place === this.waypoint!.id)) { m.style.display = 'none'; if (wp) this.wpDist = wp.far ? null : wp.pos.distanceTo(this.mode === 'ship' ? this.shipPos : this.playerPos); return; }
+    const focus = this.mode === 'ship' ? this.shipPos : this.playerPos;
+    const dist = wp.pos.distanceTo(focus);
+    if (!wp.far) this.wpDist = dist;
+    if (!wp.far && dist < 25 && this.mode === 'foot') {
+      this.note(`Has llegado: ${this.waypoint!.name}`);
+      this.waypoint = null;
+      m.style.display = 'none';
+      return;
+    }
+    const rel = wp.pos.clone().sub(this.camWorld);
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    if (rel.dot(fwd) <= 0) { m.style.display = 'none'; return; }
+    const v = rel.clone().project(this.camera);
+    if (Math.abs(v.x) > 1 || Math.abs(v.y) > 1) { m.style.display = 'none'; return; }
+    m.style.display = 'block';
+    m.style.transform = `translate(${((v.x * 0.5 + 0.5) * this.container.clientWidth).toFixed(1)}px, ${((-v.y * 0.5 + 0.5) * this.container.clientHeight).toFixed(1)}px)`;
+    if (this.frame % 6 === 0) this.wpLabel.textContent = `${wp.far ? `→ ${wp.far.toUpperCase()}` : this.waypoint!.name.toUpperCase()}  ${formatDist(wp.far ? rel.length() : dist)}`;
   }
 
   setTarget(id: string | null) {
@@ -2303,6 +2378,7 @@ export class Game {
     this.surv?.render();
     this.updateGasBake();
     this.updateMarkers();
+    this.updateWaypoint();
     this.composer.render();
     this.mdx = 0;
     this.mdy = 0;
@@ -2366,6 +2442,7 @@ export class Game {
       zoom: VISION_FOV_MAX / this.camera.fov,
       gameMode: this.gameMode,
       survival: this.surv?.hud() ?? null,
+      waypoint: this.waypoint ? { name: this.waypoint.name, dist: this.wpDist } : null,
       ruin: (() => {
         if (def.id !== 'earth') return null;
         const n = this.ruins.nearest(p, 150e3);
